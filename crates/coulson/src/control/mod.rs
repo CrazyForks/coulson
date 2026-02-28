@@ -428,6 +428,10 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
         }
         "app.delete" => {
             let params: AppIdParams = parse_params!(req);
+            // Stop managed process before deleting
+            let mut pm = state.process_manager.lock().await;
+            pm.kill_process(params.app_id).await;
+            drop(pm);
             service::app_delete(state, params.app_id)
                 .map(|_| json!({ "deleted": true }))
                 .map_err(ControlError::from)
