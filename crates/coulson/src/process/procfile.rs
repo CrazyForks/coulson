@@ -10,9 +10,9 @@ use super::provider::{
 /// Procfile provider — manages applications defined by a standard Procfile.
 ///
 /// Detection: directory contains `Procfile.dev` or `Procfile` with a `web:` process.
-/// Resolves to `$SHELL -l -c "<web command>"` with TCP port assignment via `$PORT`.
-/// Using the user's login shell ensures that environment managers (direnv, mise,
-/// rbenv, nvm, etc.) are properly loaded.
+/// Resolves to `$SHELL -l -c "<rc source>; <web command>"` with TCP port via `$PORT`.
+/// The RC file (.zshrc/.bashrc) is sourced explicitly because login shells don't
+/// load interactive config where tools like mise/direnv are typically activated.
 ///
 /// This provider is registered at the lowest priority so that ASGI and Node
 /// providers get first chance at detecting their respective app types.
@@ -45,6 +45,20 @@ fn user_shell() -> PathBuf {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/bin/sh"))
+}
+
+/// Build login-shell arguments that source the interactive RC file before
+/// executing `cmd`.  Login shells (`-l`) only load profile files (.zprofile,
+/// .bash_profile), not .zshrc/.bashrc where mise/direnv are activated.
+fn login_shell_args(cmd: &str) -> (PathBuf, Vec<String>) {
+    let shell = user_shell();
+    let name = shell.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let full_cmd = match name {
+        "zsh" => format!(". ~/.zshrc 2>/dev/null; {cmd}"),
+        "bash" => format!(". ~/.bashrc 2>/dev/null; {cmd}"),
+        _ => cmd.to_string(),
+    };
+    (shell, vec!["-l".to_string(), "-c".to_string(), full_cmd])
 }
 
 /// Check if parsed procfile content contains a `web` process type.
@@ -93,16 +107,17 @@ impl ProcessProvider for ProcfileProvider {
     fn resolve(&self, app: &ManagedApp) -> anyhow::Result<ProcessSpec> {
         let root = &app.root;
 
-        // 1. coulson.json command override → $SHELL -l -c
+        // 1. coulson.json command override
         if let Some(manifest) = &app.manifest {
             if let Some(cmd) = manifest.get("command").and_then(|v| v.as_str()) {
                 let port = allocate_port()?;
                 let mut env = std::collections::HashMap::new();
                 env.insert("PORT".to_string(), port.to_string());
                 env.extend(app.env_overrides.clone());
+                let (command, args) = login_shell_args(cmd);
                 return Ok(ProcessSpec {
-                    command: user_shell(),
-                    args: vec!["-l".to_string(), "-c".to_string(), cmd.to_string()],
+                    command,
+                    args,
                     env,
                     working_dir: root.clone(),
                     listen_target: ListenTarget::Tcp {
@@ -144,10 +159,11 @@ impl ProcessProvider for ProcfileProvider {
             "resolved Procfile web process"
         );
 
-        // 6. Use $SHELL -l -c for shell features and user env (direnv, mise, etc.)
+        // 6. Use login shell with RC sourced for user env (direnv, mise, etc.)
+        let (command, args) = login_shell_args(&full_command);
         Ok(ProcessSpec {
-            command: user_shell(),
-            args: vec!["-l".to_string(), "-c".to_string(), full_command],
+            command,
+            args,
             env,
             working_dir: root.clone(),
             listen_target: ListenTarget::Tcp {
@@ -283,7 +299,7 @@ mod tests {
         };
         let spec = p.resolve(&app).unwrap();
         assert_eq!(spec.command, user_shell());
-        assert_eq!(spec.args[2], "my-custom-server");
+        assert!(spec.args[2].contains("my-custom-server"));
         fs::remove_dir_all(&dir).ok();
     }
 }

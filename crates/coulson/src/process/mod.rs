@@ -17,6 +17,8 @@ use anyhow::Context;
 use tokio::process::{Child, Command};
 use tracing::{info, warn};
 
+use std::process::Stdio;
+
 use provider::{ManagedApp, ProcessSpec};
 
 pub type ProcessManagerHandle = Arc<tokio::sync::Mutex<ProcessManager>>;
@@ -191,6 +193,7 @@ impl ProcessManager {
         let child = cmd
             .current_dir(&spec.working_dir)
             .kill_on_drop(true)
+            .stdin(Stdio::null())
             .stdout(stderr_file)
             .stderr(log_file)
             .spawn()
@@ -309,6 +312,7 @@ impl ProcessManager {
         let child = cmd
             .current_dir(&spec.working_dir)
             .kill_on_drop(true)
+            .stdin(Stdio::null())
             .stdout(stderr_file)
             .stderr(log_file)
             .spawn()
