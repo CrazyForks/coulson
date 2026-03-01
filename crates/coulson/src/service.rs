@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::credentials;
 use crate::domain::{AppSpec, DomainName, TunnelMode};
 use crate::runtime;
 use crate::runtime::ScanWarningsFile;
@@ -481,10 +482,8 @@ pub async fn app_set_tunnel_mode(
             .and_then(|c| serde_json::from_str::<tunnel::TunnelCredentials>(c).ok())
             .is_some();
         let has_cf_config = {
-            let token = state
-                .store
-                .get_setting("cf.api_token")
-                .map_err(|e| ServiceError::Internal(e.to_string()))?;
+            let token =
+                credentials::get_api_token().map_err(|e| ServiceError::Internal(e.to_string()))?;
             let account = state
                 .store
                 .get_setting("cf.account_id")
@@ -658,23 +657,28 @@ pub async fn app_set_tunnel_mode(
                     }
                 }
 
-                // API-based: create tunnel via CF API
-                let api_token = state
-                    .store
-                    .get_setting("cf.api_token")
+                // API-based: create tunnel via CF API (token from keychain)
+                let api_token = credentials::get_api_token()
                     .map_err(|e| ServiceError::Internal(e.to_string()))?
                     .ok_or_else(|| {
                         ServiceError::InvalidParams(
                             "CF credentials not configured, run tunnel.configure first".to_string(),
                         )
                     })?;
-                let account_id = state
+                let account_id = match state
                     .store
                     .get_setting("cf.account_id")
                     .map_err(|e| ServiceError::Internal(e.to_string()))?
-                    .ok_or_else(|| {
-                        ServiceError::InvalidParams("cf.account_id not configured".to_string())
-                    })?;
+                {
+                    Some(id) => id,
+                    None => tunnel::named::resolve_account_id(&api_token)
+                        .await
+                        .map_err(|e| {
+                            ServiceError::InvalidParams(format!(
+                                "cf.account_id not configured, auto-detect failed: {e}"
+                            ))
+                        })?,
+                };
 
                 let tunnel_name = format!("coulson-{app_id}");
                 let (credentials, tunnel_id) =
