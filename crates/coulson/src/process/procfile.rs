@@ -38,29 +38,6 @@ fn read_procfile(dir: &Path) -> Option<String> {
     None
 }
 
-/// Get the user's login shell from `$SHELL`, falling back to `/bin/sh`.
-fn user_shell() -> PathBuf {
-    std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/bin/sh"))
-}
-
-/// Build login-shell arguments that source the interactive RC file before
-/// executing `cmd`.  Login shells (`-l`) only load profile files (.zprofile,
-/// .bash_profile), not .zshrc/.bashrc where mise/direnv are activated.
-fn login_shell_args(cmd: &str) -> (PathBuf, Vec<String>) {
-    let shell = user_shell();
-    let name = shell.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let full_cmd = match name {
-        "zsh" => format!(". ~/.zshrc 2>/dev/null; {cmd}"),
-        "bash" => format!(". ~/.bashrc 2>/dev/null; {cmd}"),
-        _ => cmd.to_string(),
-    };
-    (shell, vec!["-l".to_string(), "-c".to_string(), full_cmd])
-}
-
 /// Check if parsed procfile content contains a `web` process type.
 fn has_web_process(content: &str) -> bool {
     procfile::parse(content)
@@ -114,10 +91,9 @@ impl ProcessProvider for ProcfileProvider {
                 let mut env = std::collections::HashMap::new();
                 env.insert("PORT".to_string(), port.to_string());
                 env.extend(app.env_overrides.clone());
-                let (command, args) = login_shell_args(cmd);
                 return Ok(ProcessSpec {
-                    command,
-                    args,
+                    command: PathBuf::new(),
+                    args: vec![cmd.to_string()],
                     env,
                     working_dir: root.clone(),
                     listen_target: ListenTarget::Tcp {
@@ -159,11 +135,9 @@ impl ProcessProvider for ProcfileProvider {
             "resolved Procfile web process"
         );
 
-        // 6. Use login shell with RC sourced for user env (direnv, mise, etc.)
-        let (command, args) = login_shell_args(&full_command);
         Ok(ProcessSpec {
-            command,
-            args,
+            command: PathBuf::new(),
+            args: vec![full_command],
             env,
             working_dir: root.clone(),
             listen_target: ListenTarget::Tcp {
@@ -257,10 +231,9 @@ mod tests {
             socket_dir: dir.clone(),
         };
         let spec = p.resolve(&app).unwrap();
-        assert_eq!(spec.command, user_shell());
-        assert_eq!(spec.args[0], "-l");
-        assert_eq!(spec.args[1], "-c");
-        assert!(spec.args[2].contains("bundle exec rails server -p $PORT"));
+
+        assert_eq!(spec.args.len(), 1);
+        assert!(spec.args[0].contains("bundle exec rails server -p $PORT"));
         assert!(spec.env.contains_key("PORT"));
         fs::remove_dir_all(&dir).ok();
     }
@@ -280,7 +253,8 @@ mod tests {
             socket_dir: dir.clone(),
         };
         let spec = p.resolve(&app).unwrap();
-        assert!(spec.args[2].contains("bin/dev"));
+
+        assert!(spec.args[0].contains("bin/dev"));
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -298,8 +272,8 @@ mod tests {
             socket_dir: dir.clone(),
         };
         let spec = p.resolve(&app).unwrap();
-        assert_eq!(spec.command, user_shell());
-        assert!(spec.args[2].contains("my-custom-server"));
+
+        assert!(spec.args[0].contains("my-custom-server"));
         fs::remove_dir_all(&dir).ok();
     }
 }

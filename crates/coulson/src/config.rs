@@ -5,6 +5,16 @@ use std::path::PathBuf;
 use anyhow::Context;
 use serde::Deserialize;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessBackend {
+    /// Use tmux if available, else fall back to direct spawn.
+    Auto,
+    /// Require tmux; fail if missing.
+    Tmux,
+    /// Current behavior, no tmux.
+    Direct,
+}
+
 /// Directory name component used in all default paths.
 /// Debug builds use "coulson-dev" for isolation from release installs.
 #[cfg(debug_assertions)]
@@ -55,6 +65,7 @@ pub struct CoulsonConfig {
     pub inspect_max_requests: usize,
     pub certs_dir: PathBuf,
     pub runtime_dir: PathBuf,
+    pub process_backend: ProcessBackend,
 }
 
 impl Default for CoulsonConfig {
@@ -91,6 +102,7 @@ impl Default for CoulsonConfig {
             inspect_max_requests: 200,
             certs_dir: xdg_config_home().join(format!("{DIR_NAME}/certs")),
             runtime_dir,
+            process_backend: ProcessBackend::Auto,
         }
     }
 }
@@ -137,6 +149,10 @@ impl CoulsonConfig {
         }
         if let Some(ref v) = file.runtime_dir {
             cfg.runtime_dir = expand_tilde(v);
+        }
+        if let Some(ref v) = file.process_backend {
+            cfg.process_backend = parse_process_backend(v)
+                .with_context(|| format!("invalid process_backend in config.toml: {v}"))?;
         }
 
         // Layer 3: Environment variables (highest priority)
@@ -189,6 +205,10 @@ impl CoulsonConfig {
         if let Ok(path) = env::var("COULSON_RUNTIME_DIR") {
             cfg.runtime_dir = PathBuf::from(&path);
         }
+        if let Ok(raw) = env::var("COULSON_PROCESS_BACKEND") {
+            cfg.process_backend = parse_process_backend(&raw)
+                .with_context(|| format!("invalid COULSON_PROCESS_BACKEND: {raw}"))?;
+        }
 
         // HTTPS listener: env > toml > default
         if let Ok(raw) = env::var("COULSON_LISTEN_HTTPS") {
@@ -222,6 +242,15 @@ impl CoulsonConfig {
         }
 
         Ok(cfg)
+    }
+}
+
+fn parse_process_backend(input: &str) -> anyhow::Result<ProcessBackend> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(ProcessBackend::Auto),
+        "tmux" => Ok(ProcessBackend::Tmux),
+        "direct" => Ok(ProcessBackend::Direct),
+        _ => anyhow::bail!("expected auto, tmux, or direct"),
     }
 }
 
@@ -275,6 +304,7 @@ struct ConfigFile {
     inspect_max_requests: Option<usize>,
     certs_dir: Option<String>,
     runtime_dir: Option<String>,
+    process_backend: Option<String>,
 }
 
 impl ConfigFile {
