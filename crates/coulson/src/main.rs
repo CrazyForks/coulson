@@ -288,15 +288,6 @@ enum TunnelCommands {
     },
     /// Disconnect global named tunnel
     Disconnect,
-    /// Save Cloudflare API credentials
-    Configure {
-        /// CF API token
-        #[arg(long)]
-        api_token: String,
-        /// CF account ID
-        #[arg(long)]
-        account_id: String,
-    },
     /// Create a global named tunnel via CF API
     Setup {
         /// Tunnel domain
@@ -2327,17 +2318,6 @@ fn run_tunnel(cfg: CoulsonConfig, action: TunnelCommands) -> anyhow::Result<()> 
         TunnelCommands::Disconnect => {
             client.call("named_tunnel.disconnect", serde_json::json!({}))?;
             println!("{} named tunnel disconnected", "✓".green());
-            Ok(())
-        }
-        TunnelCommands::Configure {
-            api_token,
-            account_id,
-        } => {
-            client.call(
-                "tunnel.configure",
-                serde_json::json!({ "api_token": api_token, "account_id": account_id }),
-            )?;
-            println!("{} CF credentials saved", "✓".green());
             Ok(())
         }
         TunnelCommands::Setup {
