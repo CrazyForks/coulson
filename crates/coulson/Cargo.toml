@@ -53,6 +53,7 @@ tower.workspace = true
 percent-encoding.workspace = true
 procfile.workspace = true
 libc.workspace = true
+keyring.workspace = true
 
 [features]
 builtin-quick-tunnel = []
