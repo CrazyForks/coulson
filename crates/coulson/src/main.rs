@@ -1,6 +1,7 @@
 mod certs;
 mod config;
 mod control;
+mod credentials;
 mod dashboard;
 mod domain;
 mod mdns;
@@ -177,7 +178,7 @@ struct Cli {
 enum Commands {
     /// Start the daemon (proxy + control + scanner)
     Serve,
-    /// One-shot scan of apps_root
+    /// One-shot scan of apps directory
     Scan,
     /// List registered apps
     Ls {
@@ -284,7 +285,7 @@ enum TunnelCommands {
     },
     /// Connect global named tunnel
     Connect {
-        /// Tunnel token (from CF dashboard)
+        /// Tunnel token (from Cloudflare dashboard)
         #[arg(long)]
         token: Option<String>,
         /// Tunnel domain
@@ -293,16 +294,7 @@ enum TunnelCommands {
     },
     /// Disconnect global named tunnel
     Disconnect,
-    /// Save Cloudflare API credentials
-    Configure {
-        /// CF API token
-        #[arg(long)]
-        api_token: String,
-        /// CF account ID
-        #[arg(long)]
-        account_id: String,
-    },
-    /// Create a global named tunnel via CF API
+    /// Create a global named tunnel via Cloudflare API
     Setup {
         /// Tunnel domain
         #[arg(long)]
@@ -310,19 +302,26 @@ enum TunnelCommands {
         /// Tunnel name (defaults to coulson-<domain>)
         #[arg(long)]
         tunnel_name: Option<String>,
-        /// CF API token
+        /// Cloudflare API token (saved to keychain after first use)
         #[arg(long)]
-        api_token: String,
-        /// CF account ID
+        api_token: Option<String>,
+        /// Cloudflare account ID (saved to DB after first use)
         #[arg(long)]
-        account_id: String,
+        account_id: Option<String>,
     },
-    /// Delete the global named tunnel via CF API
+    /// Delete the global named tunnel via Cloudflare API
     Teardown {
-        /// CF API token
+        /// Cloudflare API token (reads from keychain if omitted)
         #[arg(long)]
-        api_token: String,
+        api_token: Option<String>,
     },
+    /// Save a Cloudflare API token to keychain
+    Login {
+        /// API token (Account > Cloudflare Tunnel > Edit, Zone > DNS > Edit)
+        token: String,
+    },
+    /// Remove saved CF API token from keychain
+    Logout,
     /// Connect a per-app named tunnel using a Cloudflare tunnel token
     AppSetup {
         /// App name or domain
@@ -565,7 +564,17 @@ fn run_doctor(cfg: CoulsonConfig, check_pf: bool) -> anyhow::Result<()> {
         }
     }
 
-    // 6. Scan warnings
+    // 6. CF API token (keychain)
+    match credentials::get_api_token() {
+        Ok(Some(_)) => print_check(true, "CF API token saved in keychain"),
+        Ok(None) => print_check(true, "CF API token not set (OK if not using CF tunnels)"),
+        Err(e) => {
+            print_check(false, &format!("keychain access error: {e}"));
+            issues += 1;
+        }
+    }
+
+    // 7. Scan warnings
     match runtime::read_scan_warnings(&cfg.scan_warnings_path) {
         Ok(Some(data)) => {
             if data.scan.warning_count == 0 {
@@ -582,7 +591,7 @@ fn run_doctor(cfg: CoulsonConfig, check_pf: bool) -> anyhow::Result<()> {
         Err(_) => print_check(true, "no scan warnings file (OK if first run)"),
     }
 
-    // 7. LAN access (per-app)
+    // 8. LAN access (per-app)
     if cfg.listen_http.ip().is_unspecified() {
         print_check(
             true,
@@ -603,7 +612,7 @@ fn run_doctor(cfg: CoulsonConfig, check_pf: bool) -> anyhow::Result<()> {
         print_check(true, &format!("proxy on {}", cfg.listen_http));
     }
 
-    // 8. TLS certificates
+    // 9. TLS certificates
     if cfg.listen_https.is_some() {
         let ca_path = cfg.certs_dir.join("ca.crt");
         let cert_path = cfg.certs_dir.join("server.crt");
@@ -629,7 +638,7 @@ fn run_doctor(cfg: CoulsonConfig, check_pf: bool) -> anyhow::Result<()> {
         print_check(true, "HTTPS listener disabled (no TLS check needed)");
     }
 
-    // 9. pf port forwarding (optional)
+    // 10. pf port forwarding (optional)
     if check_pf {
         #[cfg(target_os = "macos")]
         {
@@ -2107,6 +2116,28 @@ fn run_unshare(cfg: CoulsonConfig, name: String) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_tunnel_login(token: &str) -> anyhow::Result<()> {
+    let handle = tokio::runtime::Handle::current();
+    let body: serde_json::Value = tokio::task::block_in_place(|| {
+        handle.block_on(async {
+            let client = reqwest::Client::new();
+            let resp = client
+                .get("https://api.cloudflare.com/client/v4/user/tokens/verify")
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await?;
+            resp.json().await.map_err(anyhow::Error::from)
+        })
+    })?;
+    if body.get("success").and_then(|v| v.as_bool()) != Some(true) {
+        bail!("token verification failed: {body}");
+    }
+
+    credentials::store_api_token(token)?;
+    println!("{} API token verified and saved to keychain", "✓".green());
+    Ok(())
+}
+
 fn run_tunnel(cfg: CoulsonConfig, action: TunnelCommands) -> anyhow::Result<()> {
     let client = RpcClient::new(&cfg.control_socket);
 
@@ -2305,15 +2336,11 @@ fn run_tunnel(cfg: CoulsonConfig, action: TunnelCommands) -> anyhow::Result<()> 
 
             // CF credentials status
             println!();
-            let cf_status = client.call("tunnel.configure_status", serde_json::json!({}));
-            let cf_configured = cf_status
-                .ok()
-                .and_then(|v| v.get("configured").and_then(|c| c.as_bool()))
-                .unwrap_or(false);
-            if cf_configured {
-                println!("CF Credentials: {}", "configured".green());
+            let has_token = credentials::get_api_token().ok().flatten().is_some();
+            if has_token {
+                println!("CF API Token: {}", "saved in keychain".green());
             } else {
-                println!("CF Credentials: {}", "not configured".dimmed());
+                println!("CF API Token: {}", "not configured".dimmed());
             }
 
             Ok(())
@@ -2378,7 +2405,16 @@ fn run_tunnel(cfg: CoulsonConfig, action: TunnelCommands) -> anyhow::Result<()> 
                     println!("  domain: {}", domain.cyan());
                 }
                 TunnelMode::Global => {
-                    println!("  {}", "app exposed via global named tunnel".dimmed());
+                    let domain = client
+                        .call("named_tunnel.status", serde_json::json!({}))
+                        .ok()
+                        .and_then(|v| {
+                            let d = v.get("domain")?.as_str()?;
+                            Some(format!("{bare_name}.{d}"))
+                        });
+                    if let Some(d) = domain {
+                        println!("  {}", format!("http://{d}").cyan());
+                    }
                 }
                 TunnelMode::None => {}
             }
@@ -2413,32 +2449,33 @@ fn run_tunnel(cfg: CoulsonConfig, action: TunnelCommands) -> anyhow::Result<()> 
             println!("{} named tunnel disconnected", "✓".green());
             Ok(())
         }
-        TunnelCommands::Configure {
-            api_token,
-            account_id,
-        } => {
-            client.call(
-                "tunnel.configure",
-                serde_json::json!({ "api_token": api_token, "account_id": account_id }),
-            )?;
-            println!("{} CF credentials saved", "✓".green());
-            Ok(())
-        }
         TunnelCommands::Setup {
             domain,
             tunnel_name,
             api_token,
             account_id,
         } => {
+            let token = match api_token {
+                Some(t) => t,
+                None => credentials::get_api_token()?
+                    .ok_or_else(|| anyhow::anyhow!("no saved API token, pass --api-token"))?,
+            };
+
             let mut params = serde_json::json!({
-                "api_token": api_token,
-                "account_id": account_id,
+                "api_token": token,
                 "domain": domain,
             });
+            if let Some(a) = &account_id {
+                params["account_id"] = serde_json::json!(a);
+            }
             if let Some(n) = &tunnel_name {
                 params["tunnel_name"] = serde_json::json!(n);
             }
             let result = client.call("named_tunnel.setup", params)?;
+
+            // Save token to keychain on success
+            credentials::store_api_token(&token)?;
+
             let tunnel_id = result
                 .get("tunnel_id")
                 .and_then(|v| v.as_str())
@@ -2454,11 +2491,25 @@ fn run_tunnel(cfg: CoulsonConfig, action: TunnelCommands) -> anyhow::Result<()> 
             Ok(())
         }
         TunnelCommands::Teardown { api_token } => {
+            let token = match api_token {
+                Some(t) => t,
+                None => credentials::get_api_token()?
+                    .ok_or_else(|| anyhow::anyhow!("no saved API token, pass --api-token"))?,
+            };
             client.call(
                 "named_tunnel.teardown",
-                serde_json::json!({ "api_token": api_token }),
+                serde_json::json!({ "api_token": token }),
             )?;
             println!("{} global named tunnel destroyed", "✓".green());
+            Ok(())
+        }
+        TunnelCommands::Login { token } => {
+            run_tunnel_login(&token)?;
+            Ok(())
+        }
+        TunnelCommands::Logout => {
+            credentials::delete_api_token()?;
+            println!("{} CF API token removed from keychain", "✓".green());
             Ok(())
         }
         TunnelCommands::AppSetup {

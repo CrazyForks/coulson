@@ -7,6 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{debug, error, info};
 
+use crate::credentials;
 use crate::domain::TunnelMode;
 use crate::service;
 use crate::service::ServiceError;
@@ -72,8 +73,10 @@ struct AppIdParams {
 
 #[derive(Debug, Deserialize)]
 struct NamedTunnelSetupParams {
-    api_token: String,
-    account_id: String,
+    #[serde(default)]
+    api_token: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
     domain: String,
     #[serde(default)]
     tunnel_name: Option<String>,
@@ -81,7 +84,8 @@ struct NamedTunnelSetupParams {
 
 #[derive(Debug, Deserialize)]
 struct NamedTunnelTeardownParams {
-    api_token: String,
+    #[serde(default)]
+    api_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -555,22 +559,96 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 );
             }
 
+            // Resolve api_token: param → keychain
+            let api_token = match params.api_token {
+                Some(ref t) if !t.trim().is_empty() => t.clone(),
+                _ => match credentials::get_api_token() {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        return render_err(
+                            req.request_id,
+                            ControlError::InvalidParams(
+                                "api_token required (not found in keychain)".to_string(),
+                            ),
+                        );
+                    }
+                    Err(e) => return internal_error(req.request_id, e.to_string()),
+                },
+            };
+
+            // Resolve account_id: param → saved setting → CF API
+            let account_id = match params.account_id {
+                Some(ref a) if !a.trim().is_empty() => a.clone(),
+                _ => match state.store.get_setting("named_tunnel.account_id") {
+                    Ok(Some(a)) => a,
+                    Ok(None) => {
+                        // Auto-resolve from API token
+                        match tunnel::named::resolve_account_id(&api_token).await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                return render_err(
+                                    req.request_id,
+                                    ControlError::InvalidParams(format!(
+                                        "account_id not found, auto-detect failed: {e}"
+                                    )),
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => return internal_error(req.request_id, e.to_string()),
+                },
+            };
+
             let tunnel_name = params
                 .tunnel_name
                 .unwrap_or_else(|| format!("coulson-{}", &params.domain));
 
-            let (credentials, tunnel_id) = match tunnel::named::create_named_tunnel(
-                &params.api_token,
-                &params.account_id,
-                &tunnel_name,
+            let (credentials, tunnel_id) =
+                match tunnel::named::create_named_tunnel(&api_token, &account_id, &tunnel_name)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => return internal_error(req.request_id, e.to_string()),
+                };
+
+            // Create wildcard CNAME: *.domain -> tunnel_id.cfargotunnel.com
+            let cname_name = format!("*.{}", params.domain);
+            let zone_id = match tunnel::named::find_zone_id(&api_token, &params.domain).await {
+                Ok(id) => id,
+                Err(e) => {
+                    let _ = tunnel::named::delete_named_tunnel(&api_token, &account_id, &tunnel_id)
+                        .await;
+                    return internal_error(
+                        req.request_id,
+                        format!("failed to find zone for {}: {e}", params.domain),
+                    );
+                }
+            };
+            let dns_record_id = match tunnel::named::create_dns_cname(
+                &api_token,
+                &zone_id,
+                &cname_name,
+                &tunnel_id,
             )
             .await
             {
-                Ok(v) => v,
-                Err(e) => return internal_error(req.request_id, e.to_string()),
+                Ok(id) => id,
+                Err(e) => {
+                    let _ = tunnel::named::delete_named_tunnel(&api_token, &account_id, &tunnel_id)
+                        .await;
+                    return internal_error(
+                        req.request_id,
+                        format!("failed to create DNS CNAME: {e}"),
+                    );
+                }
             };
 
-            // Persist credentials and domain
+            // Save api_token to keychain on success
+            if let Err(e) = credentials::store_api_token(&api_token) {
+                tracing::warn!(error = %e, "failed to save api_token to keychain");
+            }
+
+            // Persist credentials, domain, account_id, zone_id, dns_record_id
             let creds_json = match serde_json::to_string(&credentials) {
                 Ok(v) => v,
                 Err(e) => return internal_error(req.request_id, e.to_string()),
@@ -589,7 +667,16 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
             }
             if let Err(e) = state
                 .store
-                .set_setting("named_tunnel.account_id", &params.account_id)
+                .set_setting("named_tunnel.account_id", &account_id)
+            {
+                return internal_error(req.request_id, e.to_string());
+            }
+            if let Err(e) = state.store.set_setting("named_tunnel.zone_id", &zone_id) {
+                return internal_error(req.request_id, e.to_string());
+            }
+            if let Err(e) = state
+                .store
+                .set_setting("named_tunnel.dns_record_id", &dns_record_id)
             {
                 return internal_error(req.request_id, e.to_string());
             }
@@ -619,11 +706,27 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 "tunnel_id": tunnel_id,
                 "cname_target": cname_target,
                 "domain": params.domain,
-                "hint": format!("Add DNS: *.{} CNAME {}", params.domain, cname_target),
             }))
         }
         "named_tunnel.teardown" => {
             let params: NamedTunnelTeardownParams = parse_params!(req);
+
+            // Resolve api_token: param → keychain
+            let api_token = match params.api_token {
+                Some(ref t) if !t.trim().is_empty() => t.clone(),
+                _ => match credentials::get_api_token() {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        return render_err(
+                            req.request_id,
+                            ControlError::InvalidParams(
+                                "api_token required (not found in keychain)".to_string(),
+                            ),
+                        );
+                    }
+                    Err(e) => return internal_error(req.request_id, e.to_string()),
+                },
+            };
 
             // Disconnect if active (scope the lock to avoid holding across await)
             let active_handle = state.named_tunnel.lock().take();
@@ -642,7 +745,7 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 };
 
                 if let Err(e) = tunnel::named::delete_named_tunnel(
-                    &params.api_token,
+                    &api_token,
                     &account_id,
                     &handle.credentials.tunnel_id,
                 )
@@ -657,16 +760,25 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 if let (Ok(Some(creds_str)), Ok(Some(acct))) = (creds_json, account_id) {
                     if let Ok(creds) = serde_json::from_str::<tunnel::TunnelCredentials>(&creds_str)
                     {
-                        if let Err(e) = tunnel::named::delete_named_tunnel(
-                            &params.api_token,
-                            &acct,
-                            &creds.tunnel_id,
-                        )
-                        .await
+                        if let Err(e) =
+                            tunnel::named::delete_named_tunnel(&api_token, &acct, &creds.tunnel_id)
+                                .await
                         {
                             return internal_error(req.request_id, e.to_string());
                         }
                     }
+                }
+            }
+
+            // Delete DNS CNAME record (best-effort)
+            if let (Ok(Some(zone_id)), Ok(Some(record_id))) = (
+                state.store.get_setting("named_tunnel.zone_id"),
+                state.store.get_setting("named_tunnel.dns_record_id"),
+            ) {
+                if let Err(e) =
+                    tunnel::named::delete_dns_record(&api_token, &zone_id, &record_id).await
+                {
+                    tracing::warn!(error = %e, "failed to delete DNS CNAME during teardown");
                 }
             }
 
@@ -675,6 +787,8 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 "named_tunnel.credentials",
                 "named_tunnel.domain",
                 "named_tunnel.account_id",
+                "named_tunnel.zone_id",
+                "named_tunnel.dns_record_id",
             ] {
                 if let Err(e) = state.store.delete_setting(key) {
                     tracing::warn!(error = %e, key, "failed to delete setting during teardown");
@@ -848,7 +962,7 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                     ),
                 );
             }
-            if let Err(e) = state.store.set_setting("cf.api_token", &params.api_token) {
+            if let Err(e) = credentials::store_api_token(&params.api_token) {
                 return internal_error(req.request_id, e.to_string());
             }
             if let Err(e) = state.store.set_setting("cf.account_id", &params.account_id) {
@@ -857,7 +971,7 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
             Ok(json!({ "configured": true }))
         }
         "tunnel.configure_status" => {
-            let has_token = matches!(state.store.get_setting("cf.api_token"), Ok(Some(_)));
+            let has_token = matches!(credentials::get_api_token(), Ok(Some(_)));
             let has_account = matches!(state.store.get_setting("cf.account_id"), Ok(Some(_)));
             Ok(json!({ "configured": has_token && has_account }))
         }
@@ -910,9 +1024,19 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
         "tunnel.app_teardown" => {
             let params: AppIdParams = parse_params!(req);
 
-            // Read CF credentials
-            let api_token =
-                require_setting!(state, req, "cf.api_token", "CF credentials not configured");
+            // Read CF credentials (api_token from keychain)
+            let api_token = match credentials::get_api_token() {
+                Ok(Some(t)) => t,
+                Ok(None) => {
+                    return render_err(
+                        req.request_id,
+                        ControlError::InvalidParams(
+                            "CF credentials not configured (no api_token in keychain)".to_string(),
+                        ),
+                    );
+                }
+                Err(e) => return internal_error(req.request_id, e.to_string()),
+            };
             let account_id =
                 require_setting!(state, req, "cf.account_id", "cf.account_id not configured");
 

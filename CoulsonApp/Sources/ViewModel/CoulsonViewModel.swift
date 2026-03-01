@@ -2,6 +2,13 @@ import Foundation
 import Network
 import SwiftUI
 
+/// Directory name matching Rust's `DIR_NAME`: debug builds use "coulson-dev".
+#if DEBUG
+private let dirName = "coulson-dev"
+#else
+private let dirName = "coulson"
+#endif
+
 @MainActor
 final class CoulsonViewModel: ObservableObject {
     @Published var apps: [AppRecord] = []
@@ -30,21 +37,21 @@ final class CoulsonViewModel: ObservableObject {
         let base = ProcessInfo.processInfo.environment["XDG_RUNTIME_DIR"]
             ?? ProcessInfo.processInfo.environment["TMPDIR"]
             ?? "/tmp"
-        return (base as NSString).appendingPathComponent("coulson")
+        return (base as NSString).appendingPathComponent(dirName)
     }
 
     /// XDG-aware config directory fallback.
     static var defaultCertsDir: String {
         let base = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"]
             ?? (NSHomeDirectory() + "/.config")
-        return (base as NSString).appendingPathComponent("coulson/certs")
+        return (base as NSString).appendingPathComponent("\(dirName)/certs")
     }
 
     /// XDG-aware state directory fallback (matches Rust default for socket).
     static var defaultStateDir: String {
         let base = ProcessInfo.processInfo.environment["XDG_STATE_HOME"]
             ?? (NSHomeDirectory() + "/.local/state")
-        return (base as NSString).appendingPathComponent("coulson")
+        return (base as NSString).appendingPathComponent(dirName)
     }
 
     init() {

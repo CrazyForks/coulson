@@ -35,6 +35,45 @@ fn cf_error_message(errors: &[CfApiError]) -> String {
         .join("; ")
 }
 
+/// Resolve the account ID from a CF API token.
+/// Calls `GET /accounts` and returns the first account's ID.
+pub async fn resolve_account_id(api_token: &str) -> anyhow::Result<String> {
+    #[derive(Debug, Deserialize)]
+    struct Account {
+        id: String,
+    }
+
+    let client = reqwest::Client::new();
+    let url = format!("{CF_API_BASE}/accounts?per_page=1");
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {api_token}"))
+        .send()
+        .await
+        .context("failed to contact Cloudflare accounts API")?;
+
+    let body: CfApiResponse<Vec<Account>> = resp
+        .json()
+        .await
+        .context("failed to parse CF accounts response")?;
+
+    if !body.success {
+        let msg = if body.errors.is_empty() {
+            "unknown error".to_string()
+        } else {
+            cf_error_message(&body.errors)
+        };
+        anyhow::bail!("failed to list accounts: {msg}");
+    }
+
+    let accounts = body.result.unwrap_or_default();
+    let account = accounts
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no accounts found for this API token"))?;
+    Ok(account.id)
+}
+
 /// Create a named Cloudflare Tunnel via the CF API.
 /// Returns (credentials, tunnel_id).
 pub async fn create_named_tunnel(
@@ -56,6 +95,7 @@ pub async fn create_named_tunnel(
         .json(&serde_json::json!({
             "name": name,
             "tunnel_secret": secret_b64,
+            "config_src": "cloudflare",
         }))
         .send()
         .await
