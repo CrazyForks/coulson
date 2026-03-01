@@ -178,7 +178,7 @@ struct Cli {
 enum Commands {
     /// Start the daemon (proxy + control + scanner)
     Serve,
-    /// One-shot scan of apps_root
+    /// One-shot scan of apps directory
     Scan,
     /// List registered apps
     Ls {
