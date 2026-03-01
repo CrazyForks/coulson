@@ -253,6 +253,11 @@ enum Commands {
         #[arg(long)]
         pf: bool,
     },
+    /// Attach to a managed process's tmux session (Ctrl-B D to detach)
+    Attach {
+        /// App name or domain (omit to match CWD)
+        name: Option<String>,
+    },
     /// Manage tunnels
     Tunnel {
         #[command(subcommand)]
@@ -353,8 +358,12 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
     let (network_change_tx, _) = broadcast::channel(4);
     let idle_timeout = Duration::from_secs(cfg.idle_timeout_secs);
     let registry = Arc::new(process::default_registry());
-    let process_manager =
-        process::new_process_manager(idle_timeout, Arc::clone(&registry), cfg.runtime_dir.clone());
+    let process_manager = process::new_process_manager(
+        idle_timeout,
+        Arc::clone(&registry),
+        cfg.runtime_dir.clone(),
+        cfg.process_backend,
+    );
 
     Ok(SharedState {
         store,
@@ -643,6 +652,44 @@ fn run_doctor(cfg: CoulsonConfig, check_pf: bool) -> anyhow::Result<()> {
         #[cfg(not(target_os = "macos"))]
         {
             print_check(true, "pf check skipped (not macOS)");
+        }
+    }
+
+    // 10. tmux process backend
+    {
+        use crate::config::ProcessBackend;
+        let tmux_path = std::process::Command::new("which")
+            .arg("tmux")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+        match (tmux_path, cfg.process_backend) {
+            (Some(path), _) => {
+                let version = std::process::Command::new("tmux")
+                    .arg("-V")
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                let backend_label = match cfg.process_backend {
+                    ProcessBackend::Auto => "auto → tmux",
+                    ProcessBackend::Tmux => "tmux",
+                    ProcessBackend::Direct => "direct (tmux available but not used)",
+                };
+                print_check(
+                    true,
+                    &format!("tmux: {version} ({path}), backend: {backend_label}"),
+                );
+            }
+            (None, ProcessBackend::Tmux) => {
+                print_check(false, "tmux not found but COULSON_PROCESS_BACKEND=tmux");
+                issues += 1;
+            }
+            (None, _) => {
+                print_check(true, "tmux not found, using direct process backend");
+            }
         }
     }
 
@@ -1178,6 +1225,7 @@ async fn main() -> anyhow::Result<()> {
         } => run_logs(cfg, name, follow, lines),
         Commands::Ps => run_ps(cfg),
         Commands::Restart { name } => run_restart(cfg, name),
+        Commands::Attach { name } => run_attach(cfg, name),
         Commands::Trust { pf } => run_trust(cfg, pf),
         Commands::Tunnel { action } => run_tunnel(cfg, action),
     }
@@ -1894,6 +1942,42 @@ fn run_restart(cfg: CoulsonConfig, name: Option<String>) -> anyhow::Result<()> {
     client.call("process.restart", serde_json::json!({ "app_id": app_id }))?;
     println!("{} {bare_name} restarted", "✓".green());
     Ok(())
+}
+
+fn run_attach(cfg: CoulsonConfig, name: Option<String>) -> anyhow::Result<()> {
+    use crate::config::ProcessBackend;
+
+    if cfg.process_backend == ProcessBackend::Direct {
+        bail!("attach requires tmux backend (set COULSON_PROCESS_BACKEND=auto or tmux)");
+    }
+
+    if !process::tmux_available() {
+        bail!("tmux not found in PATH");
+    }
+
+    let bare_name = resolve_app_name(&cfg, name.as_deref())?;
+    let session_name = bare_name.clone();
+
+    // Check if the tmux session exists
+    let status = std::process::Command::new("tmux")
+        .args(["-L", "coulson", "has-session", "-t", &session_name])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+
+    if !status.success() {
+        bail!(
+            "no tmux session for '{bare_name}' (process may not be running or using direct backend)"
+        );
+    }
+
+    // Replace current process with tmux attach
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new("tmux")
+        .args(["-L", "coulson", "attach-session", "-t", &session_name])
+        .exec();
+    // exec() only returns on error
+    bail!("failed to exec tmux: {err}");
 }
 
 fn format_duration(secs: u64) -> String {

@@ -10,9 +10,9 @@ use super::provider::{
 /// Procfile provider — manages applications defined by a standard Procfile.
 ///
 /// Detection: directory contains `Procfile.dev` or `Procfile` with a `web:` process.
-/// Resolves to `$SHELL -l -c "<web command>"` with TCP port assignment via `$PORT`.
-/// Using the user's login shell ensures that environment managers (direnv, mise,
-/// rbenv, nvm, etc.) are properly loaded.
+/// Resolves to `$SHELL -l -c "<rc source>; <web command>"` with TCP port via `$PORT`.
+/// The RC file (.zshrc/.bashrc) is sourced explicitly because login shells don't
+/// load interactive config where tools like mise/direnv are typically activated.
 ///
 /// This provider is registered at the lowest priority so that ASGI and Node
 /// providers get first chance at detecting their respective app types.
@@ -36,15 +36,6 @@ fn read_procfile(dir: &Path) -> Option<String> {
         }
     }
     None
-}
-
-/// Get the user's login shell from `$SHELL`, falling back to `/bin/sh`.
-fn user_shell() -> PathBuf {
-    std::env::var("SHELL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
 
 /// Check if parsed procfile content contains a `web` process type.
@@ -93,7 +84,7 @@ impl ProcessProvider for ProcfileProvider {
     fn resolve(&self, app: &ManagedApp) -> anyhow::Result<ProcessSpec> {
         let root = &app.root;
 
-        // 1. coulson.json command override → $SHELL -l -c
+        // 1. coulson.json command override
         if let Some(manifest) = &app.manifest {
             if let Some(cmd) = manifest.get("command").and_then(|v| v.as_str()) {
                 let port = allocate_port()?;
@@ -101,8 +92,8 @@ impl ProcessProvider for ProcfileProvider {
                 env.insert("PORT".to_string(), port.to_string());
                 env.extend(app.env_overrides.clone());
                 return Ok(ProcessSpec {
-                    command: user_shell(),
-                    args: vec!["-l".to_string(), "-c".to_string(), cmd.to_string()],
+                    command: PathBuf::new(),
+                    args: vec![cmd.to_string()],
                     env,
                     working_dir: root.clone(),
                     listen_target: ListenTarget::Tcp {
@@ -144,10 +135,9 @@ impl ProcessProvider for ProcfileProvider {
             "resolved Procfile web process"
         );
 
-        // 6. Use $SHELL -l -c for shell features and user env (direnv, mise, etc.)
         Ok(ProcessSpec {
-            command: user_shell(),
-            args: vec!["-l".to_string(), "-c".to_string(), full_command],
+            command: PathBuf::new(),
+            args: vec![full_command],
             env,
             working_dir: root.clone(),
             listen_target: ListenTarget::Tcp {
@@ -241,10 +231,9 @@ mod tests {
             socket_dir: dir.clone(),
         };
         let spec = p.resolve(&app).unwrap();
-        assert_eq!(spec.command, user_shell());
-        assert_eq!(spec.args[0], "-l");
-        assert_eq!(spec.args[1], "-c");
-        assert!(spec.args[2].contains("bundle exec rails server -p $PORT"));
+
+        assert_eq!(spec.args.len(), 1);
+        assert!(spec.args[0].contains("bundle exec rails server -p $PORT"));
         assert!(spec.env.contains_key("PORT"));
         fs::remove_dir_all(&dir).ok();
     }
@@ -264,7 +253,8 @@ mod tests {
             socket_dir: dir.clone(),
         };
         let spec = p.resolve(&app).unwrap();
-        assert!(spec.args[2].contains("bin/dev"));
+
+        assert!(spec.args[0].contains("bin/dev"));
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -282,8 +272,8 @@ mod tests {
             socket_dir: dir.clone(),
         };
         let spec = p.resolve(&app).unwrap();
-        assert_eq!(spec.command, user_shell());
-        assert_eq!(spec.args[2], "my-custom-server");
+
+        assert!(spec.args[0].contains("my-custom-server"));
         fs::remove_dir_all(&dir).ok();
     }
 }
