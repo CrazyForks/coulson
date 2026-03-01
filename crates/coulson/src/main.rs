@@ -280,7 +280,7 @@ enum TunnelCommands {
     },
     /// Connect global named tunnel
     Connect {
-        /// Tunnel token (from CF dashboard)
+        /// Tunnel token (from Cloudflare dashboard)
         #[arg(long)]
         token: Option<String>,
         /// Tunnel domain
@@ -289,7 +289,7 @@ enum TunnelCommands {
     },
     /// Disconnect global named tunnel
     Disconnect,
-    /// Create a global named tunnel via CF API
+    /// Create a global named tunnel via Cloudflare API
     Setup {
         /// Tunnel domain
         #[arg(long)]
@@ -297,16 +297,16 @@ enum TunnelCommands {
         /// Tunnel name (defaults to coulson-<domain>)
         #[arg(long)]
         tunnel_name: Option<String>,
-        /// CF API token (saved to keychain after first use)
+        /// Cloudflare API token (saved to keychain after first use)
         #[arg(long)]
         api_token: Option<String>,
-        /// CF account ID (saved to DB after first use)
+        /// Cloudflare account ID (saved to DB after first use)
         #[arg(long)]
         account_id: Option<String>,
     },
-    /// Delete the global named tunnel via CF API
+    /// Delete the global named tunnel via Cloudflare API
     Teardown {
-        /// CF API token (reads from keychain if omitted)
+        /// Cloudflare API token (reads from keychain if omitted)
         #[arg(long)]
         api_token: Option<String>,
     },
@@ -2252,15 +2252,11 @@ fn run_tunnel(cfg: CoulsonConfig, action: TunnelCommands) -> anyhow::Result<()> 
 
             // CF credentials status
             println!();
-            let cf_status = client.call("tunnel.configure_status", serde_json::json!({}));
-            let cf_configured = cf_status
-                .ok()
-                .and_then(|v| v.get("configured").and_then(|c| c.as_bool()))
-                .unwrap_or(false);
-            if cf_configured {
-                println!("CF Credentials: {}", "configured".green());
+            let has_token = credentials::get_api_token().ok().flatten().is_some();
+            if has_token {
+                println!("CF API Token: {}", "saved in keychain".green());
             } else {
-                println!("CF Credentials: {}", "not configured".dimmed());
+                println!("CF API Token: {}", "not configured".dimmed());
             }
 
             Ok(())
