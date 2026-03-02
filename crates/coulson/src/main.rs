@@ -415,6 +415,7 @@ fn run_ls(cfg: CoulsonConfig, managed: Option<bool>, domain: Option<String>) -> 
         return Ok(());
     }
 
+    let cwd_app = resolve_app_name(&cfg, None).ok();
     let rows: Vec<AppRow> = apps
         .iter()
         .map(|app| {
@@ -423,8 +424,14 @@ fn run_ls(cfg: CoulsonConfig, managed: Option<bool>, domain: Option<String>) -> 
             } else {
                 "disabled".dimmed().to_string()
             };
+            let is_cwd = cwd_app.as_deref() == Some(app.name.as_str());
+            let marker = if is_cwd {
+                format!("{} ", "→".green())
+            } else {
+                "  ".to_string()
+            };
             AppRow {
-                name: app.name.bold().to_string(),
+                name: format!("{marker}{}", app.name.bold()),
                 domain: app.domain.0.cyan().to_string(),
                 kind: dashboard::render::effective_kind_label(app.kind, &app.target).to_string(),
                 target: app.target.to_url_base().dimmed().to_string(),
@@ -436,6 +443,23 @@ fn run_ls(cfg: CoulsonConfig, managed: Option<bool>, domain: Option<String>) -> 
     use tabled::settings::Style;
     let table = tabled::Table::new(&rows).with(Style::blank()).to_string();
     println!("{table}");
+
+    if let Some(ref name) = cwd_app {
+        if let Some(app) = apps.iter().find(|a| a.name == *name) {
+            let port = RpcClient::new(&cfg.control_socket)
+                .call("health.ping", serde_json::json!({}))
+                .ok()
+                .and_then(|v| v.get("http_port").and_then(|p| p.as_u64()))
+                .map(|p| p as u16)
+                .unwrap_or_else(|| cfg.listen_http.port());
+            let suffix = if port == 80 {
+                String::new()
+            } else {
+                format!(":{port}")
+            };
+            println!("\n  {}", format!("http://{}{suffix}", app.domain.0).cyan());
+        }
+    }
 
     Ok(())
 }
@@ -2338,9 +2362,9 @@ fn run_tunnel(cfg: CoulsonConfig, action: TunnelCommands) -> anyhow::Result<()> 
             println!();
             let has_token = credentials::get_api_token().ok().flatten().is_some();
             if has_token {
-                println!("CF API Token: {}", "saved in keychain".green());
+                println!("Cloudflare API Token: {}", "saved in keychain".green());
             } else {
-                println!("CF API Token: {}", "not configured".dimmed());
+                println!("Cloudflare API Token: {}", "not configured".dimmed());
             }
 
             Ok(())
