@@ -21,10 +21,6 @@ const IP_POLL_INTERVAL_SECS: u64 = 5;
 
 pub async fn run_mdns_responder(state: SharedState) -> anyhow::Result<()> {
     let mdns = ServiceDaemon::new()?;
-    // Disable non-loopback IPv6 to avoid AAAA record pollution.
-    // Per-service interface selection (loopback vs LAN) is handled by
-    // register_domain() via ServiceInfo::set_interfaces().
-    mdns.disable_interface(IfKind::IPv6)?;
 
     let mut route_rx = state.route_tx.subscribe();
     let mut network_rx = state.network_change_tx.subscribe();
