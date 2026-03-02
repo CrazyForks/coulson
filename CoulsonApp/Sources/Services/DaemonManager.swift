@@ -82,7 +82,8 @@ final class DaemonManager: ObservableObject {
             at: plistURL.deletingLastPathComponent(),
             withIntermediateDirectories: true)
 
-        // Bootout existing service first (ignore errors if not loaded)
+        // Re-enable in case stop() disabled it, then bootout stale state
+        _ = try? runLaunchctl(["enable", serviceTarget])
         if FileManager.default.fileExists(atPath: plistPath) {
             _ = try? runLaunchctl(["bootout", serviceTarget])
         }
@@ -150,7 +151,7 @@ final class DaemonManager: ObservableObject {
                 await checkStatus()
                 logger.info("daemon running: \(self.isDaemonRunning)")
             } catch {
-                logger.error("failed to install daemon: \(error.localizedDescription)")
+                logger.error("failed to install daemon: \(error.localizedDescription, privacy: .public)")
             }
         } else if !isVersionMatched {
             logger.info("daemon version mismatch (running: \(self.daemonVersion ?? "?"), bundled: \(self.bundledVersion ?? "?")), restarting")
@@ -160,7 +161,7 @@ final class DaemonManager: ObservableObject {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 await checkStatus()
             } catch {
-                logger.error("failed to restart daemon: \(error.localizedDescription)")
+                logger.error("failed to restart daemon: \(error.localizedDescription, privacy: .public)")
             }
         } else {
             logger.info("daemon already running (v\(self.daemonVersion ?? "?"))")
