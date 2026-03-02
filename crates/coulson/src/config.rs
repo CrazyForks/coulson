@@ -309,8 +309,20 @@ struct ConfigFile {
 
 impl ConfigFile {
     fn load() -> Self {
-        let path = xdg_config_home().join(format!("{DIR_NAME}/config.toml"));
-        let Ok(content) = std::fs::read_to_string(&path) else {
+        let config_dir = xdg_config_home().join(DIR_NAME);
+        let mut cfg = Self::load_file(&config_dir.join("config.toml"));
+
+        #[cfg(debug_assertions)]
+        {
+            let dev = Self::load_file(&config_dir.join("config.dev.toml"));
+            cfg.merge(dev);
+        }
+
+        cfg
+    }
+
+    fn load_file(path: &std::path::Path) -> Self {
+        let Ok(content) = std::fs::read_to_string(path) else {
             return Self::default();
         };
         match toml::from_str(&content) {
@@ -320,5 +332,29 @@ impl ConfigFile {
                 Self::default()
             }
         }
+    }
+
+    fn merge(&mut self, other: Self) {
+        macro_rules! merge_field {
+            ($($field:ident),*) => {
+                $(if other.$field.is_some() { self.$field = other.$field; })*
+            };
+        }
+        merge_field!(
+            listen_http,
+            listen_https,
+            control_socket,
+            sqlite_path,
+            scan_warnings_path,
+            domain_suffix,
+            apps_root,
+            watch_fs,
+            idle_timeout_secs,
+            link_dir,
+            inspect_max_requests,
+            certs_dir,
+            runtime_dir,
+            process_backend
+        );
     }
 }
