@@ -767,9 +767,8 @@ async fn try_serve_static(
             serve_file(session, &index, cors).await?;
             return Ok(true);
         }
-        // Directory exists in public/ → show listing (don't fallthrough to backend)
-        serve_directory_listing(session, &canonical_file, &canonical_root, req_path, cors).await?;
-        return Ok(true);
+        // Directory without index.html → fall through to backend
+        return Ok(false);
     }
 
     if meta.is_file() {
