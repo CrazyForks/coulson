@@ -112,6 +112,8 @@ final class DaemonManager: ObservableObject {
                 try install()
                 return
             }
+            // Clear stale launchd state left by disable+unload before bootstrapping
+            _ = try? runLaunchctl(["bootout", serviceTarget])
             try runLaunchctl(["bootstrap", "gui/\(getuid())", plistPath])
         }
     }
