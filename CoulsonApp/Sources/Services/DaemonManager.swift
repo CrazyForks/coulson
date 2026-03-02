@@ -101,10 +101,19 @@ final class DaemonManager: ObservableObject {
         }
     }
 
-    /// Start the daemon: re-enable and kickstart.
+    /// Start the daemon: enable and kickstart, or bootstrap if not loaded.
     nonisolated func start() throws {
         _ = try? runLaunchctl(["enable", serviceTarget])
-        try runLaunchctl(["kickstart", "-p", serviceTarget])
+        do {
+            try runLaunchctl(["kickstart", "-p", serviceTarget])
+        } catch {
+            // Service not loaded — bootstrap it
+            guard FileManager.default.fileExists(atPath: plistPath) else {
+                try install()
+                return
+            }
+            try runLaunchctl(["bootstrap", "gui/\(getuid())", plistPath])
+        }
     }
 
     /// Stop the daemon: disable to prevent auto-restart, then send SIGTERM.
