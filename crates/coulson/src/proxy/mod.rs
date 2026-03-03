@@ -586,7 +586,10 @@ fn run_proxy_blocking(
 ) -> anyhow::Result<()> {
     // When TLS is enabled, set ca_file on ServerConf to avoid loading macOS system
     // certificates (which may contain unsupported critical extensions that crash rustls).
-    let mut conf = pingora::server::configuration::ServerConf::default();
+    let mut conf = pingora::server::configuration::ServerConf {
+        threads: 4,
+        ..Default::default()
+    };
     if let Some(ref tls) = tls {
         conf.ca_file = Some(tls.ca_path.clone());
     }

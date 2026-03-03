@@ -2805,17 +2805,18 @@ fn which_exists(cmd: &str) -> bool {
 fn build_pf_rules(cfg: &CoulsonConfig) -> (String, String, String) {
     let http_port = cfg.listen_http.port();
     let https_port = cfg.listen_https.map(|a| a.port());
+    let ip = crate::config::PF_REDIRECT_IP;
     let anchor_ref = "rdr-anchor \"coulson\"".to_string();
     let anchor_load = "load anchor \"coulson\" from \"/etc/pf.anchors/coulson\"".to_string();
 
     let mut rules = format!(
-        "rdr pass inet proto tcp from any to any port 80 -> 127.0.0.1 port {http_port}\n\
-         rdr pass inet6 proto tcp from any to any port 80 -> ::1 port {http_port}\n"
+        "rdr pass on lo0 inet proto tcp from any to any port 80 -> {ip} port {http_port}\n\
+         rdr pass on lo0 inet6 proto tcp from any to any port 80 -> ::1 port {http_port}\n"
     );
     if let Some(port) = https_port {
         rules.push_str(&format!(
-            "rdr pass inet proto tcp from any to any port 443 -> 127.0.0.1 port {port}\n\
-             rdr pass inet6 proto tcp from any to any port 443 -> ::1 port {port}\n"
+            "rdr pass on lo0 inet proto tcp from any to any port 443 -> {ip} port {port}\n\
+             rdr pass on lo0 inet6 proto tcp from any to any port 443 -> ::1 port {port}\n"
         ));
     }
     (rules, anchor_ref, anchor_load)
@@ -2834,9 +2835,65 @@ fn is_pf_configured(cfg: &CoulsonConfig) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn ensure_loopback_alias() -> anyhow::Result<()> {
+    let ip = crate::config::PF_REDIRECT_IP;
+
+    // 1. Ensure alias exists on lo0
+    let output = std::process::Command::new("ifconfig")
+        .arg("lo0")
+        .output()
+        .context("failed to run ifconfig")?;
+    let ifconfig = String::from_utf8_lossy(&output.stdout);
+    if !ifconfig.contains(&format!("inet {ip} ")) {
+        let status = std::process::Command::new("ifconfig")
+            .args(["lo0", "alias", ip])
+            .status()
+            .context("failed to add loopback alias")?;
+        if !status.success() {
+            bail!("failed to add loopback alias {ip} to lo0");
+        }
+    }
+
+    // 2. Ensure launchd plist exists so the alias persists across reboots
+    let plist_path = "/Library/LaunchDaemons/com.coulson.loopback.plist";
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.coulson.loopback</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/sbin/ifconfig</string>
+        <string>lo0</string>
+        <string>alias</string>
+        <string>{ip}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"#
+    );
+    let existing = std::fs::read_to_string(plist_path).unwrap_or_default();
+    if existing != plist {
+        std::fs::write(plist_path, &plist)
+            .with_context(|| format!("failed to write {plist_path}"))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn setup_pf_forwarding(cfg: &CoulsonConfig) -> anyhow::Result<()> {
     let http_port = cfg.listen_http.port();
     let https_port = cfg.listen_https.map(|a| a.port());
+    let ip = crate::config::PF_REDIRECT_IP;
+
+    // Ensure loopback alias exists (pf redirects use a dedicated IP to
+    // avoid macOS pf state-tracking conflicts with direct connections)
+    ensure_loopback_alias()?;
 
     let anchor_path = std::path::Path::new("/etc/pf.anchors/coulson");
     let pf_conf_path = std::path::Path::new("/etc/pf.conf");
@@ -2910,9 +2967,9 @@ fn setup_pf_forwarding(cfg: &CoulsonConfig) -> anyhow::Result<()> {
 
     if status.success() {
         println!("{}", "Port forwarding enabled successfully!".green().bold());
-        println!("  80  -> 127.0.0.1:{http_port}");
+        println!("  80  -> {ip}:{http_port}");
         if let Some(port) = https_port {
-            println!("  443 -> 127.0.0.1:{port}");
+            println!("  443 -> {ip}:{port}");
         }
     } else {
         bail!("Failed to reload pf rules. You can manually reload: pfctl -f /etc/pf.conf");
