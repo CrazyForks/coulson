@@ -128,7 +128,9 @@ fn copy_headers(
 pub async fn bridge(session: &mut Session, dashboard_router: Router) -> Result<()> {
     let method = session.req_header().method.clone();
     let uri = session.req_header().uri.clone();
-    let mut builder = http::Request::builder().method(method).uri(uri);
+    let mut builder = http::Request::builder()
+        .method(method.clone())
+        .uri(uri.clone());
     for (name, value) in session.req_header().headers.iter() {
         builder = builder.header(name, value);
     }
@@ -156,7 +158,6 @@ pub async fn bridge(session: &mut Session, dashboard_router: Router) -> Result<(
             }
         }
     }
-
     let body = if body_bytes.is_empty() {
         axum::body::Body::empty()
     } else {
@@ -171,7 +172,6 @@ pub async fn bridge(session: &mut Session, dashboard_router: Router) -> Result<(
         .oneshot(request)
         .await
         .map_err(|e| Error::explain(ErrorType::InternalError, format!("axum oneshot: {e}")))?;
-
     let (parts, body) = response.into_parts();
     let status_code = parts.status.as_u16();
     let headers: Vec<(String, String)> = parts
@@ -208,7 +208,13 @@ pub async fn bridge(session: &mut Session, dashboard_router: Router) -> Result<(
             .map(|c| c.to_bytes())
             .unwrap_or_default();
         let mut resp = ResponseHeader::build(status_code, None)?;
-        copy_headers(&mut resp, &headers, false)?;
+        // Skip axum's content-length/transfer-encoding since we collected the
+        // full body and know the exact size.  Copying a stale
+        // `transfer-encoding: chunked` while writing raw bytes corrupts
+        // HTTP/1.1 keep-alive connections and violates HTTP/2 framing rules.
+        copy_headers(&mut resp, &headers, true)?;
+        let cl: http::HeaderValue = body_bytes.len().to_string().parse().unwrap();
+        resp.insert_header(http::header::CONTENT_LENGTH, cl)?;
         session.write_response_header(Box::new(resp), false).await?;
         session.write_response_body(Some(body_bytes), true).await?;
     }
