@@ -223,6 +223,63 @@ pub fn allocate_port() -> Result<u16> {
     Ok(port)
 }
 
+/// Use the PORT from env_overrides if set, otherwise allocate a free port.
+pub fn resolve_port(env: &HashMap<String, String>) -> Result<u16> {
+    if let Some(val) = env.get("PORT") {
+        let port: u16 = val
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid PORT in .coulsonrc: {val}: {e}"))?;
+        if port == 0 {
+            anyhow::bail!("PORT=0 is not valid in .coulsonrc; remove it to use auto-allocation");
+        }
+        Ok(port)
+    } else {
+        allocate_port()
+    }
+}
+
+/// Parse a `.coulsonrc` file from the app root directory.
+///
+/// Format: simple `KEY=VALUE` lines (shell-style). Supports:
+/// - `#` comments and blank lines
+/// - Optional quoting (`KEY="value"` or `KEY='value'`)
+/// - `export KEY=VALUE` prefix
+pub fn load_coulsonrc(root: &Path) -> HashMap<String, String> {
+    let path = root.join(".coulsonrc");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    debug!(path = %path.display(), "loaded .coulsonrc");
+    parse_dotenv(&content)
+}
+
+fn parse_dotenv(content: &str) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        if let Some((key, val)) = line.split_once('=') {
+            let key = key.trim();
+            let val = val.trim();
+            // Strip matching quotes
+            let val = if val.len() >= 2
+                && ((val.starts_with('"') && val.ends_with('"'))
+                    || (val.starts_with('\'') && val.ends_with('\'')))
+            {
+                &val[1..val.len() - 1]
+            } else {
+                val
+            };
+            env.insert(key.to_string(), val.to_string());
+        }
+    }
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -371,12 +371,14 @@ impl ProcessManager {
             .with_context(|| format!("failed to create {}", managed_dir.display()))?;
         let sockets_dir = std::fs::canonicalize(&managed_dir).unwrap_or(managed_dir);
 
+        let env_overrides = crate::process::provider::load_coulsonrc(root);
+
         let managed_app = ManagedApp {
             name: name.to_string(),
             root: root.to_path_buf(),
             kind: kind.to_string(),
             manifest: None,
-            env_overrides: HashMap::new(),
+            env_overrides,
             socket_dir: sockets_dir.clone(),
         };
 

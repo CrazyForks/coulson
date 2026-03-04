@@ -4,7 +4,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::provider::{
-    allocate_port, DetectedApp, ListenTarget, ManagedApp, ProcessProvider, ProcessSpec,
+    resolve_port, DetectedApp, ListenTarget, ManagedApp, ProcessProvider, ProcessSpec,
 };
 
 /// Procfile provider — manages applications defined by a standard Procfile.
@@ -87,7 +87,7 @@ impl ProcessProvider for ProcfileProvider {
         // 1. coulson.json command override
         if let Some(manifest) = &app.manifest {
             if let Some(cmd) = manifest.get("command").and_then(|v| v.as_str()) {
-                let port = allocate_port()?;
+                let port = resolve_port(&app.env_overrides)?;
                 let mut env = std::collections::HashMap::new();
                 env.insert("PORT".to_string(), port.to_string());
                 env.extend(app.env_overrides.clone());
@@ -123,7 +123,7 @@ impl ProcessProvider for ProcfileProvider {
         };
 
         // 5. Allocate port + PORT env
-        let port = allocate_port()?;
+        let port = resolve_port(&app.env_overrides)?;
         let mut env = std::collections::HashMap::new();
         env.insert("PORT".to_string(), port.to_string());
         env.extend(app.env_overrides.clone());
