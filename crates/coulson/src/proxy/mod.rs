@@ -469,6 +469,25 @@ impl ProxyHttp for BridgeProxy {
         // Strip internal tunnel marker before forwarding to backend
         upstream_request.remove_header(crate::tunnel::proxy::VIA_TUNNEL_HEADER);
 
+        // RFC 9113 §8.2.3: when proxying HTTP/2 → HTTP/1.1, multiple Cookie
+        // headers MUST be concatenated with "; " into a single header.
+        // Puma/Rack uses the generic ", " join for duplicate headers, which
+        // breaks cookie parsing and causes CSRF failures.
+        let cookies: Vec<Vec<u8>> = upstream_request
+            .headers
+            .get_all(http::header::COOKIE)
+            .iter()
+            .map(|v| v.as_bytes().to_vec())
+            .collect();
+        if cookies.len() > 1 {
+            upstream_request.remove_header(http::header::COOKIE.as_str());
+            let merged = cookies.join(&b"; "[..]);
+            let value = http::HeaderValue::from_bytes(&merged).map_err(|e| {
+                Error::because(ErrorType::InternalError, "invalid cookie header", e)
+            })?;
+            upstream_request.insert_header(http::header::COOKIE, value)?;
+        }
+
         if let Some(upgrade) = _session.req_header().headers.get("upgrade").cloned() {
             upstream_request.insert_header("Upgrade", upgrade)?;
             upstream_request.insert_header("Connection", "Upgrade")?;
