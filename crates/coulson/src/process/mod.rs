@@ -406,8 +406,11 @@ impl ProcessManager {
         spec: &ProcessSpec,
         log_path: &Path,
     ) -> anyhow::Result<ProcessHandle> {
-        let log_file = std::fs::File::create(log_path)
-            .with_context(|| format!("failed to create log file {}", log_path.display()))?;
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("failed to open log file {}", log_path.display()))?;
         let stderr_file = log_file
             .try_clone()
             .with_context(|| "failed to clone log file handle")?;
