@@ -474,9 +474,14 @@ impl ProxyHttp for BridgeProxy {
             upstream_request.insert_header("Connection", "Upgrade")?;
         }
 
-        let is_tls = _session.digest().is_some_and(|d| d.ssl_digest.is_some());
-        upstream_request
-            .insert_header("X-Forwarded-Proto", if is_tls { "https" } else { "http" })?;
+        // Set X-Forwarded-Proto based on downstream connection type.
+        // For tunnel requests, the tunnel proxy already set this to "https"
+        // — only override if not already present.
+        if upstream_request.headers.get("X-Forwarded-Proto").is_none() {
+            let is_tls = _session.digest().is_some_and(|d| d.ssl_digest.is_some());
+            upstream_request
+                .insert_header("X-Forwarded-Proto", if is_tls { "https" } else { "http" })?;
+        }
 
         Ok(())
     }
