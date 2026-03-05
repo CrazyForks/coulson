@@ -4,6 +4,20 @@ A macOS local development gateway. Say goodbye to `localhost:port` — each proj
 
 One solution covering local, LAN, and public access — `.local` domains let phones and nearby devices connect directly, and a single command generates a public URL via Tunnel. Works great with AI IDEs like Cursor and Windsurf.
 
+## Why Not Just `localhost:port`?
+
+Every project on `localhost` shares the same origin. This causes real problems:
+
+- **Cookies collide** — session tokens, JWTs, and auth cookies from one project leak into another, causing mysterious login loops and 403 errors
+- **Saved passwords mix up** — the browser autofills credentials from project A into project B because they're both `localhost`
+- **Browser history is useless** — `localhost:3000`, `localhost:3001`, `localhost:8080`... which project was which?
+- **localStorage/IndexedDB overlap** — data from different projects stomps on each other when they use the same keys
+- **Port conflicts** — "address already in use" when two projects default to the same port; you waste time hunting which process to kill
+- **Remembering ports** — was it `:3000` or `:3001`? You end up grepping configs or checking `lsof`
+- **AI coding gets confused too** — when you tell Cursor or Claude Code "restart my server", the AI has to figure out which port, which process, which command — and often gets it wrong
+
+Coulson gives every project its own domain (`myapp.coulson.local`). Cookies, storage, passwords, and history are isolated by the browser automatically — the way they were designed to work. And when you tell your AI assistant "restart myapp", it just runs `coulson restart myapp` — no ports to remember, no processes to hunt down. The entire process group is killed cleanly (SIGTERM → SIGKILL), so child processes like file watchers, worker threads, and bundlers don't linger as orphans hogging ports.
+
 ## Features
 
 - **Zero-config routing** — directory/file name becomes the domain (`myapp` → `myapp.coulson.local`)
@@ -14,6 +28,8 @@ One solution covering local, LAN, and public access — `.local` domains let pho
 - **mDNS** — `.local` domains work out of the box, LAN and mobile devices connect directly
 - **Cloudflare Tunnel** — one command generates a public URL for sharing
 - **Web Dashboard + Menu bar app** — visual management
+
+![Request Inspector](https://coulson.hola.ac/assets/screenshot-inspector.png)
 
 ## Install
 
