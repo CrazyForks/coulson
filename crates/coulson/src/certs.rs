@@ -272,9 +272,7 @@ impl SniCertProvider {
                     return;
                 }
 
-                self.cert_cache
-                    .write()
-                    .insert(sni.to_string(), (cert, key));
+                self.cert_cache.write().insert(sni.to_string(), (cert, key));
                 debug!(sni, "generated on-demand cert");
             }
             Err(err) => {

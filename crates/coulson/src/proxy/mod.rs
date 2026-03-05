@@ -648,8 +648,7 @@ fn run_proxy_blocking(
     // TLS listener with HTTP/2 + HTTP/1.1 ALPN via dynamic SNI cert callback
     if let Some(tls) = tls {
         let cb: pingora::listeners::TlsAcceptCallbacks = Box::new(tls.sni_callback.clone());
-        let mut tls_settings =
-            pingora::listeners::tls::TlsSettings::with_callbacks(cb)?;
+        let mut tls_settings = pingora::listeners::tls::TlsSettings::with_callbacks(cb)?;
         tls_settings.enable_h2();
         service.add_tls_with_settings(&tls.bind, None, tls_settings);
         if let Ok(addr) = tls.bind.parse::<std::net::SocketAddr>() {
@@ -663,8 +662,7 @@ fn run_proxy_blocking(
             if let Some(v6_bind) = v6_bind {
                 let v6_cb: pingora::listeners::TlsAcceptCallbacks =
                     Box::new(tls.sni_callback.clone());
-                let mut v6_settings =
-                    pingora::listeners::tls::TlsSettings::with_callbacks(v6_cb)?;
+                let mut v6_settings = pingora::listeners::tls::TlsSettings::with_callbacks(v6_cb)?;
                 v6_settings.enable_h2();
                 service.add_tls_with_settings(&v6_bind, None, v6_settings);
             }
