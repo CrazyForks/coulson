@@ -38,12 +38,14 @@ pub enum TunnelRouting {
 
 const EDGE_SNI: &str = "h2.cftunnel.com";
 const UPGRADE_HEADER: &str = "cf-cloudflared-proxy-connection-upgrade";
+const TCP_PROXY_SRC_HEADER: &str = "cf-cloudflared-proxy-src";
 
 #[derive(Debug)]
 enum StreamType {
     ControlStream,
     UpdateConfiguration,
     Http,
+    Tcp,
 }
 
 fn detect_stream_type(req: &Request<h2::RecvStream>) -> StreamType {
@@ -54,6 +56,9 @@ fn detect_stream_type(req: &Request<h2::RecvStream>) -> StreamType {
         if val.as_bytes() == b"update-configuration" {
             return StreamType::UpdateConfiguration;
         }
+    }
+    if req.headers().get(TCP_PROXY_SRC_HEADER).is_some() {
+        return StreamType::Tcp;
     }
     StreamType::Http
 }
@@ -303,6 +308,13 @@ async fn try_connect(
                     warn!(error = %err, "failed to ack update-configuration");
                 }
             }
+            StreamType::Tcp => {
+                tokio::spawn(async move {
+                    if let Err(err) = proxy_tcp_stream(request, send_response).await {
+                        error!(error = %err, "tcp proxy failed");
+                    }
+                });
+            }
             StreamType::Http => {
                 let routing = routing.clone();
                 tokio::spawn(async move {
@@ -437,6 +449,49 @@ async fn try_connect(
 
     // Remove this connection's info on disconnect
     conns.write().retain(|c| c.conn_index != conn_index);
+
+    Ok(())
+}
+
+async fn proxy_tcp_stream(
+    request: Request<h2::RecvStream>,
+    mut send_response: h2::server::SendResponse<bytes::Bytes>,
+) -> anyhow::Result<()> {
+    let (parts, recv_body) = request.into_parts();
+    let dest = parts
+        .uri
+        .authority()
+        .map(|a| a.as_str().to_string())
+        .or_else(|| {
+            parts
+                .headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .context("no destination in TCP stream request")?;
+
+    debug!(%dest, "TCP proxy: dialing origin");
+
+    let mut tcp_stream = match TcpStream::connect(&dest).await {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(%dest, error = %err, "TCP proxy: connect failed");
+            let resp = http::Response::builder().status(502).body(()).unwrap();
+            let _ = send_response.send_response(resp, true);
+            anyhow::bail!("TCP proxy: failed to connect to {dest}: {err}");
+        }
+    };
+
+    let response = http::Response::builder().status(200).body(()).unwrap();
+    let send_stream = send_response
+        .send_response(response, false)
+        .context("TCP proxy: failed to send ACK")?;
+
+    debug!(%dest, "TCP proxy: connection established, piping");
+
+    let mut h2_stream = rpc::H2Stream::new(recv_body, send_stream);
+    let _ = tokio::io::copy_bidirectional(&mut h2_stream, &mut tcp_stream).await;
 
     Ok(())
 }

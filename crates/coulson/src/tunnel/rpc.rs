@@ -20,14 +20,14 @@ pub mod tunnelrpc_capnp {
 }
 
 /// Adapter: h2 RecvStream + SendStream → AsyncRead + AsyncWrite
-struct H2Stream {
+pub(super) struct H2Stream {
     recv: RecvStream,
     send: SendStream<Bytes>,
     recv_buf: Bytes,
 }
 
 impl H2Stream {
-    fn new(recv: RecvStream, send: SendStream<Bytes>) -> Self {
+    pub(super) fn new(recv: RecvStream, send: SendStream<Bytes>) -> Self {
         Self {
             recv,
             send,
