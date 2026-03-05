@@ -115,6 +115,25 @@ curl -i http://myapi.coulson.local:18080/
 
 First request auto-detects the package manager (bun/pnpm/yarn/npm), allocates a free port via the `PORT` environment variable, and runs the `dev` or `start` script. Reaped after 15 minutes idle.
 
+### Procfile App
+
+Projects with a `Procfile` (or `Procfile.dev`) containing a `web:` process are auto-managed:
+
+```
+~/Projects/myapp/
+  Procfile            # web: bundle exec rails server -p $PORT
+```
+
+```bash
+ln -s ~/Projects/myapp ~/.coulson/myapp
+```
+
+```bash
+curl -i http://myapp.coulson.local:18080/
+```
+
+First request allocates a free port via `$PORT`, runs the `web` command, and proxies traffic. `Procfile.dev` takes priority over `Procfile` when both exist.
+
 ### Static Directory
 
 Projects with a `public` subdirectory are automatically served as static files:
