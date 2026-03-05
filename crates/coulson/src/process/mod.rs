@@ -417,15 +417,11 @@ impl ProcessManager {
 
         let env_overrides = crate::process::provider::load_coulsonrc(root);
 
-        let companion_types: Vec<String> = env_overrides
-            .get("COULSON_MANAGED_SERVICES")
-            .map(|s| {
-                s.split(',')
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty() && t != "web")
-                    .collect()
-            })
-            .unwrap_or_default();
+        let companion_types = parse_managed_services(
+            env_overrides
+                .get("COULSON_MANAGED_SERVICES")
+                .map(|s| s.as_str()),
+        );
 
         if !companion_types.is_empty() && kind != "procfile" {
             warn!(
@@ -881,6 +877,18 @@ async fn quick_ready_check(target: &ListenTarget) -> bool {
 }
 
 /// Human-readable display of a listen target.
+/// Parse `COULSON_MANAGED_SERVICES` value into companion process types (excluding "web").
+fn parse_managed_services(value: Option<&str>) -> Vec<String> {
+    value
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty() && t != "web")
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn listen_target_display(target: &ListenTarget) -> String {
     match target {
         ListenTarget::Uds(path) => path.to_string_lossy().to_string(),
@@ -918,5 +926,40 @@ async fn kill_process_group(child: &mut Child) {
         Err(e) => {
             warn!(pid, error = %e, "failed to check process status, skipping group kill");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_managed_services_with_companions() {
+        let result = parse_managed_services(Some("web,worker, release "));
+        assert_eq!(result, vec!["worker", "release"]);
+    }
+
+    #[test]
+    fn parse_managed_services_web_only() {
+        let result = parse_managed_services(Some("web"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_managed_services_empty_string() {
+        let result = parse_managed_services(Some(""));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_managed_services_none() {
+        let result = parse_managed_services(None);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_managed_services_no_web() {
+        let result = parse_managed_services(Some("worker,scheduler"));
+        assert_eq!(result, vec!["worker", "scheduler"]);
     }
 }
