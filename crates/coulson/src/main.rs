@@ -33,7 +33,7 @@ use tracing::{debug, error, info};
 
 use tabled::Tabled;
 
-use crate::config::CoulsonConfig;
+use crate::config::{CoulsonConfig, LOCALHOST_SUFFIX};
 use crate::domain::{BackendTarget, TunnelMode};
 use crate::process::{ProcessManagerHandle, ProviderRegistry};
 use crate::rpc_client::RpcClient;
@@ -967,15 +967,22 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
         }
     }
 
-    // TLS certificate setup
+    // TLS certificate setup with dynamic per-SNI cert resolver.
+    // The wildcard cert covers *.{domain_suffix}; .localhost certs are
+    // generated on demand (browsers reject *.localhost wildcards per PSL).
     let tls_config = if let Some(https_addr) = cfg.listen_https {
         match certs::CertManager::ensure(&cfg.certs_dir, &cfg.domain_suffix) {
-            Ok(cm) => Some(proxy::TlsConfig {
-                bind: https_addr.to_string(),
-                cert_path: cm.cert_path().to_string(),
-                key_path: cm.key_path().to_string(),
-                ca_path: cm.ca_path().to_string(),
-            }),
+            Ok(cm) => match cm.build_resolver(&cfg.domain_suffix) {
+                Ok(resolver) => Some(proxy::TlsConfig {
+                    bind: https_addr.to_string(),
+                    ca_path: cm.ca_path().to_string(),
+                    resolver: std::sync::Arc::new(resolver),
+                }),
+                Err(err) => {
+                    error!(error = %err, "failed to build TLS cert resolver, HTTPS disabled");
+                    None
+                }
+            },
             Err(err) => {
                 error!(error = %err, "failed to initialize TLS certificates, HTTPS disabled");
                 None

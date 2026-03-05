@@ -15,6 +15,7 @@ use percent_encoding::percent_decode_str;
 use serde::Serialize;
 use tera::{Context, Tera};
 
+use crate::config::LOCALHOST_SUFFIX;
 use crate::domain::BackendTarget;
 use crate::process::{ListenTarget, ProcessManagerHandle, StartStatus};
 use crate::store::CapturedRequest;
@@ -580,9 +581,8 @@ impl ProxyHttp for BridgeProxy {
 
 pub struct TlsConfig {
     pub bind: String,
-    pub cert_path: String,
-    pub key_path: String,
     pub ca_path: String,
+    pub resolver: std::sync::Arc<crate::certs::DynamicCertResolver>,
 }
 
 pub async fn run_proxy(
@@ -645,10 +645,11 @@ fn run_proxy_blocking(
         }
     }
 
-    // TLS listener with HTTP/2 + HTTP/1.1 ALPN
+    // TLS listener with HTTP/2 + HTTP/1.1 ALPN via dynamic cert resolver
     if let Some(tls) = tls {
-        let mut tls_settings =
-            pingora::listeners::tls::TlsSettings::intermediate(&tls.cert_path, &tls.key_path)?;
+        let mut tls_settings = pingora::listeners::tls::TlsSettings::from_server_config(
+            crate::certs::build_server_config(tls.resolver.clone()),
+        );
         tls_settings.enable_h2();
         service.add_tls_with_settings(&tls.bind, None, tls_settings);
         if let Ok(addr) = tls.bind.parse::<std::net::SocketAddr>() {
@@ -660,10 +661,9 @@ fn run_proxy_blocking(
                 None
             };
             if let Some(v6_bind) = v6_bind {
-                let mut v6_settings = pingora::listeners::tls::TlsSettings::intermediate(
-                    &tls.cert_path,
-                    &tls.key_path,
-                )?;
+                let mut v6_settings = pingora::listeners::tls::TlsSettings::from_server_config(
+                    crate::certs::build_server_config(tls.resolver.clone()),
+                );
                 v6_settings.enable_h2();
                 service.add_tls_with_settings(&v6_bind, None, v6_settings);
             }
