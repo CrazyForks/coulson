@@ -155,6 +155,18 @@ curl -i http://docs.coulson.local:18080/
 
 Changes are picked up automatically within 2 seconds.
 
+### `.coulsonrc` — Per-App Environment
+
+Add a `.coulsonrc` file to any managed app directory to set environment variables:
+
+```
+# ~/Projects/myapp/.coulsonrc
+PORT=4000
+DATABASE_URL=postgres://localhost/myapp_dev
+```
+
+When `PORT` is set, the app always starts on that fixed port instead of auto-allocating one. Supports `KEY=VALUE` format with `#` comments, optional quoting, and `export` prefix.
+
 ## Cloudflare Tunnel
 
 Start/stop tunnels via CLI:
