@@ -147,39 +147,37 @@ impl ProcessManager {
 
     pub fn list_status(&mut self) -> Vec<ProcessInfo> {
         let now = Instant::now();
-        self.processes
-            .iter_mut()
-            .map(|(app_id, group)| {
-                let proc = &mut group.primary;
-                let (pid, alive, backend) = match &mut proc.handle {
-                    ProcessHandle::Direct { child } => {
-                        let pid = child.id().unwrap_or(0);
-                        let alive = matches!(child.try_wait(), Ok(None));
-                        (pid, alive, "direct")
-                    }
-                    ProcessHandle::Tmux { session_name } => {
-                        let pid = tmux_pane_pid(session_name).unwrap_or(0);
-                        let alive = if pid != 0 {
-                            tmux_pane_alive(session_name)
-                        } else {
-                            false
-                        };
-                        (pid, alive, "tmux")
-                    }
-                };
-                ProcessInfo {
+        let mut result = Vec::new();
+        for (app_id, group) in &mut self.processes {
+            let proc = &mut group.primary;
+            let (pid, alive, backend) = handle_status(&mut proc.handle);
+            result.push(ProcessInfo {
+                app_id: *app_id,
+                pid,
+                kind: proc.kind.clone(),
+                process_type: "web".to_string(),
+                listen_address: listen_target_display(&proc.listen_target),
+                uptime_secs: now.duration_since(proc.started_at).as_secs(),
+                idle_secs: now.duration_since(proc.last_active).as_secs(),
+                alive,
+                backend: backend.to_string(),
+            });
+            for companion in &mut group.companions {
+                let (c_pid, c_alive, c_backend) = handle_status(&mut companion.handle);
+                result.push(ProcessInfo {
                     app_id: *app_id,
-                    pid,
+                    pid: c_pid,
                     kind: proc.kind.clone(),
-                    process_type: "web".to_string(),
-                    listen_address: listen_target_display(&proc.listen_target),
+                    process_type: companion.process_type.clone(),
+                    listen_address: String::new(),
                     uptime_secs: now.duration_since(proc.started_at).as_secs(),
                     idle_secs: now.duration_since(proc.last_active).as_secs(),
-                    alive,
-                    backend: backend.to_string(),
-                }
-            })
-            .collect()
+                    alive: c_alive,
+                    backend: c_backend.to_string(),
+                });
+            }
+        }
+        result
     }
 
     /// Returns the listen target for the managed app, starting the process if needed.
@@ -729,6 +727,26 @@ fn login_shell_args(cmd: &str) -> (PathBuf, Vec<String>) {
         _ => cmd.to_string(),
     };
     (shell, vec!["-l".to_string(), "-c".to_string(), full_cmd])
+}
+
+/// Extract pid, alive status, and backend name from a process handle.
+fn handle_status(handle: &mut ProcessHandle) -> (u32, bool, &'static str) {
+    match handle {
+        ProcessHandle::Direct { child } => {
+            let pid = child.id().unwrap_or(0);
+            let alive = matches!(child.try_wait(), Ok(None));
+            (pid, alive, "direct")
+        }
+        ProcessHandle::Tmux { session_name } => {
+            let pid = tmux_pane_pid(session_name).unwrap_or(0);
+            let alive = if pid != 0 {
+                tmux_pane_alive(session_name)
+            } else {
+                false
+            };
+            (pid, alive, "tmux")
+        }
+    }
 }
 
 /// Check whether the process handle is still alive.
