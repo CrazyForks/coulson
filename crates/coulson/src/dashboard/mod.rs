@@ -30,11 +30,23 @@ pub fn is_dashboard_host(host: &str, domain_suffix: &str) -> bool {
 /// Returns true if the host matches the "default" entry point:
 /// bare domain suffix (e.g. "coulson.local") or IP direct access.
 pub fn is_default_host(host: &str, domain_suffix: &str) -> bool {
-    host == domain_suffix
+    if host == domain_suffix
         || host == "127.0.0.1"
         || host == "localhost"
         || host == "::1"
         || host == "[::1]"
+    {
+        return true;
+    }
+    // bare suffix .localhost equivalent: coulson.local → coulson.localhost
+    if domain_suffix != LOCALHOST_SUFFIX {
+        if let Some(prefix) = domain_suffix.split('.').next() {
+            if host == format!("{prefix}.{LOCALHOST_SUFFIX}") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn router(state: DashboardState) -> Router {
