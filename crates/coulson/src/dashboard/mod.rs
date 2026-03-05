@@ -9,6 +9,7 @@ use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use tower::ServiceExt;
 
+use crate::config::LOCALHOST_SUFFIX;
 use crate::SharedState;
 
 pub use render::execute_replay;
@@ -23,6 +24,7 @@ pub struct DashboardState {
 pub fn is_dashboard_host(host: &str, domain_suffix: &str) -> bool {
     let dashboard_host = format!("dashboard.{domain_suffix}");
     host == dashboard_host
+        || (domain_suffix != LOCALHOST_SUFFIX && host == format!("dashboard.{LOCALHOST_SUFFIX}"))
 }
 
 /// Returns true if the host matches the "default" entry point:

@@ -199,7 +199,13 @@ pub async fn frame_urls(State(state): State<DashboardState>, Path(id): Path<Stri
     let https_port = state.shared.listen_https.map(|a| a.port());
     let app_view = AppView::from_spec(&app, port);
     let gtd = global_tunnel_domain(&state.shared);
-    let urls = build_urls(&app, port, https_port, gtd.as_deref());
+    let urls = build_urls(
+        &app,
+        port,
+        https_port,
+        &state.shared.domain_suffix,
+        gtd.as_deref(),
+    );
     let mut ctx = base_context(&state.shared);
     ctx.insert("app", &app_view);
     ctx.insert("urls", &urls);

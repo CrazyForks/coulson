@@ -607,6 +607,7 @@ pub fn build_urls(
     app: &AppSpec,
     port: u16,
     https_port: Option<u16>,
+    domain_suffix: &str,
     global_tunnel_domain: Option<&str>,
 ) -> Vec<UrlView> {
     let mut urls = Vec::new();
@@ -620,6 +621,16 @@ pub fn build_urls(
             href: format!("https://{}:{}{}", &app.domain.0, hp, path),
             is_link: true,
         });
+    }
+    // .localhost alias URLs (RFC 6761 — zero-config resolution to 127.0.0.1)
+    if domain_suffix != crate::config::LOCALHOST_SUFFIX {
+        if let Some(prefix) = app.domain.0.strip_suffix(&format!(".{domain_suffix}")) {
+            let lh = format!("{prefix}.{}", crate::config::LOCALHOST_SUFFIX);
+            urls.push(UrlView {
+                href: format!("http://{lh}:{port}{path}"),
+                is_link: true,
+            });
+        }
     }
     match &app.target {
         BackendTarget::Tcp { host, port } => urls.push(UrlView {
