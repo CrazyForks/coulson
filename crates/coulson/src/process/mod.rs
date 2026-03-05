@@ -66,8 +66,19 @@ struct ManagedProcess {
     ready: bool,
 }
 
+#[allow(dead_code)]
+struct CompanionProcess {
+    process_type: String,
+    handle: ProcessHandle,
+}
+
+struct ProcessGroup {
+    primary: ManagedProcess,
+    companions: Vec<CompanionProcess>,
+}
+
 pub struct ProcessManager {
-    processes: HashMap<i64, ManagedProcess>,
+    processes: HashMap<i64, ProcessGroup>,
     idle_timeout: Duration,
     registry: Arc<ProviderRegistry>,
     runtime_dir: PathBuf,
@@ -86,6 +97,7 @@ pub struct ProcessInfo {
     pub app_id: i64,
     pub pid: u32,
     pub kind: String,
+    pub process_type: String,
     pub listen_address: String,
     pub uptime_secs: u64,
     pub idle_secs: u64,
@@ -137,7 +149,8 @@ impl ProcessManager {
         let now = Instant::now();
         self.processes
             .iter_mut()
-            .map(|(app_id, proc)| {
+            .map(|(app_id, group)| {
+                let proc = &mut group.primary;
                 let (pid, alive, backend) = match &mut proc.handle {
                     ProcessHandle::Direct { child } => {
                         let pid = child.id().unwrap_or(0);
@@ -158,6 +171,7 @@ impl ProcessManager {
                     app_id: *app_id,
                     pid,
                     kind: proc.kind.clone(),
+                    process_type: "web".to_string(),
                     listen_address: listen_target_display(&proc.listen_target),
                     uptime_secs: now.duration_since(proc.started_at).as_secs(),
                     idle_secs: now.duration_since(proc.last_active).as_secs(),
@@ -177,18 +191,22 @@ impl ProcessManager {
         kind: &str,
     ) -> anyhow::Result<ListenTarget> {
         // Check if already running and alive
-        if let Some(proc) = self.processes.get_mut(&app_id) {
-            if is_alive(&mut proc.handle) {
-                proc.last_active = Instant::now();
-                return Ok(proc.listen_target.clone());
+        if let Some(group) = self.processes.get_mut(&app_id) {
+            if is_alive(&mut group.primary.handle) {
+                group.primary.last_active = Instant::now();
+                return Ok(group.primary.listen_target.clone());
             }
             info!(app_id, "managed process exited, will restart");
             let removed = self.processes.remove(&app_id).unwrap();
-            kill_handle(removed.handle).await;
-            cleanup_listen_target(&removed.listen_target);
+            for companion in removed.companions {
+                kill_handle(companion.handle).await;
+            }
+            kill_handle(removed.primary.handle).await;
+            cleanup_listen_target(&removed.primary.listen_target);
         }
 
-        let (spec, sockets_dir, prov_name) = self.resolve_spec(app_id, name, root, kind)?;
+        let (spec, sockets_dir, prov_name, companion_types) =
+            self.resolve_spec(app_id, name, root, kind)?;
 
         info!(
             app_id,
@@ -206,16 +224,22 @@ impl ProcessManager {
         const READY_TIMEOUT_SECS: u64 = 30;
         wait_for_ready(&spec.listen_target, Duration::from_secs(READY_TIMEOUT_SECS)).await?;
 
+        let companions =
+            self.spawn_companions(app_id, name, root, kind, &companion_types, &sockets_dir);
+
         let now = Instant::now();
         self.processes.insert(
             app_id,
-            ManagedProcess {
-                handle,
-                listen_target: spec.listen_target.clone(),
-                started_at: now,
-                last_active: now,
-                kind: kind.to_string(),
-                ready: true,
+            ProcessGroup {
+                primary: ManagedProcess {
+                    handle,
+                    listen_target: spec.listen_target.clone(),
+                    started_at: now,
+                    last_active: now,
+                    kind: kind.to_string(),
+                    ready: true,
+                },
+                companions,
             },
         );
 
@@ -230,24 +254,27 @@ impl ProcessManager {
         root: &Path,
         kind: &str,
     ) -> anyhow::Result<StartStatus> {
-        if let Some(proc) = self.processes.get_mut(&app_id) {
-            if is_alive(&mut proc.handle) {
-                if proc.ready {
-                    proc.last_active = Instant::now();
-                    return Ok(StartStatus::Ready(proc.listen_target.clone()));
+        if let Some(group) = self.processes.get_mut(&app_id) {
+            if is_alive(&mut group.primary.handle) {
+                if group.primary.ready {
+                    group.primary.last_active = Instant::now();
+                    return Ok(StartStatus::Ready(group.primary.listen_target.clone()));
                 }
                 // Not yet marked ready — probe
-                if quick_ready_check(&proc.listen_target).await {
-                    proc.ready = true;
-                    proc.last_active = Instant::now();
-                    return Ok(StartStatus::Ready(proc.listen_target.clone()));
+                if quick_ready_check(&group.primary.listen_target).await {
+                    group.primary.ready = true;
+                    group.primary.last_active = Instant::now();
+                    return Ok(StartStatus::Ready(group.primary.listen_target.clone()));
                 }
                 // Still not ready — check startup timeout
                 const STARTUP_TIMEOUT_SECS: u64 = 30;
-                if proc.started_at.elapsed() > Duration::from_secs(STARTUP_TIMEOUT_SECS) {
+                if group.primary.started_at.elapsed() > Duration::from_secs(STARTUP_TIMEOUT_SECS) {
                     let removed = self.processes.remove(&app_id).unwrap();
-                    kill_handle(removed.handle).await;
-                    cleanup_listen_target(&removed.listen_target);
+                    for companion in removed.companions {
+                        kill_handle(companion.handle).await;
+                    }
+                    kill_handle(removed.primary.handle).await;
+                    cleanup_listen_target(&removed.primary.listen_target);
                     anyhow::bail!(
                         "managed process for {name} (app_id={app_id}) failed to become ready within {STARTUP_TIMEOUT_SECS}s"
                     );
@@ -256,11 +283,15 @@ impl ProcessManager {
             }
             info!(app_id, "managed process exited, will restart");
             let removed = self.processes.remove(&app_id).unwrap();
-            kill_handle(removed.handle).await;
-            cleanup_listen_target(&removed.listen_target);
+            for companion in removed.companions {
+                kill_handle(companion.handle).await;
+            }
+            kill_handle(removed.primary.handle).await;
+            cleanup_listen_target(&removed.primary.listen_target);
         }
 
-        let (spec, sockets_dir, prov_name) = self.resolve_spec(app_id, name, root, kind)?;
+        let (spec, sockets_dir, prov_name, companion_types) =
+            self.resolve_spec(app_id, name, root, kind)?;
 
         info!(
             app_id,
@@ -275,16 +306,22 @@ impl ProcessManager {
         let log_path = sockets_dir.join(format!("{name}.log"));
         let handle = self.spawn_process(name, &spec, &log_path, &sockets_dir)?;
 
+        let companions =
+            self.spawn_companions(app_id, name, root, kind, &companion_types, &sockets_dir);
+
         let now = Instant::now();
         self.processes.insert(
             app_id,
-            ManagedProcess {
-                handle,
-                listen_target: spec.listen_target,
-                started_at: now,
-                last_active: now,
-                kind: kind.to_string(),
-                ready: false,
+            ProcessGroup {
+                primary: ManagedProcess {
+                    handle,
+                    listen_target: spec.listen_target,
+                    started_at: now,
+                    last_active: now,
+                    kind: kind.to_string(),
+                    ready: false,
+                },
+                companions,
             },
         );
 
@@ -293,10 +330,13 @@ impl ProcessManager {
 
     /// Kill a specific managed process. Returns true if it was found and killed.
     pub async fn kill_process(&mut self, app_id: i64) -> bool {
-        if let Some(proc) = self.processes.remove(&app_id) {
+        if let Some(group) = self.processes.remove(&app_id) {
             info!(app_id, "killing managed process");
-            kill_handle(proc.handle).await;
-            cleanup_listen_target(&proc.listen_target);
+            for companion in group.companions {
+                kill_handle(companion.handle).await;
+            }
+            kill_handle(group.primary.handle).await;
+            cleanup_listen_target(&group.primary.listen_target);
             true
         } else {
             false
@@ -304,8 +344,8 @@ impl ProcessManager {
     }
 
     pub fn mark_active(&mut self, app_id: i64) {
-        if let Some(proc) = self.processes.get_mut(&app_id) {
-            proc.last_active = Instant::now();
+        if let Some(group) = self.processes.get_mut(&app_id) {
+            group.primary.last_active = Instant::now();
         }
     }
 
@@ -315,21 +355,24 @@ impl ProcessManager {
         let timeout = self.idle_timeout;
         let mut to_remove = Vec::new();
 
-        for (app_id, proc) in &self.processes {
-            if now.duration_since(proc.last_active) > timeout {
+        for (app_id, group) in &self.processes {
+            if now.duration_since(group.primary.last_active) > timeout {
                 to_remove.push(*app_id);
             }
         }
 
         for app_id in &to_remove {
-            if let Some(proc) = self.processes.remove(app_id) {
+            if let Some(group) = self.processes.remove(app_id) {
                 info!(
                     app_id,
-                    listen = %listen_target_display(&proc.listen_target),
+                    listen = %listen_target_display(&group.primary.listen_target),
                     "reaping idle managed process"
                 );
-                kill_handle(proc.handle).await;
-                cleanup_listen_target(&proc.listen_target);
+                for companion in group.companions {
+                    kill_handle(companion.handle).await;
+                }
+                kill_handle(group.primary.handle).await;
+                cleanup_listen_target(&group.primary.listen_target);
             }
         }
 
@@ -338,14 +381,17 @@ impl ProcessManager {
 
     /// Kill all managed processes (called on daemon shutdown).
     pub async fn shutdown_all(&mut self) {
-        for (app_id, proc) in self.processes.drain() {
+        for (app_id, group) in self.processes.drain() {
             info!(
                 app_id,
-                listen = %listen_target_display(&proc.listen_target),
+                listen = %listen_target_display(&group.primary.listen_target),
                 "shutting down managed process"
             );
-            kill_handle(proc.handle).await;
-            cleanup_listen_target(&proc.listen_target);
+            for companion in group.companions {
+                kill_handle(companion.handle).await;
+            }
+            kill_handle(group.primary.handle).await;
+            cleanup_listen_target(&group.primary.listen_target);
         }
         // If using tmux, kill the dedicated server to clean up.
         if self.use_tmux {
@@ -360,7 +406,7 @@ impl ProcessManager {
         name: &str,
         root: &Path,
         kind: &str,
-    ) -> anyhow::Result<(ProcessSpec, PathBuf, String)> {
+    ) -> anyhow::Result<(ProcessSpec, PathBuf, String, Vec<String>)> {
         let prov = self
             .registry
             .get(kind)
@@ -373,6 +419,23 @@ impl ProcessManager {
 
         let env_overrides = crate::process::provider::load_coulsonrc(root);
 
+        let companion_types: Vec<String> = env_overrides
+            .get("COULSON_MANAGED_SERVICES")
+            .map(|s| {
+                s.split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty() && t != "web")
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !companion_types.is_empty() && kind != "procfile" {
+            warn!(
+                app_id,
+                kind, "COULSON_MANAGED_SERVICES is only supported for procfile apps, ignoring"
+            );
+        }
+
         let managed_app = ManagedApp {
             name: name.to_string(),
             root: root.to_path_buf(),
@@ -382,9 +445,17 @@ impl ProcessManager {
             socket_dir: sockets_dir.clone(),
         };
 
-        let spec = prov.resolve(&managed_app)?;
+        let mut spec = prov.resolve(&managed_app)?;
+        // Do not pass COULSON_MANAGED_SERVICES to child processes
+        spec.env.remove("COULSON_MANAGED_SERVICES");
+
         let _ = app_id; // used in caller for logging
-        Ok((spec, sockets_dir, prov.display_name().to_string()))
+        Ok((
+            spec,
+            sockets_dir,
+            prov.display_name().to_string(),
+            companion_types,
+        ))
     }
 
     /// Spawn a process using the current backend (direct or tmux).
@@ -400,6 +471,88 @@ impl ProcessManager {
         } else {
             Self::spawn_direct(name, spec, log_path)
         }
+    }
+
+    /// Spawn companion processes for a Procfile app.
+    fn spawn_companions(
+        &self,
+        app_id: i64,
+        name: &str,
+        root: &Path,
+        kind: &str,
+        companion_types: &[String],
+        sockets_dir: &Path,
+    ) -> Vec<CompanionProcess> {
+        if companion_types.is_empty() || kind != "procfile" {
+            return vec![];
+        }
+
+        let env_overrides = crate::process::provider::load_coulsonrc(root);
+        let managed_app = ManagedApp {
+            name: name.to_string(),
+            root: root.to_path_buf(),
+            kind: kind.to_string(),
+            manifest: None,
+            env_overrides,
+            socket_dir: sockets_dir.to_path_buf(),
+        };
+
+        let provider = procfile::ProcfileProvider;
+        let mut companions = Vec::new();
+
+        for ptype in companion_types {
+            match provider.resolve_companion(&managed_app, ptype) {
+                Ok(cspec) => {
+                    let spec = ProcessSpec {
+                        command: cspec.command,
+                        args: cspec.args,
+                        env: cspec.env,
+                        working_dir: cspec.working_dir,
+                        listen_target: ListenTarget::Tcp {
+                            host: String::new(),
+                            port: 0,
+                        },
+                    };
+                    let log_path = sockets_dir.join(format!("{name}-{ptype}.log"));
+                    match self.spawn_process(
+                        &format!("{name}-{ptype}"),
+                        &spec,
+                        &log_path,
+                        sockets_dir,
+                    ) {
+                        Ok(handle) => {
+                            info!(
+                                app_id,
+                                process_type = %ptype,
+                                "spawned companion process"
+                            );
+                            companions.push(CompanionProcess {
+                                process_type: ptype.clone(),
+                                handle,
+                            });
+                        }
+                        Err(e) => {
+                            warn!(
+                                app_id,
+                                process_type = %ptype,
+                                error = %e,
+                                "failed to spawn companion process"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        app_id,
+                        process_type = %ptype,
+                        error = %e,
+                        "failed to resolve companion process"
+                    );
+                }
+            }
+        }
+
+        companions
     }
 
     /// Spawn via direct child process (original behavior).
