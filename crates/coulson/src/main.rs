@@ -981,19 +981,19 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
         }
     }
 
-    // TLS certificate setup with dynamic per-SNI cert resolver.
+    // TLS certificate setup with dynamic per-SNI cert callback.
     // The wildcard cert covers *.{domain_suffix}; .localhost certs are
     // generated on demand (browsers reject *.localhost wildcards per PSL).
     let tls_config = if let Some(https_addr) = cfg.listen_https {
         match certs::CertManager::ensure(&cfg.certs_dir, &cfg.domain_suffix) {
-            Ok(cm) => match cm.build_resolver(&cfg.domain_suffix) {
-                Ok(resolver) => Some(proxy::TlsConfig {
+            Ok(cm) => match cm.build_sni_provider(&cfg.domain_suffix) {
+                Ok(sni_provider) => Some(proxy::TlsConfig {
                     bind: https_addr.to_string(),
                     ca_path: cm.ca_path().to_string(),
-                    resolver: std::sync::Arc::new(resolver),
+                    sni_callback: certs::SniCallback(sni_provider),
                 }),
                 Err(err) => {
-                    error!(error = %err, "failed to build TLS cert resolver, HTTPS disabled");
+                    error!(error = %err, "failed to build TLS SNI provider, HTTPS disabled");
                     None
                 }
             },

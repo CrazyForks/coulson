@@ -582,7 +582,7 @@ impl ProxyHttp for BridgeProxy {
 pub struct TlsConfig {
     pub bind: String,
     pub ca_path: String,
-    pub resolver: std::sync::Arc<crate::certs::DynamicCertResolver>,
+    pub sni_callback: crate::certs::SniCallback,
 }
 
 pub async fn run_proxy(
@@ -645,11 +645,11 @@ fn run_proxy_blocking(
         }
     }
 
-    // TLS listener with HTTP/2 + HTTP/1.1 ALPN via dynamic cert resolver
+    // TLS listener with HTTP/2 + HTTP/1.1 ALPN via dynamic SNI cert callback
     if let Some(tls) = tls {
-        let mut tls_settings = pingora::listeners::tls::TlsSettings::from_server_config(
-            crate::certs::build_server_config(tls.resolver.clone()),
-        );
+        let cb: pingora::listeners::TlsAcceptCallbacks = Box::new(tls.sni_callback.clone());
+        let mut tls_settings =
+            pingora::listeners::tls::TlsSettings::with_callbacks(cb)?;
         tls_settings.enable_h2();
         service.add_tls_with_settings(&tls.bind, None, tls_settings);
         if let Ok(addr) = tls.bind.parse::<std::net::SocketAddr>() {
@@ -661,9 +661,10 @@ fn run_proxy_blocking(
                 None
             };
             if let Some(v6_bind) = v6_bind {
-                let mut v6_settings = pingora::listeners::tls::TlsSettings::from_server_config(
-                    crate::certs::build_server_config(tls.resolver.clone()),
-                );
+                let v6_cb: pingora::listeners::TlsAcceptCallbacks =
+                    Box::new(tls.sni_callback.clone());
+                let mut v6_settings =
+                    pingora::listeners::tls::TlsSettings::with_callbacks(v6_cb)?;
                 v6_settings.enable_h2();
                 service.add_tls_with_settings(&v6_bind, None, v6_settings);
             }
