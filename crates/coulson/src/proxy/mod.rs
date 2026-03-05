@@ -1342,6 +1342,14 @@ fn resolve_target(
         return Some(hit);
     }
 
+    // Also try default.localhost for .localhost requests
+    if domain_suffix != LOCALHOST_SUFFIX && host.ends_with(&format!(".{LOCALHOST_SUFFIX}")) {
+        let default_localhost = format!("default.{LOCALHOST_SUFFIX}");
+        if let Some(hit) = select_route(routes.get(&default_localhost), path) {
+            return Some(hit);
+        }
+    }
+
     None
 }
 
