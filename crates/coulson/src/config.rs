@@ -15,6 +15,10 @@ pub enum ProcessBackend {
     Direct,
 }
 
+/// Secondary domain suffix that is always available (RFC 6761 reserved).
+/// Browsers and OS resolve `.localhost` to 127.0.0.1 with zero configuration.
+pub const LOCALHOST_SUFFIX: &str = "localhost";
+
 /// Directory name component used in all default paths.
 /// Debug builds use "coulson-dev" for isolation from release installs.
 #[cfg(debug_assertions)]
