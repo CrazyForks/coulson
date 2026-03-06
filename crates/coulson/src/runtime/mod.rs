@@ -9,8 +9,21 @@ use tracing_subscriber::EnvFilter;
 use crate::config::CoulsonConfig;
 use crate::scanner::ScanStats;
 
+/// Noisy third-party modules to suppress at debug level.
+const NOISY_MODULES: &[&str] = &[
+    "h2",
+    "hickory_proto",
+    "hickory_resolver",
+    "mdns_sd",
+    "pingora_proxy",
+    "rustls::client",
+];
+
 pub fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    for module in NOISY_MODULES {
+        filter = filter.add_directive(format!("{module}=warn").parse().unwrap());
+    }
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
