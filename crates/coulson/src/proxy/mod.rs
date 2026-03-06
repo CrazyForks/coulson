@@ -266,7 +266,7 @@ impl ProxyHttp for BridgeProxy {
                                 listen_target_to_backend(listen_target)
                             }
                             StartStatus::Starting => {
-                                write_loading_page(session, name).await?;
+                                write_loading_page(session, name, kind).await?;
                                 return Ok(true);
                             }
                         }
@@ -373,7 +373,7 @@ impl ProxyHttp for BridgeProxy {
                     listen_target_to_backend(listen_target)
                 }
                 StartStatus::Starting => {
-                    write_loading_page(session, name).await?;
+                    write_loading_page(session, name, kind).await?;
                     return Ok(true);
                 }
             }
@@ -1194,7 +1194,7 @@ async fn pm_mark_active(pm: &ProcessManagerHandle, app_id: i64) {
 // Error / routing helpers
 // ---------------------------------------------------------------------------
 
-async fn write_loading_page(session: &mut Session, app_name: &str) -> Result<()> {
+async fn write_loading_page(session: &mut Session, app_name: &str, kind: &str) -> Result<()> {
     let accept = session
         .req_header()
         .headers
@@ -1214,7 +1214,9 @@ async fn write_loading_page(session: &mut Session, app_name: &str) -> Result<()>
         static TEMPLATE: &str = include_str!("loading.html");
         (
             "text/html; charset=utf-8",
-            TEMPLATE.replace("{{name}}", &html_escape(app_name)),
+            TEMPLATE
+                .replace("{{name}}", &html_escape(app_name))
+                .replace("{{kind}}", &html_escape(kind)),
         )
     } else {
         (
