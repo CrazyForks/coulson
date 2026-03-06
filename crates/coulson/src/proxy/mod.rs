@@ -1195,10 +1195,36 @@ async fn pm_mark_active(pm: &ProcessManagerHandle, app_id: i64) {
 // ---------------------------------------------------------------------------
 
 async fn write_loading_page(session: &mut Session, app_name: &str) -> Result<()> {
-    static TEMPLATE: &str = include_str!("loading.html");
-    let body = TEMPLATE.replace("{{name}}", &html_escape(app_name));
+    let accept = session
+        .req_header()
+        .headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let (content_type, body) = if accept.contains("application/json") {
+        (
+            "application/json; charset=utf-8",
+            format!(
+                r#"{{"error":"starting","app":"{}","retry_after":1}}"#,
+                app_name.replace('"', "\\\"")
+            ),
+        )
+    } else if accept.contains("text/html") {
+        static TEMPLATE: &str = include_str!("loading.html");
+        (
+            "text/html; charset=utf-8",
+            TEMPLATE.replace("{{name}}", &html_escape(app_name)),
+        )
+    } else {
+        (
+            "text/plain; charset=utf-8",
+            format!("{app_name} is starting, retry in 1s"),
+        )
+    };
+
     let mut resp = ResponseHeader::build(503, None)?;
-    resp.insert_header("content-type", "text/html; charset=utf-8")?;
+    resp.insert_header("content-type", content_type)?;
     resp.insert_header("content-length", body.len().to_string())?;
     resp.insert_header("retry-after", "1")?;
     resp.insert_header("cache-control", "no-cache, no-store")?;
