@@ -102,6 +102,18 @@ pub struct SharedState {
 }
 
 impl SharedState {
+    pub fn use_default_http_port(&self) -> bool {
+        let pf = cfg!(target_os = "macos")
+            && is_pf_configured_quick(&self.listen_http, &self.listen_https);
+        self.listen_http.port() == 80 || pf
+    }
+
+    pub fn use_default_https_port(&self) -> bool {
+        let pf = cfg!(target_os = "macos")
+            && is_pf_configured_quick(&self.listen_http, &self.listen_https);
+        self.listen_https.is_some() && (self.listen_https.map(|a| a.port()) == Some(443) || pf)
+    }
+
     pub fn reload_routes(&self) -> anyhow::Result<bool> {
         let enabled_apps = self.store.list_enabled()?;
         let mut table: HashMap<String, Vec<RouteRule>> = HashMap::new();
@@ -2850,14 +2862,46 @@ fn build_pf_rules(cfg: &CoulsonConfig) -> (String, String, String) {
 
 #[cfg(target_os = "macos")]
 fn is_pf_configured(cfg: &CoulsonConfig) -> bool {
-    let (rules, anchor_ref, anchor_load) = build_pf_rules(cfg);
+    is_pf_configured_quick(&cfg.listen_http, &cfg.listen_https)
+}
+
+#[cfg(target_os = "macos")]
+fn is_pf_configured_quick(
+    listen_http: &std::net::SocketAddr,
+    listen_https: &Option<std::net::SocketAddr>,
+) -> bool {
+    let http_port = listen_http.port();
+    let https_port = listen_https.map(|a| a.port());
+    let ip = crate::config::PF_REDIRECT_IP;
+    let anchor_ref = "rdr-anchor \"coulson\"";
+    let anchor_load = "load anchor \"coulson\" from \"/etc/pf.anchors/coulson\"";
+
+    let mut expected_rules = format!(
+        "rdr pass on lo0 inet proto tcp from any to any port 80 -> {ip} port {http_port}\n\
+         rdr pass on lo0 inet6 proto tcp from any to any port 80 -> ::1 port {http_port}\n"
+    );
+    if let Some(port) = https_port {
+        expected_rules.push_str(&format!(
+            "rdr pass on lo0 inet proto tcp from any to any port 443 -> {ip} port {port}\n\
+             rdr pass on lo0 inet6 proto tcp from any to any port 443 -> ::1 port {port}\n"
+        ));
+    }
+
     let anchor_path = std::path::Path::new("/etc/pf.anchors/coulson");
     let pf_conf_path = std::path::Path::new("/etc/pf.conf");
     let existing_anchor = std::fs::read_to_string(anchor_path).unwrap_or_default();
     let existing_pf_conf = std::fs::read_to_string(pf_conf_path).unwrap_or_default();
-    existing_anchor == rules
-        && existing_pf_conf.contains(&anchor_ref)
-        && existing_pf_conf.contains(&anchor_load)
+    existing_anchor == expected_rules
+        && existing_pf_conf.contains(anchor_ref)
+        && existing_pf_conf.contains(anchor_load)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_pf_configured_quick(
+    _listen_http: &std::net::SocketAddr,
+    _listen_https: &Option<std::net::SocketAddr>,
+) -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]

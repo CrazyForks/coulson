@@ -280,7 +280,12 @@ extension AppDelegate {
         let app = box.app
         Task { @MainActor in
             guard let vm = self.vm else { return }
-            if let url = URL(string: app.primaryURL(proxyPort: vm.proxyPort)) {
+            if let url = URL(
+                string: app.primaryURL(
+                    proxyPort: vm.proxyPort,
+                    useDefaultPort: vm.useDefaultHttpPort
+                )
+            ) {
                 NSWorkspace.shared.open(url)
             }
         }
@@ -293,7 +298,12 @@ extension AppDelegate {
             guard let vm = self.vm else { return }
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(
-                app.primaryURL(proxyPort: vm.proxyPort), forType: .string)
+                app.primaryURL(
+                    proxyPort: vm.proxyPort,
+                    useDefaultPort: vm.useDefaultHttpPort
+                ),
+                forType: .string
+            )
         }
     }
 
@@ -302,7 +312,10 @@ extension AppDelegate {
         let app = box.app
         Task { @MainActor in
             guard let vm = self.vm else { return }
-            if let url = app.httpsURL(httpsPort: vm.httpsPort) {
+            if let url = app.httpsURL(
+                httpsPort: vm.httpsPort,
+                useDefaultPort: vm.useDefaultHttpsPort
+            ) {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(url, forType: .string)
             }

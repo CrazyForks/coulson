@@ -47,7 +47,12 @@ struct AppRowView: View {
 
             // Open in browser
             Button {
-                if let url = URL(string: app.primaryURL(proxyPort: vm.proxyPort)) {
+                if let url = URL(
+                    string: app.primaryURL(
+                        proxyPort: vm.proxyPort,
+                        useDefaultPort: vm.useDefaultHttpPort
+                    )
+                ) {
                     NSWorkspace.shared.open(url)
                 }
             } label: {

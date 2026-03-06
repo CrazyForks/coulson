@@ -265,6 +265,8 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
             "version": env!("CARGO_PKG_VERSION"),
             "http_port": state.listen_http.port(),
             "https_port": state.listen_https.map(|a| a.port()),
+            "use_default_http_port": state.use_default_http_port(),
+            "use_default_https_port": state.use_default_https_port(),
             "runtime_dir": state.runtime_dir.to_string_lossy(),
         })),
         "app.list" => service::app_list(state)

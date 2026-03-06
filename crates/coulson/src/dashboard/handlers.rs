@@ -33,7 +33,10 @@ pub async fn page_index(State(state): State<DashboardState>) -> Html<String> {
         ctx.insert("title", "Apps");
         ctx.insert("active_nav", "apps");
         ctx.extend(stats_context(&apps));
-        ctx.insert("apps", &app_views(&apps, port));
+        ctx.insert(
+            "apps",
+            &app_views(&apps, port, state.shared.use_default_http_port()),
+        );
         ctx.insert("error", "");
         ctx.insert("form_name", "");
         ctx.insert("form_target_value", "");
@@ -71,7 +74,7 @@ pub async fn page_app_detail(
         _ => return html_response(StatusCode::NOT_FOUND, render_not_found(&state.shared)),
     };
     let port = state.shared.listen_http.port();
-    let app_view = AppView::from_spec(&app, port);
+    let app_view = AppView::from_spec(&app, port, state.shared.use_default_http_port());
     let title = format!("{} — Detail", app.domain.0);
     let page = render_page("pages/app_detail.html", &state.shared, |ctx| {
         ctx.insert("title", &title);
@@ -98,7 +101,7 @@ pub async fn page_requests(
         _ => return html_response(StatusCode::NOT_FOUND, render_not_found(&state.shared)),
     };
     let port = state.shared.listen_http.port();
-    let app_view = AppView::from_spec(&app, port);
+    let app_view = AppView::from_spec(&app, port, state.shared.use_default_http_port());
     let requests = state
         .shared
         .store
@@ -129,7 +132,7 @@ pub async fn page_request_detail(
         _ => return html_response(StatusCode::NOT_FOUND, render_not_found(&state.shared)),
     };
     let port = state.shared.listen_http.port();
-    let app_view = AppView::from_spec(&app, port);
+    let app_view = AppView::from_spec(&app, port, state.shared.use_default_http_port());
     let req_view = RequestView::from_captured(&captured);
 
     let page = render_page("pages/request_detail.html", &state.shared, |ctx| {
@@ -169,7 +172,7 @@ pub async fn frame_tunnel(State(state): State<DashboardState>, Path(id): Path<St
         _ => return html_response(StatusCode::NOT_FOUND, "Not found".to_string()),
     };
     let port = state.shared.listen_http.port();
-    let app_view = AppView::from_spec(&app, port);
+    let app_view = AppView::from_spec(&app, port, state.shared.use_default_http_port());
     let mut ctx = base_context(&state.shared);
     ctx.insert("app", &app_view);
     Html(render_partial("partials/detail/tunnel.html", &ctx)).into_response()
@@ -184,7 +187,7 @@ pub async fn frame_features(
         _ => return html_response(StatusCode::NOT_FOUND, "Not found".to_string()),
     };
     let port = state.shared.listen_http.port();
-    let app_view = AppView::from_spec(&app, port);
+    let app_view = AppView::from_spec(&app, port, state.shared.use_default_http_port());
     let mut ctx = base_context(&state.shared);
     ctx.insert("app", &app_view);
     Html(render_partial("partials/detail/features.html", &ctx)).into_response()
@@ -197,12 +200,14 @@ pub async fn frame_urls(State(state): State<DashboardState>, Path(id): Path<Stri
     };
     let port = state.shared.listen_http.port();
     let https_port = state.shared.listen_https.map(|a| a.port());
-    let app_view = AppView::from_spec(&app, port);
+    let app_view = AppView::from_spec(&app, port, state.shared.use_default_http_port());
     let gtd = global_tunnel_domain(&state.shared);
     let urls = build_urls(
         &app,
         port,
         https_port,
+        state.shared.use_default_http_port(),
+        state.shared.use_default_https_port(),
         &state.shared.domain_suffix,
         gtd.as_deref(),
     );
@@ -274,7 +279,10 @@ pub async fn action_scan(State(state): State<DashboardState>) -> Response {
         .unwrap_or_default();
     let table_ctx = {
         let mut ctx = Context::new();
-        ctx.insert("apps", &app_views(&all, port));
+        ctx.insert(
+            "apps",
+            &app_views(&all, port, state.shared.use_default_http_port()),
+        );
         ctx.insert("default_app", &default_app);
         ctx
     };
@@ -338,7 +346,10 @@ pub async fn action_toggle(
         .unwrap_or_default();
     let row_ctx = {
         let mut ctx = Context::new();
-        ctx.insert("app", &AppView::from_spec(&updated, port));
+        ctx.insert(
+            "app",
+            &AppView::from_spec(&updated, port, state.shared.use_default_http_port()),
+        );
         ctx.insert("default_app", &default_app);
         ctx
     };
@@ -575,7 +586,7 @@ pub async fn action_replay(
         .ok();
 
     let port = state.shared.listen_http.port();
-    let app_view = AppView::from_spec(&app, port);
+    let app_view = AppView::from_spec(&app, port, state.shared.use_default_http_port());
     let req_view = RequestView::from_captured(&captured);
 
     let replay_view = match outcome.as_ref() {
@@ -759,7 +770,10 @@ pub async fn action_create_app(
                 .unwrap_or_default();
             let table_ctx = {
                 let mut ctx = Context::new();
-                ctx.insert("apps", &app_views(&all, port));
+                ctx.insert(
+                    "apps",
+                    &app_views(&all, port, state.shared.use_default_http_port()),
+                );
                 ctx.insert("default_app", &default_app);
                 ctx
             };
@@ -844,7 +858,7 @@ fn render_settings_modal_error(
     form: &EditSettingsForm,
 ) -> Response {
     let port = state.shared.listen_http.port();
-    let app_view = AppView::from_spec(app, port);
+    let app_view = AppView::from_spec(app, port, state.shared.use_default_http_port());
     let mut ctx = Context::new();
     ctx.insert("app", &app_view);
     ctx.insert("settings_error", error);

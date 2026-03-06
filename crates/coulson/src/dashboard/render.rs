@@ -190,9 +190,9 @@ pub struct UrlView {
 }
 
 impl AppView {
-    pub fn from_spec(app: &AppSpec, port: u16) -> Self {
+    pub fn from_spec(app: &AppSpec, port: u16, use_default_http_port: bool) -> Self {
         let path = app.path_prefix.as_deref().unwrap_or("/");
-        let domain_href = format!("http://{}:{}{}", &app.domain.0, port, path);
+        let domain_href = format_http_url(&app.domain.0, port, path, use_default_http_port);
         let target_port = if let BackendTarget::Tcp { port, .. } = &app.target {
             Some(*port)
         } else {
@@ -601,26 +601,30 @@ pub fn stats_context(apps: &[AppSpec]) -> Context {
     ctx
 }
 
-pub fn app_views(apps: &[AppSpec], port: u16) -> Vec<AppView> {
-    apps.iter().map(|a| AppView::from_spec(a, port)).collect()
+pub fn app_views(apps: &[AppSpec], port: u16, use_default_http_port: bool) -> Vec<AppView> {
+    apps.iter()
+        .map(|a| AppView::from_spec(a, port, use_default_http_port))
+        .collect()
 }
 
 pub fn build_urls(
     app: &AppSpec,
     port: u16,
     https_port: Option<u16>,
+    use_default_http_port: bool,
+    use_default_https_port: bool,
     domain_suffix: &str,
     global_tunnel_domain: Option<&str>,
 ) -> Vec<UrlView> {
     let mut urls = Vec::new();
     let path = app.path_prefix.as_deref().unwrap_or("/");
     urls.push(UrlView {
-        href: format!("http://{}:{}{}", &app.domain.0, port, path),
+        href: format_http_url(&app.domain.0, port, path, use_default_http_port),
         is_link: true,
     });
     if let Some(hp) = https_port {
         urls.push(UrlView {
-            href: format!("https://{}:{}{}", &app.domain.0, hp, path),
+            href: format_https_url(&app.domain.0, hp, path, use_default_https_port),
             is_link: true,
         });
     }
@@ -629,7 +633,7 @@ pub fn build_urls(
         if let Some(prefix) = app.domain.0.strip_suffix(&format!(".{domain_suffix}")) {
             let lh = format!("{prefix}.{}", crate::config::LOCALHOST_SUFFIX);
             urls.push(UrlView {
-                href: format!("http://{lh}:{port}{path}"),
+                href: format_http_url(&lh, port, path, use_default_http_port),
                 is_link: true,
             });
         }
@@ -680,6 +684,22 @@ pub fn build_urls(
         }
     }
     urls
+}
+
+fn format_http_url(host: &str, port: u16, path: &str, use_default_port: bool) -> String {
+    if use_default_port || port == 80 {
+        format!("http://{host}{path}")
+    } else {
+        format!("http://{host}:{port}{path}")
+    }
+}
+
+fn format_https_url(host: &str, port: u16, path: &str, use_default_port: bool) -> String {
+    if use_default_port || port == 443 {
+        format!("https://{host}{path}")
+    } else {
+        format!("https://{host}:{port}{path}")
+    }
 }
 
 pub fn turbo_replace(target: &str, content: &str) -> String {

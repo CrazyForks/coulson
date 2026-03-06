@@ -65,20 +65,25 @@ struct AppRecord: Decodable, Identifiable, Hashable {
         }
     }
 
-    func primaryURL(proxyPort: Int?) -> String {
-        let portSuffix = (proxyPort != nil && proxyPort != 80) ? ":\(proxyPort!)" : ""
+    func primaryURL(proxyPort: Int?, useDefaultPort: Bool = false) -> String {
+        let portSuffix = (proxyPort != nil && proxyPort != 80 && !useDefaultPort) ? ":\(proxyPort!)" : ""
         return "http://\(domain)\(portSuffix)/"
     }
 
-    func httpsURL(httpsPort: Int?) -> String? {
+    func httpsURL(httpsPort: Int?, useDefaultPort: Bool = false) -> String? {
         guard let port = httpsPort else { return nil }
-        let portSuffix = port != 443 ? ":\(port)" : ""
+        let portSuffix = (port != 443 && !useDefaultPort) ? ":\(port)" : ""
         return "https://\(domain)\(portSuffix)/"
     }
 
-    func dashboardURLs(proxyPort: Int?, httpsPort: Int?) -> [String] {
-        var out = [primaryURL(proxyPort: proxyPort)]
-        if let https = httpsURL(httpsPort: httpsPort) {
+    func dashboardURLs(
+        proxyPort: Int?,
+        httpsPort: Int?,
+        useDefaultHttpPort: Bool = false,
+        useDefaultHttpsPort: Bool = false
+    ) -> [String] {
+        var out = [primaryURL(proxyPort: proxyPort, useDefaultPort: useDefaultHttpPort)]
+        if let https = httpsURL(httpsPort: httpsPort, useDefaultPort: useDefaultHttpsPort) {
             out.append(https)
         }
         if let host = target.host, let port = target.port {

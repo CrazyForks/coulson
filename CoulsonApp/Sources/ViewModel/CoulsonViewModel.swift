@@ -25,6 +25,8 @@ final class CoulsonViewModel: ObservableObject {
     let domainSuffix: String
     @Published var proxyPort: Int?
     @Published var httpsPort: Int?
+    @Published var useDefaultHttpPort = false
+    @Published var useDefaultHttpsPort = false
     @Published var runtimeDir: String
     let daemonManager: DaemonManager
     private var autoRefreshTask: Task<Void, Never>?
@@ -200,6 +202,8 @@ final class CoulsonViewModel: ObservableObject {
             if let port = result["https_port"] as? Int {
                 httpsPort = port
             }
+            useDefaultHttpPort = result["use_default_http_port"] as? Bool ?? false
+            useDefaultHttpsPort = result["use_default_https_port"] as? Bool ?? false
             if let dir = result["runtime_dir"] as? String {
                 runtimeDir = dir
             }
