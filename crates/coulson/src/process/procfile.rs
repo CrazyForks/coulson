@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -6,6 +7,16 @@ use tracing::debug;
 use super::provider::{
     resolve_port, DetectedApp, ListenTarget, ManagedApp, ProcessProvider, ProcessSpec,
 };
+
+/// Spec for a companion process (no listen_target, no PORT).
+#[allow(dead_code)]
+pub struct CompanionSpec {
+    pub process_type: String,
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub working_dir: PathBuf,
+}
 
 /// Procfile provider — manages applications defined by a standard Procfile.
 ///
@@ -44,6 +55,43 @@ fn has_web_process(content: &str) -> bool {
         .ok()
         .and_then(|procs| procs.get("web").map(|_| ()))
         .is_some()
+}
+
+impl ProcfileProvider {
+    /// Resolve a non-web companion process from the Procfile.
+    #[allow(dead_code)]
+    pub fn resolve_companion(
+        &self,
+        app: &ManagedApp,
+        process_type: &str,
+    ) -> anyhow::Result<CompanionSpec> {
+        let root = &app.root;
+        let content = read_procfile(root)
+            .ok_or_else(|| anyhow::anyhow!("no Procfile found in {}", root.display()))?;
+        let procs = procfile::parse(&content)
+            .map_err(|e| anyhow::anyhow!("failed to parse Procfile: {e}"))?;
+        let entry = procs
+            .get(process_type)
+            .ok_or_else(|| anyhow::anyhow!("Procfile has no '{process_type}' process type"))?;
+
+        let full_command = if entry.options.is_empty() {
+            entry.command.to_string()
+        } else {
+            format!("{} {}", entry.command, entry.options.join(" "))
+        };
+
+        // Companion gets env_overrides but no PORT, no COULSON_MANAGED_SERVICES
+        let mut env = app.env_overrides.clone();
+        env.remove("COULSON_MANAGED_SERVICES");
+
+        Ok(CompanionSpec {
+            process_type: process_type.to_string(),
+            command: PathBuf::new(),
+            args: vec![full_command],
+            env,
+            working_dir: root.clone(),
+        })
+    }
 }
 
 impl ProcessProvider for ProcfileProvider {
@@ -88,7 +136,7 @@ impl ProcessProvider for ProcfileProvider {
         if let Some(manifest) = &app.manifest {
             if let Some(cmd) = manifest.get("command").and_then(|v| v.as_str()) {
                 let port = resolve_port(&app.env_overrides)?;
-                let mut env = std::collections::HashMap::new();
+                let mut env = HashMap::new();
                 env.insert("PORT".to_string(), port.to_string());
                 env.extend(app.env_overrides.clone());
                 return Ok(ProcessSpec {
@@ -124,7 +172,7 @@ impl ProcessProvider for ProcfileProvider {
 
         // 5. Allocate port + PORT env
         let port = resolve_port(&app.env_overrides)?;
-        let mut env = std::collections::HashMap::new();
+        let mut env = HashMap::new();
         env.insert("PORT".to_string(), port.to_string());
         env.extend(app.env_overrides.clone());
 
@@ -274,6 +322,48 @@ mod tests {
         let spec = p.resolve(&app).unwrap();
 
         assert!(spec.args[0].contains("my-custom-server"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_companion_worker() {
+        let dir = temp_dir("resolve-companion");
+        fs::write(
+            dir.join("Procfile"),
+            "web: rails s -p $PORT\nworker: bundle exec sidekiq",
+        )
+        .unwrap();
+        let p = ProcfileProvider;
+        let app = ManagedApp {
+            name: "myapp".into(),
+            root: dir.clone(),
+            kind: "procfile".into(),
+            manifest: None,
+            env_overrides: Default::default(),
+            socket_dir: dir.clone(),
+        };
+        let spec = p.resolve_companion(&app, "worker").unwrap();
+
+        assert_eq!(spec.args.len(), 1);
+        assert!(spec.args[0].contains("bundle exec sidekiq"));
+        assert!(!spec.env.contains_key("PORT"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_companion_missing_type() {
+        let dir = temp_dir("resolve-companion-missing");
+        fs::write(dir.join("Procfile"), "web: rails s").unwrap();
+        let p = ProcfileProvider;
+        let app = ManagedApp {
+            name: "myapp".into(),
+            root: dir.clone(),
+            kind: "procfile".into(),
+            manifest: None,
+            env_overrides: Default::default(),
+            socket_dir: dir.clone(),
+        };
+        assert!(p.resolve_companion(&app, "worker").is_err());
         fs::remove_dir_all(&dir).ok();
     }
 }

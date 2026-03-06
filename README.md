@@ -134,6 +134,14 @@ curl -i http://myapp.coulson.local:18080/
 
 First request allocates a free port via `$PORT`, runs the `web` command, and proxies traffic. `Procfile.dev` takes priority over `Procfile` when both exist.
 
+To start companion processes (workers, etc.) alongside the web process, add to `.coulsonrc`:
+
+```
+COULSON_MANAGED_SERVICES=web,worker
+```
+
+All listed process types from the Procfile are started together and share the same lifecycle — idle timeout reaps the entire group.
+
 ### Static Directory
 
 Projects with a `public` subdirectory are automatically served as static files:
