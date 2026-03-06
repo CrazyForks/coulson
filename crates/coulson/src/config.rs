@@ -325,13 +325,17 @@ struct ConfigFile {
 impl ConfigFile {
     fn load() -> Self {
         let config_dir = xdg_config_home().join(DIR_NAME);
-        let mut cfg = Self::load_file(&config_dir.join("config.toml"));
+
+        #[cfg(not(debug_assertions))]
+        let cfg = Self::load_file(&config_dir.join("config.toml"));
 
         #[cfg(debug_assertions)]
-        {
+        let cfg = {
+            let mut base = Self::load_file(&config_dir.join("config.toml"));
             let dev = Self::load_file(&config_dir.join("config.dev.toml"));
-            cfg.merge(dev);
-        }
+            base.merge(dev);
+            base
+        };
 
         cfg
     }
@@ -349,6 +353,7 @@ impl ConfigFile {
         }
     }
 
+    #[cfg(debug_assertions)]
     fn merge(&mut self, other: Self) {
         macro_rules! merge_field {
             ($($field:ident),*) => {
