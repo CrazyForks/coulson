@@ -266,6 +266,16 @@ enum Commands {
     },
     /// Show running managed processes
     Ps,
+    /// Start a managed process
+    Start {
+        /// App name or domain (omit to match CWD)
+        name: Option<String>,
+    },
+    /// Stop a managed process
+    Stop {
+        /// App name or domain (omit to match CWD)
+        name: Option<String>,
+    },
     /// Restart a managed process
     Restart {
         /// App name or domain (omit to match CWD)
@@ -276,6 +286,9 @@ enum Commands {
         /// Also set up pf port forwarding (80/443 -> Coulson listen ports)
         #[arg(long)]
         pf: bool,
+        /// Force re-apply even if already configured
+        #[arg(long)]
+        force: bool,
     },
     /// Attach to a managed process's tmux session (Ctrl-B D to detach)
     Attach {
@@ -1290,9 +1303,11 @@ async fn main() -> anyhow::Result<()> {
             lines,
         } => run_logs(cfg, name, follow, lines),
         Commands::Ps => run_ps(cfg),
-        Commands::Restart { name } => run_restart(cfg, name),
+        Commands::Start { name } => run_process_action(cfg, name, "process.start"),
+        Commands::Stop { name } => run_process_action(cfg, name, "process.stop"),
+        Commands::Restart { name } => run_process_action(cfg, name, "process.restart"),
         Commands::Attach { name } => run_attach(cfg, name),
-        Commands::Trust { pf } => run_trust(cfg, pf),
+        Commands::Trust { pf, force } => run_trust(cfg, pf, force),
         Commands::Tunnel { action } => run_tunnel(cfg, action),
     }
 }
@@ -2006,12 +2021,57 @@ fn run_ps(cfg: CoulsonConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_restart(cfg: CoulsonConfig, name: Option<String>) -> anyhow::Result<()> {
+fn run_process_action(
+    cfg: CoulsonConfig,
+    name: Option<String>,
+    method: &str,
+) -> anyhow::Result<()> {
     let client = RpcClient::new(&cfg.control_socket);
     let (bare_name, app_id) = resolve_app_id(&client, &cfg, name)?;
 
-    client.call("process.restart", serde_json::json!({ "app_id": app_id }))?;
-    println!("{} {bare_name} restarted", "✓".green());
+    let result = client.call(method, serde_json::json!({ "app_id": app_id }))?;
+
+    let action = match method {
+        "process.start" => "started",
+        "process.stop" => "stopped",
+        "process.restart" => "restarted",
+        _ => "done",
+    };
+    println!("{} {bare_name} {action}", "✓".green());
+
+    // Show URLs after start/restart
+    if method != "process.stop" {
+        if let Some(app) = client
+            .call("app.list", serde_json::json!({}))
+            .ok()
+            .and_then(|v| {
+                v.get("apps")?
+                    .as_array()?
+                    .iter()
+                    .find(|a| a.get("id").and_then(|id| id.as_i64()) == Some(app_id))
+                    .cloned()
+            })
+        {
+            if let Some(domain) = app.get("domain").and_then(|d| d.as_str()) {
+                let port = result
+                    .get("listen")
+                    .and_then(|l| l.get("port"))
+                    .and_then(|p| p.as_u64())
+                    .map(|p| p as u16)
+                    .unwrap_or_else(|| cfg.listen_http.port());
+                let suffix = if port == 80 {
+                    String::new()
+                } else {
+                    format!(":{port}")
+                };
+                println!("  {}", format!("http://{domain}{suffix}").cyan());
+                if let Some(lh) = localhost_url(domain, &cfg.domain_suffix, port) {
+                    println!("  {}", lh.cyan());
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2626,7 +2686,11 @@ fn find_app_json(client: &RpcClient, app_id: i64) -> anyhow::Result<serde_json::
         .ok_or_else(|| anyhow::anyhow!("app not found: {app_id}"))
 }
 
-fn run_trust(cfg: CoulsonConfig, #[allow(unused)] pf: bool) -> anyhow::Result<()> {
+fn run_trust(
+    cfg: CoulsonConfig,
+    #[allow(unused)] pf: bool,
+    #[allow(unused)] force: bool,
+) -> anyhow::Result<()> {
     let ca_path = cfg.certs_dir.join("ca.crt");
 
     if !ca_path.exists() {
@@ -2643,7 +2707,7 @@ fn run_trust(cfg: CoulsonConfig, #[allow(unused)] pf: bool) -> anyhow::Result<()
 
         println!("CA certificate: {}", ca_path.display());
 
-        if ca_trusted && pf_ok {
+        if ca_trusted && pf_ok && !force {
             println!(
                 "{}",
                 "CA certificate already trusted in system keychain."
@@ -2673,11 +2737,13 @@ fn run_trust(cfg: CoulsonConfig, #[allow(unused)] pf: bool) -> anyhow::Result<()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
             .unwrap_or(false);
         if !is_root {
-            let cmd = if pf {
-                "sudo coulson trust --pf"
-            } else {
-                "sudo coulson trust"
-            };
+            let mut cmd = "sudo coulson trust".to_string();
+            if pf {
+                cmd.push_str(" --pf");
+            }
+            if force {
+                cmd.push_str(" --force");
+            }
             bail!("This command requires root privileges. Run: {cmd}");
         }
 
