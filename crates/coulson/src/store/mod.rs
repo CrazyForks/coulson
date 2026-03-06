@@ -986,7 +986,7 @@ impl AppRepository {
                 req.status_code,
                 req.response_headers,
                 req.response_body,
-                req.response_time_ms,
+                req.response_time_ms.map(|v| v as i64),
             ],
         )?;
         // Prune old entries beyond max

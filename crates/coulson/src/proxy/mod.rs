@@ -517,7 +517,7 @@ impl ProxyHttp for BridgeProxy {
         Ok(())
     }
 
-    fn upstream_response_filter(
+    async fn upstream_response_filter(
         &self,
         _session: &mut Session,
         upstream_response: &mut ResponseHeader,
