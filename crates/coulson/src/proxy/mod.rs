@@ -770,11 +770,11 @@ async fn try_serve_static(
     let clean = sanitize_path(&decoded);
     let full_path = PathBuf::from(root).join(&clean);
 
-    let canonical_root = match std::fs::canonicalize(root) {
+    let canonical_root = match tokio::fs::canonicalize(root).await {
         Ok(p) => p,
         Err(_) => return Ok(false),
     };
-    let canonical_file = match std::fs::canonicalize(&full_path) {
+    let canonical_file = match tokio::fs::canonicalize(&full_path).await {
         Ok(p) => p,
         Err(_) => return Ok(false),
     };
@@ -782,16 +782,18 @@ async fn try_serve_static(
         return Ok(false);
     }
 
-    let meta = match std::fs::metadata(&canonical_file) {
+    let meta = match tokio::fs::metadata(&canonical_file).await {
         Ok(m) => m,
         Err(_) => return Ok(false),
     };
 
     if meta.is_dir() {
         let index = canonical_file.join("index.html");
-        if index.exists() && index.is_file() {
-            serve_file(session, &index, cors).await?;
-            return Ok(true);
+        if let Ok(m) = tokio::fs::metadata(&index).await {
+            if m.is_file() {
+                serve_file(session, &index, cors).await?;
+                return Ok(true);
+            }
         }
         // Directory without index.html → fall through to backend
         return Ok(false);
@@ -811,14 +813,14 @@ async fn serve_static(session: &mut Session, root: &str, req_path: &str, cors: b
     let full_path = PathBuf::from(root).join(&clean);
 
     // Security: ensure resolved path is under root
-    let canonical_root = match std::fs::canonicalize(root) {
+    let canonical_root = match tokio::fs::canonicalize(root).await {
         Ok(p) => p,
         Err(_) => {
             write_error_page(session, 500, "static_root_missing").await?;
             return Ok(());
         }
     };
-    let canonical_file = match std::fs::canonicalize(&full_path) {
+    let canonical_file = match tokio::fs::canonicalize(&full_path).await {
         Ok(p) => p,
         Err(_) => {
             write_not_found(session).await?;
@@ -830,7 +832,7 @@ async fn serve_static(session: &mut Session, root: &str, req_path: &str, cors: b
         return Ok(());
     }
 
-    let meta = match std::fs::metadata(&canonical_file) {
+    let meta = match tokio::fs::metadata(&canonical_file).await {
         Ok(m) => m,
         Err(_) => {
             write_not_found(session).await?;
@@ -841,8 +843,10 @@ async fn serve_static(session: &mut Session, root: &str, req_path: &str, cors: b
     if meta.is_dir() {
         // Try index.html first
         let index = canonical_file.join("index.html");
-        if index.exists() && index.is_file() {
-            return serve_file(session, &index, cors).await;
+        if let Ok(m) = tokio::fs::metadata(&index).await {
+            if m.is_file() {
+                return serve_file(session, &index, cors).await;
+            }
         }
         // Directory listing
         return serve_directory_listing(session, &canonical_file, &canonical_root, req_path, cors)
@@ -857,7 +861,7 @@ async fn serve_static(session: &mut Session, root: &str, req_path: &str, cors: b
 }
 
 async fn serve_file(session: &mut Session, path: &Path, cors: bool) -> Result<()> {
-    let body = match std::fs::read(path) {
+    let body = match tokio::fs::read(path).await {
         Ok(b) => b,
         Err(_) => {
             write_error_page(session, 500, "read_error").await?;
@@ -894,7 +898,7 @@ async fn serve_directory_listing(
     };
 
     let mut entries = Vec::new();
-    let read_dir = match std::fs::read_dir(dir) {
+    let mut read_dir = match tokio::fs::read_dir(dir).await {
         Ok(rd) => rd,
         Err(_) => {
             write_error_page(session, 500, "read_dir_error").await?;
@@ -902,12 +906,12 @@ async fn serve_directory_listing(
         }
     };
 
-    for entry in read_dir.flatten() {
+    while let Ok(Some(entry)) = read_dir.next_entry().await {
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {
             continue; // hide dotfiles
         }
-        let meta = entry.metadata().ok();
+        let meta = entry.metadata().await.ok();
         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
         let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
         let modified = meta
