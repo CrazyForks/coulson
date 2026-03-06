@@ -31,8 +31,11 @@ const DIR_NAME: &str = "coulson";
 /// macOS pf corrupts SYN-ACK packets when `rdr ... -> 127.0.0.1 port X`
 /// is active and a client connects directly to `127.0.0.1:X`.  Using a
 /// separate loopback alias avoids this state-tracking conflict.
+/// We use 127.49.27.41 (within 127.0.0.0/8) so that upstream apps see a
+/// loopback REMOTE_ADDR — frameworks like Rails restrict dev tools
+/// (web-console, etc.) to loopback connections.
 #[cfg(target_os = "macos")]
-pub const PF_REDIRECT_IP: &str = "10.20.0.1";
+pub const PF_REDIRECT_IP: &str = "127.49.27.41";
 
 fn xdg_state_home() -> PathBuf {
     env::var("XDG_STATE_HOME")
