@@ -2949,6 +2949,11 @@ fn is_pf_configured(cfg: &CoulsonConfig) -> bool {
     is_pf_configured_quick(&cfg.listen_http, &cfg.listen_https)
 }
 
+#[cfg(not(target_os = "macos"))]
+fn is_pf_configured(_cfg: &CoulsonConfig) -> bool {
+    false
+}
+
 #[cfg(target_os = "macos")]
 fn is_pf_configured_quick(
     listen_http: &std::net::SocketAddr,
