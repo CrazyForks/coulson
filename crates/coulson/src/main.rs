@@ -99,19 +99,33 @@ pub struct SharedState {
     pub network_change_tx: broadcast::Sender<()>,
     pub certs_dir: std::path::PathBuf,
     pub runtime_dir: std::path::PathBuf,
+    /// Cached pf-configured status with TTL to avoid per-request disk I/O.
+    pf_cache: Arc<Mutex<(bool, std::time::Instant)>>,
 }
 
 impl SharedState {
+    const PF_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn is_pf_active(&self) -> bool {
+        if !cfg!(target_os = "macos") {
+            return false;
+        }
+        let mut cache = self.pf_cache.lock();
+        if cache.1.elapsed() < Self::PF_CACHE_TTL {
+            return cache.0;
+        }
+        let val = is_pf_configured_quick(&self.listen_http, &self.listen_https);
+        *cache = (val, std::time::Instant::now());
+        val
+    }
+
     pub fn use_default_http_port(&self) -> bool {
-        let pf = cfg!(target_os = "macos")
-            && is_pf_configured_quick(&self.listen_http, &self.listen_https);
-        self.listen_http.port() == 80 || pf
+        self.listen_http.port() == 80 || self.is_pf_active()
     }
 
     pub fn use_default_https_port(&self) -> bool {
-        let pf = cfg!(target_os = "macos")
-            && is_pf_configured_quick(&self.listen_http, &self.listen_https);
-        self.listen_https.is_some() && (self.listen_https.map(|a| a.port()) == Some(443) || pf)
+        self.listen_https.is_some()
+            && (self.listen_https.map(|a| a.port()) == Some(443) || self.is_pf_active())
     }
 
     pub fn reload_routes(&self) -> anyhow::Result<bool> {
@@ -424,6 +438,10 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
         network_change_tx,
         certs_dir: cfg.certs_dir.clone(),
         runtime_dir: cfg.runtime_dir.clone(),
+        pf_cache: Arc::new(Mutex::new((
+            is_pf_configured(cfg),
+            std::time::Instant::now(),
+        ))),
     })
 }
 

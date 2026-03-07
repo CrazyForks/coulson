@@ -69,6 +69,7 @@ async fn mw_force_https(
     session: &mut Session,
     route: &RouteRule,
     https_port: Option<u16>,
+    use_default_https_port: bool,
 ) -> Result<Flow> {
     if !route.force_https {
         return Ok(Flow::Next);
@@ -109,12 +110,12 @@ async fn mw_force_https(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let location = if https_port == 443 {
+    let location = if use_default_https_port || https_port == 443 {
         format!("https://{hostname}{pq}")
     } else {
         format!("https://{hostname}:{https_port}{pq}")
     };
-    let mut resp = ResponseHeader::build(301, None)?;
+    let mut resp = ResponseHeader::build(302, None)?;
     resp.insert_header("location", &location)?;
     resp.insert_header("content-length", "0")?;
     session.write_response_header(Box::new(resp), true).await?;
@@ -228,8 +229,13 @@ impl ProxyHttp for BridgeProxy {
                     if mw_auth(session, &route).await? == Flow::Done {
                         return Ok(true);
                     }
-                    if mw_force_https(session, &route, self.shared.listen_https.map(|a| a.port()))
-                        .await?
+                    if mw_force_https(
+                        session,
+                        &route,
+                        self.shared.listen_https.map(|a| a.port()),
+                        self.shared.use_default_https_port(),
+                    )
+                    .await?
                         == Flow::Done
                     {
                         return Ok(true);
@@ -334,7 +340,13 @@ impl ProxyHttp for BridgeProxy {
         if mw_auth(session, &route).await? == Flow::Done {
             return Ok(true);
         }
-        if mw_force_https(session, &route, self.shared.listen_https.map(|a| a.port())).await?
+        if mw_force_https(
+            session,
+            &route,
+            self.shared.listen_https.map(|a| a.port()),
+            self.shared.use_default_https_port(),
+        )
+        .await?
             == Flow::Done
         {
             return Ok(true);
