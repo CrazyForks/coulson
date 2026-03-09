@@ -272,8 +272,19 @@ impl ProxyHttp for BridgeProxy {
                                 listen_target_to_backend(listen_target)
                             }
                             StartStatus::Starting => {
-                                write_loading_page(session, name, kind).await?;
-                                return Ok(true);
+                                match await_managed_ready(
+                                    session,
+                                    &self.process_manager,
+                                    *app_id,
+                                    name,
+                                    &root_path,
+                                    kind,
+                                )
+                                .await?
+                                {
+                                    Some(target) => target,
+                                    None => return Ok(true),
+                                }
                             }
                         }
                     } else {
@@ -385,8 +396,19 @@ impl ProxyHttp for BridgeProxy {
                     listen_target_to_backend(listen_target)
                 }
                 StartStatus::Starting => {
-                    write_loading_page(session, name, kind).await?;
-                    return Ok(true);
+                    match await_managed_ready(
+                        session,
+                        &self.process_manager,
+                        *app_id,
+                        name,
+                        &root_path,
+                        kind,
+                    )
+                    .await?
+                    {
+                        Some(target) => target,
+                        None => return Ok(true),
+                    }
                 }
             }
         } else {
@@ -1210,6 +1232,57 @@ async fn pm_mark_active(pm: &ProcessManagerHandle, app_id: i64) {
 // Error / routing helpers
 // ---------------------------------------------------------------------------
 
+fn accepts_html(session: &Session) -> bool {
+    session
+        .req_header()
+        .headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"))
+}
+
+/// Wait for a managed process to become ready.
+/// Browsers get an immediate 503 loading page; other clients block with polling.
+async fn await_managed_ready(
+    session: &mut Session,
+    pm: &ProcessManagerHandle,
+    app_id: i64,
+    name: &str,
+    root: &std::path::Path,
+    kind: &str,
+) -> std::result::Result<Option<BackendTarget>, Box<Error>> {
+    // First attempt already returned Starting — check if browser
+    if accepts_html(session) {
+        write_loading_page(session, name, kind).await?;
+        return Ok(None);
+    }
+    // Non-browser: poll until ready or timeout
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + MAX_WAIT;
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        let status = {
+            let mut pm = pm.lock().await;
+            pm.ensure_started(app_id, name, root, kind)
+                .await
+                .map_err(|e| Error::explain(ErrorType::ConnectError, format!("{e}")))?
+        };
+        match status {
+            StartStatus::Ready(listen_target) => {
+                pm_mark_active(pm, app_id).await;
+                return Ok(Some(listen_target_to_backend(listen_target)));
+            }
+            StartStatus::Starting => {
+                if tokio::time::Instant::now() >= deadline {
+                    write_error_page(session, 504, "managed_startup_timeout").await?;
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
 async fn write_loading_page(session: &mut Session, app_name: &str, kind: &str) -> Result<()> {
     let accept = session
         .req_header()
@@ -1299,6 +1372,11 @@ async fn write_error_page(session: &mut Session, status: u16, message: &str) -> 
             "Internal Error",
             "The static file root directory is not accessible.",
             "Verify the app's <code>static_root</code> path exists and is readable.",
+        ),
+        (504, "managed_startup_timeout") => (
+            "Gateway Timeout",
+            "The managed app did not become ready in time.",
+            "Check that the app starts successfully by looking at its log file.",
         ),
         (500, _) => (
             "Internal Error",
