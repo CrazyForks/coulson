@@ -34,6 +34,12 @@ pub async fn run_mdns_responder(state: SharedState) -> anyhow::Result<()> {
     let mut ip_poll_timer = interval(Duration::from_secs(IP_POLL_INTERVAL_SECS));
     let mut last_local_ip = detect_local_ip();
 
+    // Health check: periodically verify our mDNS records are resolvable
+    const HEALTH_CHECK_SECS: u64 = 10;
+    let mut health_timer = interval(Duration::from_secs(HEALTH_CHECK_SECS));
+    health_timer.tick().await; // skip immediate first tick
+    let health_domain = state.domain_suffix.clone();
+
     // registered: domain -> (fullname, was_lan)
     let mut registered: HashMap<String, (String, bool)> = HashMap::new();
 
@@ -75,6 +81,20 @@ pub async fn run_mdns_responder(state: SharedState) -> anyhow::Result<()> {
                     );
                     last_local_ip = current_ip;
                     reregister_all(&mdns, &state, &mut registered);
+                }
+            }
+            _ = health_timer.tick() => {
+                if !registered.is_empty() {
+                    let domain = health_domain.clone();
+                    let ok = tokio::task::spawn_blocking(move || can_resolve_mdns(&domain))
+                        .await
+                        .unwrap_or(false);
+                    if ok {
+                        info!("mdns health check ok for {health_domain}");
+                    } else {
+                        warn!("mdns health check failed for {health_domain}, triggering re-registration");
+                        let _ = state.network_change_tx.send(());
+                    }
                 }
             }
         }
@@ -302,6 +322,16 @@ fn reregister_all(
 
 fn is_local_domain(domain: &str) -> bool {
     domain.ends_with(".local") || domain == "local"
+}
+
+/// Try to resolve a .local domain via mDNS to verify our records are working.
+fn can_resolve_mdns(domain: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    // ToSocketAddrs uses the system resolver which handles .local via mDNS on macOS
+    match format!("{domain}:0").to_socket_addrs() {
+        Ok(mut addrs) => addrs.next().is_some(),
+        Err(_) => false,
+    }
 }
 
 /// Register a domain in mDNS.
