@@ -120,6 +120,7 @@ struct UpdateSettingsParams {
     spa_rewrite: Option<bool>,
     listen_port: Option<Option<u16>>,
     lan_access: Option<bool>,
+    cname: Option<Option<String>>,
     tunnel_mode: Option<TunnelMode>,
     app_tunnel_domain: Option<String>,
     app_tunnel_token: Option<String>,
@@ -392,6 +393,7 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                     listen_port: params.listen_port,
                     timeout_ms: None,
                     lan_access: params.lan_access,
+                    cname: params.cname.clone(),
                 },
             ) {
                 return render_err(req.request_id, ControlError::from(e));

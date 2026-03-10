@@ -173,6 +173,10 @@ impl SharedState {
                         .push(rule.clone());
                 }
             }
+            // Register cname alias so apps are reachable via custom domain
+            if let Some(ref cname) = app.cname {
+                table.entry(cname.clone()).or_default().push(rule.clone());
+            }
             table.entry(domain).or_default().push(rule);
         }
         for rules in table.values_mut() {

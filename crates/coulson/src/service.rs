@@ -115,6 +115,7 @@ pub struct UpdateSettingsParams {
     pub listen_port: Option<Option<u16>>,
     pub timeout_ms: Option<Option<u64>>,
     pub lan_access: Option<bool>,
+    pub cname: Option<Option<String>>,
 }
 
 pub fn app_update_settings(
@@ -122,6 +123,20 @@ pub fn app_update_settings(
     app_id: i64,
     params: &UpdateSettingsParams,
 ) -> Result<(), ServiceError> {
+    // Normalize and validate cname before passing to store
+    let cname_normalized = match &params.cname {
+        Some(Some(raw)) => {
+            let normalized = normalize_cname(raw)?;
+            if normalized.is_empty() {
+                Some(None) // treat empty/whitespace-only as clear
+            } else {
+                validate_cname_unique(state, app_id, &normalized)?;
+                Some(Some(normalized))
+            }
+        }
+        Some(None) => Some(None), // explicit clear
+        None => None,             // not provided
+    };
     match state.store.update_settings(
         app_id,
         params.cors_enabled,
@@ -132,6 +147,7 @@ pub fn app_update_settings(
         params.listen_port,
         params.timeout_ms,
         params.lan_access,
+        cname_normalized.as_ref().map(|v| v.as_deref()),
     ) {
         Ok(true) => {
             state
@@ -813,6 +829,81 @@ pub fn normalize_path_prefix(input: Option<&str>) -> Result<Option<String>, Stri
         return Ok(Some(trimmed.trim_end_matches('/').to_string()));
     }
     Ok(Some(trimmed.to_string()))
+}
+
+/// Normalize and validate a cname. Returns the cleaned hostname or an error
+/// for inputs that contain schemes, paths, or invalid characters.
+fn normalize_cname(raw: &str) -> Result<String, ServiceError> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return Ok(String::new());
+    }
+    // Reject scheme prefixes
+    if s.contains("://") {
+        return Err(ServiceError::InvalidParams(
+            "cname must be a bare hostname, not a URL".to_string(),
+        ));
+    }
+    // Strip port suffix (e.g. "foo.com:443" -> "foo.com")
+    let host = s.split(':').next().unwrap_or("");
+    // Reject paths
+    if host.contains('/') {
+        return Err(ServiceError::InvalidParams(
+            "cname must be a bare hostname without path".to_string(),
+        ));
+    }
+    if host.is_empty() {
+        return Err(ServiceError::InvalidParams(
+            "cname cannot be empty or port-only".to_string(),
+        ));
+    }
+    // Validate hostname labels
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(ServiceError::InvalidParams(format!(
+                "invalid hostname label in cname: {host}"
+            )));
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(ServiceError::InvalidParams(format!(
+                "invalid character in cname: {host}"
+            )));
+        }
+    }
+    Ok(host.to_string())
+}
+
+/// Validate that a cname doesn't conflict with any existing domain or cname.
+fn validate_cname_unique(
+    state: &SharedState,
+    app_id: i64,
+    cname: &str,
+) -> Result<(), ServiceError> {
+    let apps = state.store.list_all().map_err(ServiceError::from)?;
+    for app in &apps {
+        if app.id.0 == app_id {
+            continue; // skip self
+        }
+        if app.domain.0 == cname {
+            return Err(ServiceError::DomainConflict);
+        }
+        if app.cname.as_deref() == Some(cname) {
+            return Err(ServiceError::DomainConflict);
+        }
+    }
+    // Also check .localhost aliases
+    let suffix = &state.domain_suffix;
+    for app in &apps {
+        if app.id.0 == app_id {
+            continue;
+        }
+        if let Some(prefix) = app.domain.0.strip_suffix(&format!(".{suffix}")) {
+            if format!("{prefix}.localhost") == cname {
+                return Err(ServiceError::DomainConflict);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Parse the first route target from a coulson.routes file content.

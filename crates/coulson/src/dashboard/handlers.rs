@@ -252,6 +252,7 @@ pub async fn action_toggle_lan_access(
                 listen_port: None,
                 timeout_ms: None,
                 lan_access: Some(!app.lan_access),
+                cname: None,
             },
         );
     }
@@ -432,6 +433,7 @@ pub async fn action_toggle_cors(
                 listen_port: None,
                 timeout_ms: None,
                 lan_access: None,
+                cname: None,
             },
         );
     }
@@ -455,6 +457,7 @@ pub async fn action_toggle_https(
                 listen_port: None,
                 timeout_ms: None,
                 lan_access: None,
+                cname: None,
             },
         );
     }
@@ -478,6 +481,7 @@ pub async fn action_toggle_spa(
                 listen_port: None,
                 timeout_ms: None,
                 lan_access: None,
+                cname: None,
             },
         );
     }
@@ -702,6 +706,7 @@ pub async fn action_update_settings(
             listen_port,
             timeout_ms,
             lan_access: None,
+            cname: None,
         },
     ) {
         Ok(_) => Redirect::to(&format!("/apps/{id}")).into_response(),
@@ -912,6 +917,7 @@ pub async fn action_set_basic_auth(
                 listen_port: None,
                 timeout_ms: None,
                 lan_access: None,
+                cname: None,
             },
         );
     }
