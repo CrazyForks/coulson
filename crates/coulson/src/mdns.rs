@@ -6,7 +6,7 @@ use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::SharedState;
 
@@ -20,7 +20,7 @@ const RESOLV_CONF: &str = "/etc/resolv.conf";
 const IP_POLL_INTERVAL_SECS: u64 = 5;
 
 pub async fn run_mdns_responder(state: SharedState) -> anyhow::Result<()> {
-    let mdns = ServiceDaemon::new()?;
+    let mut mdns = ServiceDaemon::new()?;
 
     let mut route_rx = state.route_tx.subscribe();
     let mut network_rx = state.network_change_tx.subscribe();
@@ -60,14 +60,14 @@ pub async fn run_mdns_responder(state: SharedState) -> anyhow::Result<()> {
                 }
             }
             _ = net_rx.recv() => {
-                info!("network change detected (resolv.conf), re-registering mdns records");
-                reregister_all(&mdns, &state, &mut registered);
+                info!("network change detected (resolv.conf), rebuilding mdns daemon");
+                rebuild_mdns_daemon(&mut mdns, &state, &mut registered);
                 last_local_ip = detect_local_ip();
             }
             result = network_rx.recv() => {
                 if let Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) = result {
-                    info!("network change detected (RPC), re-registering mdns records");
-                    reregister_all(&mdns, &state, &mut registered);
+                    info!("network change detected (RPC), rebuilding mdns daemon");
+                    rebuild_mdns_daemon(&mut mdns, &state, &mut registered);
                     last_local_ip = detect_local_ip();
                 }
             }
@@ -77,10 +77,10 @@ pub async fn run_mdns_responder(state: SharedState) -> anyhow::Result<()> {
                     info!(
                         old = ?last_local_ip,
                         new = ?current_ip,
-                        "network change detected (IP changed), re-registering mdns records"
+                        "network change detected (IP changed), rebuilding mdns daemon"
                     );
                     last_local_ip = current_ip;
-                    reregister_all(&mdns, &state, &mut registered);
+                    rebuild_mdns_daemon(&mut mdns, &state, &mut registered);
                 }
             }
             _ = health_timer.tick() => {
@@ -292,30 +292,26 @@ fn sync_records(
     }
 }
 
-fn reregister_all(
-    mdns: &ServiceDaemon,
+/// Rebuild the ServiceDaemon to re-bind multicast sockets on the current
+/// network interfaces, then re-register all records. This is necessary after
+/// network changes (WiFi switch, sleep/wake) because the old daemon's sockets
+/// are bound to interfaces that may no longer exist.
+fn rebuild_mdns_daemon(
+    mdns: &mut ServiceDaemon,
     state: &SharedState,
     registered: &mut HashMap<String, (String, bool)>,
 ) {
-    if registered.is_empty() {
-        return;
-    }
-    let lan_ip = detect_local_ip();
-    let domains: Vec<(String, (String, bool))> = registered.drain().collect();
-    for (_domain, (fullname, _)) in &domains {
-        let _ = mdns.unregister(fullname);
-    }
-    for (domain, _) in domains {
-        let is_bare_suffix = domain == state.domain_suffix;
-        let use_lan = !is_bare_suffix && domain_has_lan_access(state, &domain);
-        match register_domain(mdns, &domain, if use_lan { lan_ip } else { None }) {
-            Ok(fullname) => {
-                debug!(domain, lan = use_lan, "mdns re-registered");
-                registered.insert(domain, (fullname, use_lan));
-            }
-            Err(e) => {
-                error!(domain, error = %e, "failed to re-register mdns service");
-            }
+    // Create new daemon FIRST — only replace old one on success
+    match ServiceDaemon::new() {
+        Ok(new_mdns) => {
+            let _ = mdns.shutdown();
+            registered.clear();
+            *mdns = new_mdns;
+            sync_records(mdns, state, registered);
+            info!("mdns daemon rebuilt with {} records", registered.len());
+        }
+        Err(e) => {
+            error!(error = %e, "failed to rebuild mdns daemon, keeping existing");
         }
     }
 }
@@ -324,14 +320,39 @@ fn is_local_domain(domain: &str) -> bool {
     domain.ends_with(".local") || domain == "local"
 }
 
-/// Try to resolve a .local domain via mDNS to verify our records are working.
+/// Resolve a .local hostname via a fresh mDNS multicast query.
+/// Creates a temporary ServiceDaemon to send a real mDNS query on the wire,
+/// avoiding the system resolver cache which may return stale results.
 fn can_resolve_mdns(domain: &str) -> bool {
-    use std::net::ToSocketAddrs;
-    // ToSocketAddrs uses the system resolver which handles .local via mDNS on macOS
-    match format!("{domain}:0").to_socket_addrs() {
-        Ok(mut addrs) => addrs.next().is_some(),
-        Err(_) => false,
+    use mdns_sd::HostnameResolutionEvent;
+
+    let probe = match ServiceDaemon::new() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    let hostname = format!("{domain}.");
+    let rx = match probe.resolve_hostname(&hostname, Some(2000)) {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = probe.shutdown();
+            return false;
+        }
+    };
+    let mut found = false;
+    while let Ok(event) = rx.recv() {
+        match event {
+            HostnameResolutionEvent::AddressesFound(..) => {
+                found = true;
+                break;
+            }
+            HostnameResolutionEvent::SearchTimeout(_)
+            | HostnameResolutionEvent::SearchStopped(_) => break,
+            _ => {}
+        }
     }
+    let _ = probe.stop_resolve_hostname(&hostname);
+    let _ = probe.shutdown();
+    found
 }
 
 /// Register a domain in mDNS.
