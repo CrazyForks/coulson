@@ -528,6 +528,13 @@ impl ProxyHttp for BridgeProxy {
             upstream_request.insert_header("Connection", "Upgrade")?;
         }
 
+        // Set X-Forwarded-Host from the original Host header if not already present.
+        if upstream_request.headers.get("X-Forwarded-Host").is_none() {
+            if let Some(host) = _session.req_header().headers.get("host") {
+                upstream_request.insert_header("X-Forwarded-Host", host)?;
+            }
+        }
+
         // Set X-Forwarded-Proto based on downstream connection type.
         // For tunnel requests, the tunnel proxy already set this to "https"
         // — only override if not already present.
