@@ -4,6 +4,8 @@ mod control;
 mod credentials;
 mod dashboard;
 mod domain;
+mod forward;
+mod launchd;
 mod mdns;
 mod process;
 mod proxy;
@@ -99,33 +101,42 @@ pub struct SharedState {
     pub network_change_tx: broadcast::Sender<()>,
     pub certs_dir: std::path::PathBuf,
     pub runtime_dir: std::path::PathBuf,
-    /// Cached pf-configured status with TTL to avoid per-request disk I/O.
-    pf_cache: Arc<Mutex<(bool, std::time::Instant)>>,
+    /// Cached privileged-port status with TTL to avoid per-request disk I/O.
+    forward_cache: Arc<Mutex<(bool, std::time::Instant)>>,
 }
 
 impl SharedState {
-    const PF_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+    const FORWARD_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
-    fn is_pf_active(&self) -> bool {
+    fn has_privileged_http(&self) -> bool {
         if !cfg!(target_os = "macos") {
             return false;
         }
-        let mut cache = self.pf_cache.lock();
-        if cache.1.elapsed() < Self::PF_CACHE_TTL {
+        let mut cache = self.forward_cache.lock();
+        if cache.1.elapsed() < Self::FORWARD_CACHE_TTL {
             return cache.0;
         }
-        let val = is_pf_configured_quick(&self.listen_http, &self.listen_https);
+        let val = is_forward_configured()
+            || is_pf_configured_quick(&self.listen_http, &self.listen_https);
         *cache = (val, std::time::Instant::now());
         val
     }
 
+    fn has_privileged_https(&self) -> bool {
+        if !cfg!(target_os = "macos") {
+            return false;
+        }
+        is_forward_https_configured()
+            || is_pf_configured_quick(&self.listen_http, &self.listen_https)
+    }
+
     pub fn use_default_http_port(&self) -> bool {
-        self.listen_http.port() == 80 || self.is_pf_active()
+        self.listen_http.port() == 80 || self.has_privileged_http()
     }
 
     pub fn use_default_https_port(&self) -> bool {
         self.listen_https.is_some()
-            && (self.listen_https.map(|a| a.port()) == Some(443) || self.is_pf_active())
+            && (self.listen_https.map(|a| a.port()) == Some(443) || self.has_privileged_https())
     }
 
     pub fn reload_routes(&self) -> anyhow::Result<bool> {
@@ -252,9 +263,18 @@ enum Commands {
         /// App name or domain (omit to match CWD)
         name: Option<String>,
     },
+    /// Forward privileged ports via launchd socket activation (80/443 -> high ports)
+    Forward {
+        /// Target address for HTTP (port 80)
+        #[arg(long, default_value = "127.0.0.1:18080")]
+        http_target: std::net::SocketAddr,
+        /// Target address for HTTPS (port 443)
+        #[arg(long, default_value = "127.0.0.1:18443")]
+        https_target: std::net::SocketAddr,
+    },
     /// Check system health
     Doctor {
-        /// Also check pf port forwarding configuration
+        /// Also check port forwarding configuration
         #[arg(long)]
         pf: bool,
     },
@@ -301,8 +321,11 @@ enum Commands {
     },
     /// Trust the Coulson CA certificate (add to macOS login keychain)
     Trust {
-        /// Also set up pf port forwarding (80/443 -> Coulson listen ports)
+        /// Install launchd forwarding daemon (80/443 -> Coulson listen ports)
         #[arg(long)]
+        forward: bool,
+        /// (deprecated, alias for --forward) Set up port forwarding
+        #[arg(long, hide = true)]
         pf: bool,
         /// Force re-apply even if already configured
         #[arg(long)]
@@ -442,8 +465,8 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
         network_change_tx,
         certs_dir: cfg.certs_dir.clone(),
         runtime_dir: cfg.runtime_dir.clone(),
-        pf_cache: Arc::new(Mutex::new((
-            is_pf_configured(cfg),
+        forward_cache: Arc::new(Mutex::new((
+            is_forward_configured() || is_pf_configured(cfg),
             std::time::Instant::now(),
         ))),
     })
@@ -723,11 +746,42 @@ fn run_doctor(cfg: CoulsonConfig, check_pf: bool) -> anyhow::Result<()> {
         print_check(true, "HTTPS listener disabled (no TLS check needed)");
     }
 
-    // 10. pf port forwarding (optional)
+    // 10. port forwarding (optional)
     if check_pf {
         #[cfg(target_os = "macos")]
         {
-            if is_pf_configured(&cfg) {
+            let plist_exists = std::path::Path::new(FORWARD_PLIST_PATH).exists();
+            let service_loaded = is_forward_service_loaded();
+            if plist_exists && service_loaded {
+                let plist_has_https = is_forward_https_configured();
+                let needs_https = cfg.listen_https.is_some();
+                if needs_https != plist_has_https {
+                    let installed = if plist_has_https { "80/443" } else { "80" };
+                    let expected = if needs_https { "80/443" } else { "80" };
+                    print_check(
+                        false,
+                        &format!(
+                            "forwarding daemon mismatch: installed={installed}, expected={expected}"
+                        ),
+                    );
+                    print_warn("run: sudo coulson trust --forward --force");
+                    issues += 1;
+                } else {
+                    let fwd_desc = if needs_https {
+                        "launchd forwarding daemon installed (80/443)"
+                    } else {
+                        "launchd forwarding daemon installed (80)"
+                    };
+                    print_check(true, fwd_desc);
+                }
+            } else if plist_exists && !service_loaded {
+                print_check(
+                    false,
+                    "forwarding daemon plist exists but service not loaded",
+                );
+                print_warn("run: sudo coulson trust --forward --force");
+                issues += 1;
+            } else if is_pf_configured(&cfg) {
                 let http_port = cfg.listen_http.port();
                 let https_port = cfg.listen_https.map(|a| a.port());
                 print_check(
@@ -737,15 +791,16 @@ fn run_doctor(cfg: CoulsonConfig, check_pf: bool) -> anyhow::Result<()> {
                         https_port.map_or("n/a".to_string(), |p| p.to_string())
                     ),
                 );
+                print_warn("pf forwarding is deprecated, consider: sudo coulson trust --forward");
             } else {
-                print_check(false, "pf forwarding not configured");
-                print_warn("run: sudo coulson trust --pf");
+                print_check(false, "port forwarding not configured");
+                print_warn("run: sudo coulson trust --forward");
                 issues += 1;
             }
         }
         #[cfg(not(target_os = "macos"))]
         {
-            print_check(true, "pf check skipped (not macOS)");
+            print_check(true, "port forwarding check skipped (not macOS)");
         }
     }
 
@@ -1329,7 +1384,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Stop { name } => run_process_action(cfg, name, "process.stop"),
         Commands::Restart { name } => run_process_action(cfg, name, "process.restart"),
         Commands::Attach { name } => run_attach(cfg, name),
-        Commands::Trust { pf, force } => run_trust(cfg, pf, force),
+        Commands::Trust { forward, pf, force } => run_trust(cfg, forward || pf, force),
+        Commands::Forward {
+            http_target,
+            https_target,
+        } => run_forward(http_target, https_target).await,
         Commands::Tunnel { action } => run_tunnel(cfg, action),
     }
 }
@@ -2710,7 +2769,7 @@ fn find_app_json(client: &RpcClient, app_id: i64) -> anyhow::Result<serde_json::
 
 fn run_trust(
     cfg: CoulsonConfig,
-    #[allow(unused)] pf: bool,
+    #[allow(unused)] forward: bool,
     #[allow(unused)] force: bool,
 ) -> anyhow::Result<()> {
     let ca_path = cfg.certs_dir.join("ca.crt");
@@ -2725,30 +2784,19 @@ fn run_trust(
     #[cfg(target_os = "macos")]
     {
         let ca_trusted = is_ca_trusted(&ca_path);
-        let pf_ok = if pf { is_pf_configured(&cfg) } else { true };
 
         println!("CA certificate: {}", ca_path.display());
 
-        if ca_trusted && pf_ok && !force {
+        // Early return only when no forwarding is requested — forwarding
+        // always falls through to setup_forward_daemon() which does its
+        // own content-based comparison to handle config changes.
+        if ca_trusted && !forward && !force {
             println!(
                 "{}",
                 "CA certificate already trusted in system keychain."
                     .green()
                     .bold()
             );
-            if pf {
-                let http_port = cfg.listen_http.port();
-                let https_port = cfg.listen_https.map(|a| a.port());
-                println!(
-                    "{}",
-                    format!(
-                        "Port forwarding already configured (80 -> {http_port}, 443 -> {}).",
-                        https_port.map_or("disabled".to_string(), |p| p.to_string())
-                    )
-                    .green()
-                    .bold()
-                );
-            }
             return Ok(());
         }
 
@@ -2760,8 +2808,8 @@ fn run_trust(
             .unwrap_or(false);
         if !is_root {
             let mut cmd = "sudo coulson trust".to_string();
-            if pf {
-                cmd.push_str(" --pf");
+            if forward {
+                cmd.push_str(" --forward");
             }
             if force {
                 cmd.push_str(" --force");
@@ -2802,8 +2850,10 @@ fn run_trust(
             }
         }
 
-        if pf {
-            setup_pf_forwarding(&cfg)?;
+        if forward {
+            setup_forward_daemon(&cfg, force)?;
+            // Clean up legacy pf rules if present
+            cleanup_pf_rules();
         }
     }
 
@@ -2927,27 +2977,264 @@ fn which_exists(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(target_os = "macos")]
-fn build_pf_rules(cfg: &CoulsonConfig) -> (String, String, String) {
-    let http_port = cfg.listen_http.port();
-    let https_port = cfg.listen_https.map(|a| a.port());
-    let ip = crate::config::PF_REDIRECT_IP;
-    let anchor_ref = "rdr-anchor \"coulson\"".to_string();
-    let anchor_load = "load anchor \"coulson\" from \"/etc/pf.anchors/coulson\"".to_string();
+const FORWARD_PLIST_PATH: &str = "/Library/LaunchDaemons/com.coulson.forward.plist";
 
-    let mut rules = format!(
-        "rdr pass on lo0 inet proto tcp from any to any port 80 -> {ip} port {http_port}\n\
-         rdr pass on lo0 inet6 proto tcp from any to any port 80 -> ::1 port {http_port}\n"
-    );
-    if let Some(port) = https_port {
-        rules.push_str(&format!(
-            "rdr pass on lo0 inet proto tcp from any to any port 443 -> {ip} port {port}\n\
-             rdr pass on lo0 inet6 proto tcp from any to any port 443 -> ::1 port {port}\n"
-        ));
-    }
-    (rules, anchor_ref, anchor_load)
+/// Check if the launchd forwarding daemon is installed and loaded.
+#[cfg(target_os = "macos")]
+fn is_forward_configured() -> bool {
+    std::path::Path::new(FORWARD_PLIST_PATH).exists() && is_forward_service_loaded()
 }
 
+/// Check if the installed plist includes HTTPS (CoulsonHTTPS) socket and service is loaded.
+#[cfg(target_os = "macos")]
+fn is_forward_https_configured() -> bool {
+    std::fs::read_to_string(FORWARD_PLIST_PATH)
+        .map(|c| c.contains("CoulsonHTTPS"))
+        .unwrap_or(false)
+        && is_forward_service_loaded()
+}
+
+/// Check if the com.coulson.forward service is loaded in launchd.
+#[cfg(target_os = "macos")]
+fn is_forward_service_loaded() -> bool {
+    std::process::Command::new("launchctl")
+        .args(["print", "system/com.coulson.forward"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_forward_configured() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_forward_https_configured() -> bool {
+    false
+}
+
+/// Run the `coulson forward` subcommand: activate launchd sockets and forward.
+async fn run_forward(
+    http_target: std::net::SocketAddr,
+    https_target: std::net::SocketAddr,
+) -> anyhow::Result<()> {
+    let mut handles = Vec::new();
+
+    match launchd::activate_socket("CoulsonHTTP") {
+        Ok(fds) if !fds.is_empty() => {
+            info!("activated CoulsonHTTP socket ({} fd(s))", fds.len());
+            handles.push(tokio::spawn(forward::run_forwarder(fds, http_target)));
+        }
+        Ok(_) => info!("no CoulsonHTTP sockets activated"),
+        Err(e) => error!("failed to activate CoulsonHTTP: {e}"),
+    }
+
+    match launchd::activate_socket("CoulsonHTTPS") {
+        Ok(fds) if !fds.is_empty() => {
+            info!("activated CoulsonHTTPS socket ({} fd(s))", fds.len());
+            handles.push(tokio::spawn(forward::run_forwarder(fds, https_target)));
+        }
+        Ok(_) => info!("no CoulsonHTTPS sockets activated"),
+        Err(e) => error!("failed to activate CoulsonHTTPS: {e}"),
+    }
+
+    if handles.is_empty() {
+        anyhow::bail!("no sockets activated — is launchd running this process?");
+    }
+
+    for h in handles {
+        h.await??;
+    }
+    Ok(())
+}
+
+/// Install the launchd forwarding daemon plist.
+#[cfg(target_os = "macos")]
+fn setup_forward_daemon(cfg: &CoulsonConfig, force: bool) -> anyhow::Result<()> {
+    let http_port = cfg.listen_http.port();
+    let https_port = cfg.listen_https.map(|a| a.port());
+
+    // Find the coulson binary path
+    let coulson_bin = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/coulson"));
+
+    let username = std::env::var("SUDO_USER")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "root".to_string());
+
+    // Build ProgramArguments
+    let mut args = format!(
+        "        <string>{bin}</string>\n\
+         \x20       <string>forward</string>\n\
+         \x20       <string>--http-target</string>\n\
+         \x20       <string>127.0.0.1:{http_port}</string>",
+        bin = coulson_bin.display(),
+    );
+    if let Some(port) = https_port {
+        args.push_str(&format!(
+            "\n\
+             \x20       <string>--https-target</string>\n\
+             \x20       <string>127.0.0.1:{port}</string>"
+        ));
+    }
+
+    // Build Sockets dict — always include HTTP; only include HTTPS if enabled
+    let mut sockets = "\
+        <key>CoulsonHTTP</key>\n\
+        \x20       <dict>\n\
+        \x20           <key>SockServiceName</key>\n\
+        \x20           <string>80</string>\n\
+        \x20           <key>SockType</key>\n\
+        \x20           <string>stream</string>\n\
+        \x20       </dict>"
+        .to_string();
+    if https_port.is_some() {
+        sockets.push_str(
+            "\n\
+            \x20       <key>CoulsonHTTPS</key>\n\
+            \x20       <dict>\n\
+            \x20           <key>SockServiceName</key>\n\
+            \x20           <string>443</string>\n\
+            \x20           <key>SockType</key>\n\
+            \x20           <string>stream</string>\n\
+            \x20       </dict>",
+        );
+    }
+
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.coulson.forward</string>
+    <key>ProgramArguments</key>
+    <array>
+{args}
+    </array>
+    <key>UserName</key>
+    <string>{username}</string>
+    <key>Sockets</key>
+    <dict>
+        {sockets}
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/tmp/coulson-forward.log</string>
+</dict>
+</plist>
+"#
+    );
+
+    // Check if already installed with same content
+    let ports_desc = if https_port.is_some() { "80/443" } else { "80" };
+
+    let existing = std::fs::read_to_string(FORWARD_PLIST_PATH).unwrap_or_default();
+    if existing == plist && !force {
+        println!(
+            "{}",
+            format!("Forwarding daemon already installed ({ports_desc}).")
+                .green()
+                .bold()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Installing forwarding daemon ({ports_desc} -> 127.0.0.1:{http_port}{})...",
+        https_port.map_or(String::new(), |p| format!("/127.0.0.1:{p}"))
+    );
+
+    // Unload existing if present
+    if std::path::Path::new(FORWARD_PLIST_PATH).exists() {
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", "system", FORWARD_PLIST_PATH])
+            .status();
+    }
+
+    std::fs::write(FORWARD_PLIST_PATH, &plist)
+        .with_context(|| format!("failed to write {FORWARD_PLIST_PATH}"))?;
+
+    let status = std::process::Command::new("launchctl")
+        .args(["bootstrap", "system", FORWARD_PLIST_PATH])
+        .status()
+        .context("failed to run launchctl bootstrap")?;
+
+    if status.success() {
+        println!(
+            "{}",
+            "Forwarding daemon installed successfully!".green().bold()
+        );
+        println!("  80  -> 127.0.0.1:{http_port}");
+        if let Some(port) = https_port {
+            println!("  443 -> 127.0.0.1:{port}");
+        }
+    } else {
+        // Clean up plist to avoid dirty state where file exists but service isn't loaded
+        let _ = std::fs::remove_file(FORWARD_PLIST_PATH);
+        bail!("Failed to bootstrap forwarding daemon. Check: launchctl bootstrap system {FORWARD_PLIST_PATH}");
+    }
+
+    Ok(())
+}
+
+/// Remove legacy pf forwarding rules if present.
+#[cfg(target_os = "macos")]
+fn cleanup_pf_rules() {
+    let anchor_path = std::path::Path::new("/etc/pf.anchors/coulson");
+    let pf_conf_path = std::path::Path::new("/etc/pf.conf");
+    let loopback_plist = "/Library/LaunchDaemons/com.coulson.loopback.plist";
+
+    let mut cleaned = false;
+
+    // Remove pf anchor file
+    if anchor_path.exists() && std::fs::remove_file(anchor_path).is_ok() {
+        println!("Removed legacy pf anchor: {}", anchor_path.display());
+        cleaned = true;
+    }
+
+    // Remove coulson lines from pf.conf
+    if let Ok(content) = std::fs::read_to_string(pf_conf_path) {
+        if content.contains("coulson") {
+            let new_conf: String = content
+                .lines()
+                .filter(|l| !l.contains("coulson"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            if std::fs::write(pf_conf_path, &new_conf).is_ok() {
+                println!("Cleaned coulson rules from {}", pf_conf_path.display());
+                let _ = std::process::Command::new("pfctl")
+                    .args(["-f", "/etc/pf.conf"])
+                    .status();
+                cleaned = true;
+            }
+        }
+    }
+
+    // Remove loopback alias plist
+    if std::path::Path::new(loopback_plist).exists() {
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", "system", loopback_plist])
+            .status();
+        if std::fs::remove_file(loopback_plist).is_ok() {
+            println!("Removed legacy loopback plist: {loopback_plist}");
+            cleaned = true;
+        }
+    }
+
+    if cleaned {
+        println!("{}", "Legacy pf rules cleaned up.".green().bold());
+    }
+}
+
+// Legacy pf detection (for backward compatibility during transition)
 #[cfg(target_os = "macos")]
 fn is_pf_configured(cfg: &CoulsonConfig) -> bool {
     is_pf_configured_quick(&cfg.listen_http, &cfg.listen_https)
@@ -2995,150 +3282,6 @@ fn is_pf_configured_quick(
     _listen_https: &Option<std::net::SocketAddr>,
 ) -> bool {
     false
-}
-
-#[cfg(target_os = "macos")]
-fn ensure_loopback_alias() -> anyhow::Result<()> {
-    let ip = crate::config::PF_REDIRECT_IP;
-
-    // 1. Ensure alias exists on lo0
-    let output = std::process::Command::new("ifconfig")
-        .arg("lo0")
-        .output()
-        .context("failed to run ifconfig")?;
-    let ifconfig = String::from_utf8_lossy(&output.stdout);
-    if !ifconfig.contains(&format!("inet {ip} ")) {
-        let status = std::process::Command::new("ifconfig")
-            .args(["lo0", "alias", ip])
-            .status()
-            .context("failed to add loopback alias")?;
-        if !status.success() {
-            bail!("failed to add loopback alias {ip} to lo0");
-        }
-    }
-
-    // 2. Ensure launchd plist exists so the alias persists across reboots
-    let plist_path = "/Library/LaunchDaemons/com.coulson.loopback.plist";
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.coulson.loopback</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/sbin/ifconfig</string>
-        <string>lo0</string>
-        <string>alias</string>
-        <string>{ip}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>
-"#
-    );
-    let existing = std::fs::read_to_string(plist_path).unwrap_or_default();
-    if existing != plist {
-        std::fs::write(plist_path, &plist)
-            .with_context(|| format!("failed to write {plist_path}"))?;
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn setup_pf_forwarding(cfg: &CoulsonConfig) -> anyhow::Result<()> {
-    let http_port = cfg.listen_http.port();
-    let https_port = cfg.listen_https.map(|a| a.port());
-    let ip = crate::config::PF_REDIRECT_IP;
-
-    // Ensure loopback alias exists (pf redirects use a dedicated IP to
-    // avoid macOS pf state-tracking conflicts with direct connections)
-    ensure_loopback_alias()?;
-
-    let anchor_path = std::path::Path::new("/etc/pf.anchors/coulson");
-    let pf_conf_path = std::path::Path::new("/etc/pf.conf");
-    let (rules, anchor_ref, anchor_load) = build_pf_rules(cfg);
-
-    // Check if already configured
-    let existing_anchor = std::fs::read_to_string(anchor_path).unwrap_or_default();
-    let existing_pf_conf = std::fs::read_to_string(pf_conf_path).unwrap_or_default();
-    let anchor_ok = existing_anchor == rules;
-    let pf_conf_ok =
-        existing_pf_conf.contains(&anchor_ref) && existing_pf_conf.contains(&anchor_load);
-
-    if anchor_ok && pf_conf_ok {
-        println!(
-            "{}",
-            format!(
-                "Port forwarding already configured (80 -> {http_port}, 443 -> {}).",
-                https_port.map_or("disabled".to_string(), |p| p.to_string())
-            )
-            .green()
-            .bold()
-        );
-        return Ok(());
-    }
-
-    println!(
-        "Setting up port forwarding (80 -> {http_port}, 443 -> {})...",
-        https_port.map_or("disabled".to_string(), |p| p.to_string())
-    );
-
-    // Write anchor file
-    std::fs::write(anchor_path, &rules).context("failed to write /etc/pf.anchors/coulson")?;
-
-    // Rewrite pf.conf with coulson anchors at correct positions
-    // pf requires order: options, normalization, queueing, translation (rdr), filtering (anchor)
-    if !pf_conf_ok {
-        // Strip any existing coulson lines first
-        let cleaned: Vec<&str> = existing_pf_conf
-            .lines()
-            .filter(|l| !l.contains("coulson"))
-            .collect();
-
-        let mut new_conf = String::new();
-        let mut rdr_inserted = false;
-        for line in &cleaned {
-            // Insert rdr-anchor before the first filtering anchor line
-            if !rdr_inserted && line.starts_with("anchor ") {
-                new_conf.push_str(&anchor_ref);
-                new_conf.push('\n');
-                rdr_inserted = true;
-            }
-            new_conf.push_str(line);
-            new_conf.push('\n');
-        }
-        if !rdr_inserted {
-            new_conf.push_str(&anchor_ref);
-            new_conf.push('\n');
-        }
-        // load anchor goes at the end
-        new_conf.push_str(&anchor_load);
-        new_conf.push('\n');
-
-        std::fs::write(pf_conf_path, &new_conf).context("failed to write /etc/pf.conf")?;
-    }
-
-    // Reload pf
-    let status = std::process::Command::new("pfctl")
-        .args(["-f", "/etc/pf.conf"])
-        .status()
-        .context("failed to reload pf")?;
-
-    if status.success() {
-        println!("{}", "Port forwarding enabled successfully!".green().bold());
-        println!("  80  -> {ip}:{http_port}");
-        if let Some(port) = https_port {
-            println!("  443 -> {ip}:{port}");
-        }
-    } else {
-        bail!("Failed to reload pf rules. You can manually reload: pfctl -f /etc/pf.conf");
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
