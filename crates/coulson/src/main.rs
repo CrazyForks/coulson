@@ -2977,6 +2977,7 @@ fn which_exists(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "macos")]
 const FORWARD_PLIST_PATH: &str = "/Library/LaunchDaemons/com.coulson.forward.plist";
 
 /// Check if the launchd forwarding daemon is installed and loaded.
