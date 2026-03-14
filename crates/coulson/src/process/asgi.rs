@@ -47,6 +47,11 @@ impl ProcessProvider for AsgiProvider {
         let server = find_asgi_server(&app.root)?;
         let socket_path = app.socket_path();
 
+        let reload = matches!(
+            app.env_overrides.get("ASGI_RELOAD").map(|v| v.as_str()),
+            Some("1" | "true")
+        );
+
         let mut args = vec![module];
         match server.server_type {
             AsgiServer::Granian => {
@@ -56,14 +61,21 @@ impl ProcessProvider for AsgiProvider {
                     "--interface".into(),
                     "asgi".into(),
                 ]);
+                if reload {
+                    args.push("--reload".into());
+                }
             }
             AsgiServer::Uvicorn => {
                 args.extend(["--uds".into(), socket_path.to_string_lossy().to_string()]);
+                if reload {
+                    args.push("--reload".into());
+                }
             }
         }
 
         let mut env = std::collections::HashMap::new();
         env.extend(app.env_overrides.clone());
+        env.remove("ASGI_RELOAD");
 
         Ok(ProcessSpec {
             command: server.binary,
@@ -499,6 +511,54 @@ mod tests {
     fn detect_module_fails_with_no_entry_point() {
         let root = temp_app_dir("module-none");
         assert!(detect_module(&root).is_err());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn make_managed_app(root: &Path, env: Vec<(&str, &str)>) -> ManagedApp {
+        let socket_dir = root.join("sockets");
+        fs::create_dir_all(&socket_dir).unwrap();
+        ManagedApp {
+            name: "testapp".into(),
+            root: root.to_path_buf(),
+            kind: "asgi".into(),
+            manifest: None,
+            env_overrides: env.into_iter().map(|(k, v)| (k.into(), v.into())).collect(),
+            socket_dir,
+        }
+    }
+
+    #[test]
+    fn reload_enabled_uvicorn() {
+        let root = temp_app_dir("reload-uvicorn");
+        fs::write(root.join("app.py"), "").unwrap();
+        place_venv_binary(&root, "uvicorn");
+        let app = make_managed_app(&root, vec![("ASGI_RELOAD", "1")]);
+        let spec = AsgiProvider.resolve(&app).unwrap();
+        assert!(spec.args.contains(&"--reload".to_string()));
+        assert!(!spec.env.contains_key("ASGI_RELOAD"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reload_enabled_granian() {
+        let root = temp_app_dir("reload-granian");
+        fs::write(root.join("app.py"), "").unwrap();
+        place_venv_binary(&root, "granian");
+        let app = make_managed_app(&root, vec![("ASGI_RELOAD", "true")]);
+        let spec = AsgiProvider.resolve(&app).unwrap();
+        assert!(spec.args.contains(&"--reload".to_string()));
+        assert!(!spec.env.contains_key("ASGI_RELOAD"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reload_disabled_by_default() {
+        let root = temp_app_dir("reload-default");
+        fs::write(root.join("app.py"), "").unwrap();
+        place_venv_binary(&root, "uvicorn");
+        let app = make_managed_app(&root, vec![]);
+        let spec = AsgiProvider.resolve(&app).unwrap();
+        assert!(!spec.args.contains(&"--reload".to_string()));
         fs::remove_dir_all(&root).ok();
     }
 }
