@@ -116,7 +116,7 @@ impl SharedState {
         if cache.1.elapsed() < Self::FORWARD_CACHE_TTL {
             return cache.0;
         }
-        let val = is_forward_configured()
+        let val = is_forward_configured_for_port(self.listen_http.port())
             || is_pf_configured_quick(&self.listen_http, &self.listen_https);
         *cache = (val, std::time::Instant::now());
         val
@@ -126,7 +126,11 @@ impl SharedState {
         if !cfg!(target_os = "macos") {
             return false;
         }
-        is_forward_https_configured()
+        let https_port = match self.listen_https {
+            Some(addr) => addr.port(),
+            None => return false,
+        };
+        is_forward_https_configured_for_port(https_port)
             || is_pf_configured_quick(&self.listen_http, &self.listen_https)
     }
 
@@ -466,7 +470,7 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
         certs_dir: cfg.certs_dir.clone(),
         runtime_dir: cfg.runtime_dir.clone(),
         forward_cache: Arc::new(Mutex::new((
-            is_forward_configured() || is_pf_configured(cfg),
+            is_forward_configured_for_port(cfg.listen_http.port()) || is_pf_configured(cfg),
             std::time::Instant::now(),
         ))),
     })
@@ -755,6 +759,11 @@ fn run_doctor(cfg: CoulsonConfig, check_pf: bool) -> anyhow::Result<()> {
             if plist_exists && service_loaded {
                 let plist_has_https = is_forward_https_configured();
                 let needs_https = cfg.listen_https.is_some();
+                let http_port_matches = is_forward_configured_for_port(cfg.listen_http.port());
+                let https_port_matches = cfg
+                    .listen_https
+                    .map(|a| is_forward_https_configured_for_port(a.port()))
+                    .unwrap_or(true);
                 if needs_https != plist_has_https {
                     let installed = if plist_has_https { "80/443" } else { "80" };
                     let expected = if needs_https { "80/443" } else { "80" };
@@ -763,6 +772,13 @@ fn run_doctor(cfg: CoulsonConfig, check_pf: bool) -> anyhow::Result<()> {
                         &format!(
                             "forwarding daemon mismatch: installed={installed}, expected={expected}"
                         ),
+                    );
+                    print_warn("run: sudo coulson trust --forward --force");
+                    issues += 1;
+                } else if !http_port_matches || !https_port_matches {
+                    print_check(
+                        false,
+                        "forwarding daemon target port does not match current listen port",
                     );
                     print_warn("run: sudo coulson trust --forward --force");
                     issues += 1;
@@ -2990,6 +3006,20 @@ fn is_forward_configured() -> bool {
     std::path::Path::new(FORWARD_PLIST_PATH).exists() && is_forward_service_loaded()
 }
 
+/// Check if the forwarding daemon forwards port 80 to the given HTTP port.
+#[cfg(target_os = "macos")]
+fn is_forward_configured_for_port(http_port: u16) -> bool {
+    if !is_forward_configured() {
+        return false;
+    }
+    let plist = match std::fs::read_to_string(FORWARD_PLIST_PATH) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    // Match exact plist XML value to avoid port prefix false positives (e.g. 1808 vs 18080)
+    plist.contains(&format!("<string>127.0.0.1:{http_port}</string>"))
+}
+
 /// Check if the installed plist includes HTTPS (CoulsonHTTPS) socket and service is loaded.
 #[cfg(target_os = "macos")]
 fn is_forward_https_configured() -> bool {
@@ -2997,6 +3027,19 @@ fn is_forward_https_configured() -> bool {
         .map(|c| c.contains("CoulsonHTTPS"))
         .unwrap_or(false)
         && is_forward_service_loaded()
+}
+
+/// Check if the forwarding daemon forwards port 443 to the given HTTPS port.
+#[cfg(target_os = "macos")]
+fn is_forward_https_configured_for_port(https_port: u16) -> bool {
+    if !is_forward_https_configured() {
+        return false;
+    }
+    let plist = match std::fs::read_to_string(FORWARD_PLIST_PATH) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    plist.contains(&format!("<string>127.0.0.1:{https_port}</string>"))
 }
 
 /// Check if the com.coulson.forward service is loaded in launchd.
@@ -3017,7 +3060,17 @@ fn is_forward_configured() -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
+fn is_forward_configured_for_port(_http_port: u16) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
 fn is_forward_https_configured() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_forward_https_configured_for_port(_https_port: u16) -> bool {
     false
 }
 
