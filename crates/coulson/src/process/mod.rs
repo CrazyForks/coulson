@@ -430,11 +430,14 @@ impl ProcessManager {
             );
         }
 
+        // Load .coulson.toml manifest if present
+        let manifest = load_coulson_toml_manifest(root);
+
         let managed_app = ManagedApp {
             name: name.to_string(),
             root: root.to_path_buf(),
             kind: kind.to_string(),
-            manifest: None,
+            manifest,
             env_overrides,
             socket_dir: sockets_dir.clone(),
         };
@@ -651,6 +654,34 @@ impl ProcessManager {
         debug!(session = %session_name, "spawned tmux session");
 
         Ok(ProcessHandle::Tmux { session_name })
+    }
+}
+
+/// Load `.coulson.toml` from app root and convert to serde_json::Value for providers.
+/// Logs errors instead of silently ignoring them.
+fn load_coulson_toml_manifest(root: &Path) -> Option<serde_json::Value> {
+    let toml_path = root.join(".coulson.toml");
+    let raw = match std::fs::read_to_string(&toml_path) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::error!(path = %toml_path.display(), %e, "failed to read .coulson.toml");
+            return None;
+        }
+    };
+    let table: toml::Value = match toml::from_str(&raw) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(path = %toml_path.display(), %e, "failed to parse .coulson.toml");
+            return None;
+        }
+    };
+    match serde_json::to_value(table) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::error!(path = %toml_path.display(), %e, "failed to convert .coulson.toml to JSON");
+            None
+        }
     }
 }
 

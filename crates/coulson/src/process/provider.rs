@@ -64,7 +64,7 @@ impl ManagedApp {
 /// - `.env` / `.env.local` (dotenv)
 /// - `mise.toml` / `.mise.toml` (via `mise env --json` subprocess)
 /// - `.envrc` (via `direnv export json` subprocess)
-/// - `coulson.json` `env` field
+/// - `.coulson.toml` `env` field
 /// - Per-app overrides stored in SQLite via control API
 ///
 /// For now, providers use their own defaults + `ManagedApp::env_overrides`.
@@ -77,7 +77,7 @@ pub trait ProcessProvider: Send + Sync {
 
     /// Try to detect if `dir` contains an app this provider can manage.
     ///
-    /// `manifest` is the parsed `coulson.json` content if present.
+    /// `manifest` is the parsed `.coulson.toml` content (as JSON Value) if present.
     /// Returns `None` if the provider cannot handle this directory.
     fn detect(&self, dir: &Path, manifest: Option<&Value>) -> Option<DetectedApp>;
 

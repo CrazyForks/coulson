@@ -1573,10 +1573,13 @@ fn run_add_directory_inner(
     }
 
     // Try auto-detect app kind
-    let manifest_path = cwd.join("coulson.json");
-    let manifest: Option<serde_json::Value> = if manifest_path.is_file() {
-        let data = std::fs::read_to_string(&manifest_path).ok();
-        data.and_then(|s| serde_json::from_str(&s).ok())
+    let toml_path = cwd.join(".coulson.toml");
+    let manifest: Option<serde_json::Value> = if toml_path.is_file() {
+        let data = std::fs::read_to_string(&toml_path)
+            .with_context(|| format!("failed to read {}", toml_path.display()))?;
+        let table: toml::Value = toml::from_str(&data)
+            .with_context(|| format!("invalid TOML in {}", toml_path.display()))?;
+        Some(serde_json::to_value(table)?)
     } else {
         None
     };
@@ -1612,7 +1615,7 @@ fn run_add_directory_inner(
             println!("  {}", lh.cyan());
         }
     } else {
-        // No auto-detect, still create symlink (scanner will parse coulson.routes etc.)
+        // No auto-detect, still create symlink (scanner will parse .coulson.toml/.coulson etc.)
         std::fs::create_dir_all(&cfg.apps_root)?;
         #[cfg(unix)]
         std::os::unix::fs::symlink(cwd, &link_path).with_context(|| {
@@ -1642,7 +1645,8 @@ fn run_add_directory_inner(
         }
         println!(
             "  {}",
-            "Tip: use `coulson add <port>` to specify a target port, or add coulson.json/coulson.routes".dimmed()
+            "Tip: use `coulson add <port>` to specify a target port, or add .coulson.toml/.coulson"
+                .dimmed()
         );
     }
 

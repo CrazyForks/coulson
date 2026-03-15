@@ -43,8 +43,8 @@ impl ProcessProvider for AsgiProvider {
     }
 
     fn resolve(&self, app: &ManagedApp) -> anyhow::Result<ProcessSpec> {
-        let module = detect_module(&app.root)?;
-        let server = find_asgi_server(&app.root)?;
+        let module = detect_module(&app.root, app.manifest.as_ref())?;
+        let server = find_asgi_server(&app.root, app.manifest.as_ref())?;
         let socket_path = app.socket_path();
 
         let reload = matches!(
@@ -108,16 +108,11 @@ struct AsgiServerInfo {
 }
 
 /// Detect the ASGI module to pass to granian / uvicorn.
-/// Priority: coulson.json `module` field > app.py > main.py
-fn detect_module(root: &Path) -> anyhow::Result<String> {
-    let manifest_path = root.join("coulson.json");
-    if manifest_path.exists() {
-        if let Ok(raw) = std::fs::read_to_string(&manifest_path) {
-            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(module) = manifest.get("module").and_then(|v| v.as_str()) {
-                    return Ok(module.to_string());
-                }
-            }
+/// Priority: manifest `module` field > app.py > main.py
+fn detect_module(root: &Path, manifest: Option<&Value>) -> anyhow::Result<String> {
+    if let Some(m) = manifest {
+        if let Some(module) = m.get("module").and_then(|v| v.as_str()) {
+            return Ok(module.to_string());
         }
     }
 
@@ -137,71 +132,66 @@ fn detect_module(root: &Path) -> anyhow::Result<String> {
 /// Find the best available ASGI server for the given app directory.
 ///
 /// Resolution order:
-///   1. `coulson.json` `server` field (`"granian"` | `"uvicorn"`) → use that server
-///   2. `coulson.json` `command` field → use as binary path, infer server type from name
+///   1. manifest `server` field (`"granian"` | `"uvicorn"`) → use that server
+///   2. manifest `command` field → use as binary path, infer server type from name
 ///   3. Auto-detect: try uvicorn first (venv → PATH), then granian (venv → PATH)
-fn find_asgi_server(root: &Path) -> anyhow::Result<AsgiServerInfo> {
-    let manifest_path = root.join("coulson.json");
-    if manifest_path.exists() {
-        if let Ok(raw) = std::fs::read_to_string(&manifest_path) {
-            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&raw) {
-                let server_pref = manifest.get("server").and_then(|v| v.as_str());
-                let command = manifest.get("command").and_then(|v| v.as_str());
+fn find_asgi_server(root: &Path, manifest: Option<&Value>) -> anyhow::Result<AsgiServerInfo> {
+    if let Some(m) = manifest {
+        let server_pref = m.get("server").and_then(|v| v.as_str());
+        let command = m.get("command").and_then(|v| v.as_str());
 
-                // Explicit server preference
-                if let Some(server_name) = server_pref {
-                    let server_type = match server_name {
-                        "granian" => AsgiServer::Granian,
-                        "uvicorn" => AsgiServer::Uvicorn,
-                        other => {
-                            warn!(
-                                server = other,
-                                "unknown server in coulson.json, trying auto-detect"
-                            );
-                            return auto_detect_server(root);
-                        }
-                    };
-                    if let Some(cmd) = command {
-                        let path = PathBuf::from(cmd);
-                        if path.exists() {
-                            return Ok(AsgiServerInfo {
-                                server_type,
-                                binary: path,
-                            });
-                        }
-                        warn!(
-                            command = cmd,
-                            "coulson.json command not found, searching defaults"
-                        );
-                    }
-                    let binary = find_server_binary(root, server_name)?;
+        // Explicit server preference
+        if let Some(server_name) = server_pref {
+            let server_type = match server_name {
+                "granian" => AsgiServer::Granian,
+                "uvicorn" => AsgiServer::Uvicorn,
+                other => {
+                    warn!(
+                        server = other,
+                        "unknown server in .coulson.toml, trying auto-detect"
+                    );
+                    return auto_detect_server(root);
+                }
+            };
+            if let Some(cmd) = command {
+                let path = PathBuf::from(cmd);
+                if path.exists() {
                     return Ok(AsgiServerInfo {
                         server_type,
-                        binary,
+                        binary: path,
                     });
                 }
-
-                // Command field without explicit server → infer type from binary name
-                if let Some(cmd) = command {
-                    let path = PathBuf::from(cmd);
-                    if path.exists() {
-                        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        let server_type = if name.contains("uvicorn") {
-                            AsgiServer::Uvicorn
-                        } else {
-                            AsgiServer::Granian
-                        };
-                        return Ok(AsgiServerInfo {
-                            server_type,
-                            binary: path,
-                        });
-                    }
-                    warn!(
-                        command = cmd,
-                        "coulson.json command not found, trying defaults"
-                    );
-                }
+                warn!(
+                    command = cmd,
+                    ".coulson.toml command not found, searching defaults"
+                );
             }
+            let binary = find_server_binary(root, server_name)?;
+            return Ok(AsgiServerInfo {
+                server_type,
+                binary,
+            });
+        }
+
+        // Command field without explicit server → infer type from binary name
+        if let Some(cmd) = command {
+            let path = PathBuf::from(cmd);
+            if path.exists() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let server_type = if name.contains("uvicorn") {
+                    AsgiServer::Uvicorn
+                } else {
+                    AsgiServer::Granian
+                };
+                return Ok(AsgiServerInfo {
+                    server_type,
+                    binary: path,
+                });
+            }
+            warn!(
+                command = cmd,
+                ".coulson.toml command not found, trying defaults"
+            );
         }
     }
 
@@ -371,8 +361,8 @@ mod tests {
         let root = temp_app_dir("manifest-uvicorn");
         place_venv_binary(&root, "granian");
         place_venv_binary(&root, "uvicorn");
-        fs::write(root.join("coulson.json"), r#"{"server": "uvicorn"}"#).unwrap();
-        let info = find_asgi_server(&root).unwrap();
+        let manifest = serde_json::json!({"server": "uvicorn"});
+        let info = find_asgi_server(&root, Some(&manifest)).unwrap();
         assert_eq!(info.server_type, AsgiServer::Uvicorn);
         assert_eq!(info.binary, root.join(".venv/bin/uvicorn"));
         fs::remove_dir_all(&root).ok();
@@ -383,8 +373,8 @@ mod tests {
         let root = temp_app_dir("manifest-granian");
         place_venv_binary(&root, "granian");
         place_venv_binary(&root, "uvicorn");
-        fs::write(root.join("coulson.json"), r#"{"server": "granian"}"#).unwrap();
-        let info = find_asgi_server(&root).unwrap();
+        let manifest = serde_json::json!({"server": "granian"});
+        let info = find_asgi_server(&root, Some(&manifest)).unwrap();
         assert_eq!(info.server_type, AsgiServer::Granian);
         assert_eq!(info.binary, root.join(".venv/bin/granian"));
         fs::remove_dir_all(&root).ok();
@@ -395,12 +385,9 @@ mod tests {
         let root = temp_app_dir("manifest-server-cmd");
         place_venv_binary(&root, "uvicorn");
         let custom = root.join(".venv/bin/uvicorn");
-        let manifest = format!(
-            r#"{{"server": "uvicorn", "command": "{}"}}"#,
-            custom.display()
-        );
-        fs::write(root.join("coulson.json"), manifest).unwrap();
-        let info = find_asgi_server(&root).unwrap();
+        let manifest =
+            serde_json::json!({"server": "uvicorn", "command": custom.to_string_lossy().as_ref()});
+        let info = find_asgi_server(&root, Some(&manifest)).unwrap();
         assert_eq!(info.server_type, AsgiServer::Uvicorn);
         assert_eq!(info.binary, custom);
         fs::remove_dir_all(&root).ok();
@@ -411,9 +398,8 @@ mod tests {
         let root = temp_app_dir("manifest-cmd-uvicorn");
         place_venv_binary(&root, "uvicorn");
         let uvicorn_path = root.join(".venv/bin/uvicorn");
-        let manifest = format!(r#"{{"command": "{}"}}"#, uvicorn_path.display());
-        fs::write(root.join("coulson.json"), manifest).unwrap();
-        let info = find_asgi_server(&root).unwrap();
+        let manifest = serde_json::json!({"command": uvicorn_path.to_string_lossy().as_ref()});
+        let info = find_asgi_server(&root, Some(&manifest)).unwrap();
         assert_eq!(info.server_type, AsgiServer::Uvicorn);
         assert_eq!(info.binary, uvicorn_path);
         fs::remove_dir_all(&root).ok();
@@ -424,9 +410,8 @@ mod tests {
         let root = temp_app_dir("manifest-cmd-granian");
         place_venv_binary(&root, "granian");
         let granian_path = root.join(".venv/bin/granian");
-        let manifest = format!(r#"{{"command": "{}"}}"#, granian_path.display());
-        fs::write(root.join("coulson.json"), manifest).unwrap();
-        let info = find_asgi_server(&root).unwrap();
+        let manifest = serde_json::json!({"command": granian_path.to_string_lossy().as_ref()});
+        let info = find_asgi_server(&root, Some(&manifest)).unwrap();
         assert_eq!(info.server_type, AsgiServer::Granian);
         assert_eq!(info.binary, granian_path);
         fs::remove_dir_all(&root).ok();
@@ -436,7 +421,7 @@ mod tests {
     fn no_manifest_auto_detects_uvicorn() {
         let root = temp_app_dir("no-manifest-uvicorn");
         place_venv_binary(&root, "uvicorn");
-        let info = find_asgi_server(&root).unwrap();
+        let info = find_asgi_server(&root, None).unwrap();
         assert_eq!(info.server_type, AsgiServer::Uvicorn);
         fs::remove_dir_all(&root).ok();
     }
@@ -445,7 +430,7 @@ mod tests {
     fn no_manifest_auto_detects_granian() {
         let root = temp_app_dir("no-manifest-granian");
         place_venv_binary(&root, "granian");
-        let info = find_asgi_server(&root).unwrap();
+        let info = find_asgi_server(&root, None).unwrap();
         assert_eq!(info.server_type, AsgiServer::Granian);
         fs::remove_dir_all(&root).ok();
     }
@@ -454,8 +439,8 @@ mod tests {
     fn manifest_unknown_server_falls_back() {
         let root = temp_app_dir("manifest-unknown");
         place_venv_binary(&root, "uvicorn");
-        fs::write(root.join("coulson.json"), r#"{"server": "hypercorn"}"#).unwrap();
-        let info = find_asgi_server(&root).unwrap();
+        let manifest = serde_json::json!({"server": "hypercorn"});
+        let info = find_asgi_server(&root, Some(&manifest)).unwrap();
         // Falls back to auto-detect → finds uvicorn
         assert_eq!(info.server_type, AsgiServer::Uvicorn);
         fs::remove_dir_all(&root).ok();
@@ -465,7 +450,7 @@ mod tests {
     fn detect_module_from_app_py() {
         let root = temp_app_dir("module-app-py");
         fs::write(root.join("app.py"), "").unwrap();
-        assert_eq!(detect_module(&root).unwrap(), "app:app");
+        assert_eq!(detect_module(&root, None).unwrap(), "app:app");
         fs::remove_dir_all(&root).ok();
     }
 
@@ -473,7 +458,7 @@ mod tests {
     fn detect_module_from_main_py() {
         let root = temp_app_dir("module-main-py");
         fs::write(root.join("main.py"), "").unwrap();
-        assert_eq!(detect_module(&root).unwrap(), "main:app");
+        assert_eq!(detect_module(&root, None).unwrap(), "main:app");
         fs::remove_dir_all(&root).ok();
     }
 
@@ -482,19 +467,18 @@ mod tests {
         let root = temp_app_dir("module-both");
         fs::write(root.join("app.py"), "").unwrap();
         fs::write(root.join("main.py"), "").unwrap();
-        assert_eq!(detect_module(&root).unwrap(), "app:app");
+        assert_eq!(detect_module(&root, None).unwrap(), "app:app");
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn detect_module_from_manifest() {
         let root = temp_app_dir("module-manifest");
-        fs::write(
-            root.join("coulson.json"),
-            r#"{"module": "mymod:create_app"}"#,
-        )
-        .unwrap();
-        assert_eq!(detect_module(&root).unwrap(), "mymod:create_app");
+        let manifest = serde_json::json!({"module": "mymod:create_app"});
+        assert_eq!(
+            detect_module(&root, Some(&manifest)).unwrap(),
+            "mymod:create_app"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
@@ -502,15 +486,18 @@ mod tests {
     fn detect_module_manifest_overrides_files() {
         let root = temp_app_dir("module-manifest-override");
         fs::write(root.join("app.py"), "").unwrap();
-        fs::write(root.join("coulson.json"), r#"{"module": "custom:factory"}"#).unwrap();
-        assert_eq!(detect_module(&root).unwrap(), "custom:factory");
+        let manifest = serde_json::json!({"module": "custom:factory"});
+        assert_eq!(
+            detect_module(&root, Some(&manifest)).unwrap(),
+            "custom:factory"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn detect_module_fails_with_no_entry_point() {
         let root = temp_app_dir("module-none");
-        assert!(detect_module(&root).is_err());
+        assert!(detect_module(&root, None).is_err());
         fs::remove_dir_all(&root).ok();
     }
 

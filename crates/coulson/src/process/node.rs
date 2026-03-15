@@ -57,7 +57,7 @@ impl ProcessProvider for NodeProvider {
     fn resolve(&self, app: &ManagedApp) -> anyhow::Result<ProcessSpec> {
         let root = &app.root;
 
-        // Check coulson.json command override
+        // Check manifest command override
         if let Some(manifest) = &app.manifest {
             if let Some(cmd) = manifest.get("command").and_then(|v| v.as_str()) {
                 let port = resolve_port(&app.env_overrides)?;

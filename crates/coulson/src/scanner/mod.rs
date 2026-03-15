@@ -11,65 +11,143 @@ use crate::process::ProviderRegistry;
 use crate::store::{domain_to_db, route_key, ScanUpsertResult, StaticAppInput};
 use crate::SharedState;
 
+/// Parsed `.coulson.toml` manifest info exposed for service layer use.
+pub struct ManifestInfo {
+    pub name: Option<String>,
+    pub domain_prefix: Option<String>,
+    #[allow(dead_code)]
+    pub enabled: bool,
+    pub target_type: String,
+    pub target_value: String,
+    pub path_prefix: Option<String>,
+    pub timeout_ms: Option<u64>,
+    pub cors_enabled: bool,
+    pub force_https: bool,
+    pub basic_auth_user: Option<String>,
+    pub basic_auth_pass: Option<String>,
+    pub spa_rewrite: bool,
+    pub listen_port: Option<u16>,
+    /// Number of routes defined in the manifest (0 if using top-level port/socket).
+    pub route_count: usize,
+    /// The raw manifest as JSON Value for provider detection.
+    pub manifest_json: serde_json::Value,
+}
+
+/// Parse a `.coulson.toml` file and return structured info for the service layer.
+/// Returns `None` if the file doesn't exist; errors on parse failure.
+pub fn parse_toml_manifest(dir: &Path) -> Option<anyhow::Result<ManifestInfo>> {
+    let toml_path = dir.join(".coulson.toml");
+    if !toml_path.exists() {
+        return None;
+    }
+    Some(parse_toml_manifest_inner(&toml_path))
+}
+
+fn parse_toml_manifest_inner(toml_path: &Path) -> anyhow::Result<ManifestInfo> {
+    let raw = fs::read_to_string(toml_path)
+        .with_context(|| format!("failed reading {}", toml_path.display()))?;
+    let manifest: CoulsonManifest =
+        toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", toml_path.display()))?;
+
+    let manifest_json = manifest_to_json_value(&manifest);
+
+    let (target_type, target_value) = if let Some(ref socket) = manifest.socket {
+        ("unix_socket".to_string(), socket.clone())
+    } else if let Some(port) = manifest.port {
+        let host = manifest
+            .host
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        ("tcp".to_string(), format!("{host}:{port}"))
+    } else if let Some(routes) = &manifest.routes {
+        // Use first route's target for single-app import
+        if let Some(first) = routes.first() {
+            if let Some((host, port)) = parse_target_token(&first.target) {
+                ("tcp".to_string(), format!("{host}:{port}"))
+            } else {
+                anyhow::bail!(
+                    "invalid route target '{}' in {}",
+                    first.target,
+                    toml_path.display()
+                );
+            }
+        } else {
+            // Empty [[routes]] array — no target available
+            ("tcp".to_string(), String::new())
+        }
+    } else {
+        // No port/socket/routes — could be a managed app (kind-only manifest)
+        ("tcp".to_string(), String::new())
+    };
+
+    // Extract path_prefix, route-level timeout, and route count from routes
+    let (path_prefix, effective_timeout, route_count) = if let Some(routes) = &manifest.routes {
+        let count = routes.len();
+        if let Some(first) = routes.first() {
+            let pp = normalize_path_prefix(first.path.as_deref());
+            // Route-level timeout overrides manifest-level
+            (pp, first.timeout.or(manifest.timeout), count)
+        } else {
+            (None, manifest.timeout, 0)
+        }
+    } else {
+        (None, manifest.timeout, 0)
+    };
+
+    Ok(ManifestInfo {
+        name: manifest.name,
+        domain_prefix: manifest.domain,
+        enabled: manifest.enabled.unwrap_or(true),
+        target_type,
+        target_value,
+        path_prefix,
+        timeout_ms: effective_timeout,
+        route_count,
+        cors_enabled: manifest.cors.unwrap_or(false),
+        force_https: manifest.force_https.unwrap_or(false),
+        basic_auth_user: manifest.basic_auth_user,
+        basic_auth_pass: manifest.basic_auth_pass,
+        spa_rewrite: manifest.spa.unwrap_or(false),
+        listen_port: manifest.listen_port,
+        manifest_json,
+    })
+}
+
+/// Unified manifest parsed from `.coulson.toml`.
+/// `domain` is a prefix (suffix appended at scan time).
 #[derive(Debug, Deserialize)]
 struct CoulsonManifest {
     name: Option<String>,
     domain: Option<String>,
-    #[allow(dead_code)]
-    kind: Option<String>,
-    #[allow(dead_code)]
-    module: Option<String>,
-    #[allow(dead_code)]
-    server: Option<String>,
-    #[allow(dead_code)]
-    command: Option<String>,
-    target_host: Option<String>,
-    #[serde(default)]
-    target_port: u16,
-    path_prefix: Option<String>,
-    timeout_ms: Option<u64>,
-    #[serde(default)]
-    socket_path: Option<String>,
-    routes: Option<Vec<CoulsonManifestRoute>>,
     enabled: Option<bool>,
+    kind: Option<String>,
+    module: Option<String>,
+    server: Option<String>,
+    command: Option<String>,
+    port: Option<u16>,
+    host: Option<String>,
+    socket: Option<String>,
+    timeout: Option<u64>,
     #[serde(default)]
-    cors_enabled: Option<bool>,
+    cors: Option<bool>,
     #[serde(default)]
     force_https: Option<bool>,
+    #[serde(default)]
+    spa: Option<bool>,
     #[serde(default)]
     basic_auth_user: Option<String>,
     #[serde(default)]
     basic_auth_pass: Option<String>,
     #[serde(default)]
-    spa_rewrite: Option<bool>,
-    #[serde(default)]
     listen_port: Option<u16>,
+    routes: Option<Vec<CoulsonManifestRoute>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CoulsonManifestRoute {
-    #[serde(default)]
-    path_prefix: Option<String>,
-    #[serde(default)]
-    target_host: Option<String>,
-    #[serde(default)]
-    target_port: u16,
-    #[serde(default)]
-    socket_path: Option<String>,
-    #[serde(default)]
-    timeout_ms: Option<u64>,
-    #[serde(default)]
-    cors_enabled: Option<bool>,
-    #[serde(default)]
-    force_https: Option<bool>,
-    #[serde(default)]
-    basic_auth_user: Option<String>,
-    #[serde(default)]
-    basic_auth_pass: Option<String>,
-    #[serde(default)]
-    spa_rewrite: Option<bool>,
-    #[serde(default)]
-    listen_port: Option<u16>,
+    path: Option<String>,
+    target: String,
+    timeout: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -307,28 +385,49 @@ fn discover(
 
         if file_type.is_dir() {
             let dir_name = file_name;
-            let routes_path = entry.path().join("coulson.routes");
-            if routes_path.exists() {
-                let raw = fs::read_to_string(&routes_path)
-                    .with_context(|| format!("failed reading {}", routes_path.display()))?;
+
+            // Priority: .coulson.toml → .coulson → provider auto-detect → public/
+            let toml_path = entry.path().join(".coulson.toml");
+            if toml_path.exists() {
+                let raw = fs::read_to_string(&toml_path)
+                    .with_context(|| format!("failed reading {}", toml_path.display()))?;
+                let manifest = parse_manifest(&raw)
+                    .with_context(|| format!("invalid TOML in {}", toml_path.display()))?;
+                let apps = manifest_to_discovered_apps(
+                    &manifest,
+                    &dir_name,
+                    &entry.path(),
+                    suffix,
+                    registry,
+                    &mut parse_warnings,
+                )?;
+                for app in apps {
+                    insert_with_priority(&mut by_route, &mut conflicts, app);
+                }
+                continue;
+            }
+
+            let coulson_file = entry.path().join(".coulson");
+            if coulson_file.exists() {
+                let raw = fs::read_to_string(&coulson_file)
+                    .with_context(|| format!("failed reading {}", coulson_file.display()))?;
                 let parse = parse_pow_file_routes(&raw);
                 parse_warnings.extend(
                     parse
                         .warnings
                         .into_iter()
-                        .map(|w| format!("{}: {}", routes_path.display(), w)),
+                        .map(|w| format!("{}: {}", coulson_file.display(), w)),
                 );
-                let routes = parse.routes;
                 let domain_text = file_name_to_domain(&dir_name, suffix);
                 let domain = DomainName::parse(&domain_text, suffix).with_context(|| {
                     format!(
                         "invalid domain '{}' in {}",
                         domain_text,
-                        routes_path.display()
+                        coulson_file.display()
                     )
                 })?;
                 let explicit_domain = dir_name.ends_with(&format!(".{suffix}"));
-                for route in routes {
+                for route in parse.routes {
                     let app = DiscoveredStaticApp {
                         name: sanitize_name(&dir_name),
                         kind: AppKind::Static,
@@ -352,179 +451,63 @@ fn discover(
                 continue;
             }
 
-            let manifest_path = entry.path().join("coulson.json");
-            if !manifest_path.exists() {
-                // Auto-detect managed app via provider registry
-                if let Some((_provider, detected)) = registry.detect(&entry.path(), None) {
-                    let domain_text = file_name_to_domain(&dir_name, suffix);
-                    let domain = DomainName::parse(&domain_text, suffix).with_context(|| {
-                        format!(
-                            "invalid domain '{}' in {}",
-                            domain_text,
-                            entry.path().display()
-                        )
-                    })?;
-                    let root_str = entry.path().to_string_lossy().to_string();
-                    let app_kind = kind_str_to_app_kind(&detected.kind);
-                    let app = DiscoveredStaticApp {
-                        name: sanitize_name(&dir_name),
-                        kind: app_kind,
-                        domain,
-                        path_prefix: None,
-                        target_type: "managed".to_string(),
-                        target_value: root_str,
-                        timeout_ms: None,
-                        cors_enabled: false,
-                        force_https: false,
-                        basic_auth_user: None,
-                        basic_auth_pass: None,
-                        spa_rewrite: false,
-                        listen_port: None,
-                        enabled: true,
-                        explicit_domain: dir_name.ends_with(&format!(".{suffix}")),
-                        fs_entry: dir_name.clone(),
-                    };
-                    insert_with_priority(&mut by_route, &mut conflicts, app);
-                } else if entry.path().join("public").is_dir() {
-                    let domain_text = file_name_to_domain(&dir_name, suffix);
-                    let domain = DomainName::parse(&domain_text, suffix).with_context(|| {
-                        format!(
-                            "invalid domain '{}' in {}",
-                            domain_text,
-                            entry.path().display()
-                        )
-                    })?;
-                    let public_root = entry.path().join("public").to_string_lossy().to_string();
-                    let app = DiscoveredStaticApp {
-                        name: sanitize_name(&dir_name),
-                        kind: AppKind::Static,
-                        domain,
-                        path_prefix: None,
-                        target_type: "static_dir".to_string(),
-                        target_value: public_root,
-                        timeout_ms: None,
-                        cors_enabled: false,
-                        force_https: false,
-                        basic_auth_user: None,
-                        basic_auth_pass: None,
-                        spa_rewrite: false,
-                        listen_port: None,
-                        enabled: true,
-                        explicit_domain: dir_name.ends_with(&format!(".{suffix}")),
-                        fs_entry: dir_name.clone(),
-                    };
-                    insert_with_priority(&mut by_route, &mut conflicts, app);
-                }
-                continue;
-            }
-
-            let raw = fs::read_to_string(&manifest_path)
-                .with_context(|| format!("failed reading {}", manifest_path.display()))?;
-            let manifest: CoulsonManifest = serde_json::from_str(&raw)
-                .with_context(|| format!("invalid JSON in {}", manifest_path.display()))?;
-
-            let name = manifest.name.unwrap_or_else(|| dir_name.clone());
-            let explicit_domain = manifest.domain.is_some();
-            let domain = manifest
-                .domain
-                .unwrap_or_else(|| format!("{}.{}", sanitize_name(&dir_name), suffix));
-            let domain = DomainName::parse(&domain, suffix).with_context(|| {
-                format!("invalid domain '{}' in {}", domain, manifest_path.display())
-            })?;
-
-            let enabled = manifest.enabled.unwrap_or(true);
-            let dir_path = entry.path();
-
-            // Check if a provider can handle this directory (manifest kind or auto-detect)
-            let manifest_value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
-            let is_managed = registry.detect(&dir_path, Some(&manifest_value));
-
-            if let Some((_prov, detected)) = is_managed {
-                let root_str = dir_path.to_string_lossy().to_string();
+            // Auto-detect managed app via provider registry
+            if let Some((_provider, detected)) = registry.detect(&entry.path(), None) {
+                let domain_text = file_name_to_domain(&dir_name, suffix);
+                let domain = DomainName::parse(&domain_text, suffix).with_context(|| {
+                    format!(
+                        "invalid domain '{}' in {}",
+                        domain_text,
+                        entry.path().display()
+                    )
+                })?;
+                let root_str = entry.path().to_string_lossy().to_string();
                 let app_kind = kind_str_to_app_kind(&detected.kind);
                 let app = DiscoveredStaticApp {
-                    name,
+                    name: sanitize_name(&dir_name),
                     kind: app_kind,
                     domain,
                     path_prefix: None,
                     target_type: "managed".to_string(),
                     target_value: root_str,
                     timeout_ms: None,
-                    cors_enabled: manifest.cors_enabled.unwrap_or(false),
-                    force_https: manifest.force_https.unwrap_or(false),
-                    basic_auth_user: manifest.basic_auth_user,
-                    basic_auth_pass: manifest.basic_auth_pass,
-                    spa_rewrite: manifest.spa_rewrite.unwrap_or(false),
-                    listen_port: manifest.listen_port,
-                    enabled,
-                    explicit_domain,
+                    cors_enabled: false,
+                    force_https: false,
+                    basic_auth_user: None,
+                    basic_auth_pass: None,
+                    spa_rewrite: false,
+                    listen_port: None,
+                    enabled: true,
+                    explicit_domain: dir_name.ends_with(&format!(".{suffix}")),
                     fs_entry: dir_name.clone(),
                 };
                 insert_with_priority(&mut by_route, &mut conflicts, app);
-            } else if let Some(routes) = manifest.routes {
-                for route in routes {
-                    let socket = route.socket_path.or_else(|| manifest.socket_path.clone());
-                    let (tt, tv) = if let Some(sp) = socket {
-                        ("unix_socket".to_string(), sp)
-                    } else {
-                        let host = route.target_host.unwrap_or_else(|| "127.0.0.1".to_string());
-                        ("tcp".to_string(), format!("{host}:{}", route.target_port))
-                    };
-                    let app = DiscoveredStaticApp {
-                        name: name.clone(),
-                        kind: AppKind::Static,
-                        domain: domain.clone(),
-                        path_prefix: normalize_path_prefix(route.path_prefix.as_deref()),
-                        target_type: tt,
-                        target_value: tv,
-                        timeout_ms: route.timeout_ms,
-                        cors_enabled: route
-                            .cors_enabled
-                            .or(manifest.cors_enabled)
-                            .unwrap_or(false),
-                        force_https: route.force_https.or(manifest.force_https).unwrap_or(false),
-                        basic_auth_user: route
-                            .basic_auth_user
-                            .or_else(|| manifest.basic_auth_user.clone()),
-                        basic_auth_pass: route
-                            .basic_auth_pass
-                            .or_else(|| manifest.basic_auth_pass.clone()),
-                        spa_rewrite: route.spa_rewrite.or(manifest.spa_rewrite).unwrap_or(false),
-                        listen_port: route.listen_port.or(manifest.listen_port),
-                        enabled,
-                        explicit_domain,
-                        fs_entry: dir_name.clone(),
-                    };
-                    insert_with_priority(&mut by_route, &mut conflicts, app);
-                }
-            } else {
-                let (tt, tv) = if let Some(sp) = manifest.socket_path {
-                    ("unix_socket".to_string(), sp)
-                } else {
-                    let host = manifest
-                        .target_host
-                        .unwrap_or_else(|| "127.0.0.1".to_string());
-                    (
-                        "tcp".to_string(),
-                        format!("{host}:{}", manifest.target_port),
+            } else if entry.path().join("public").is_dir() {
+                let domain_text = file_name_to_domain(&dir_name, suffix);
+                let domain = DomainName::parse(&domain_text, suffix).with_context(|| {
+                    format!(
+                        "invalid domain '{}' in {}",
+                        domain_text,
+                        entry.path().display()
                     )
-                };
+                })?;
+                let public_root = entry.path().join("public").to_string_lossy().to_string();
                 let app = DiscoveredStaticApp {
-                    name,
+                    name: sanitize_name(&dir_name),
                     kind: AppKind::Static,
                     domain,
-                    path_prefix: normalize_path_prefix(manifest.path_prefix.as_deref()),
-                    target_type: tt,
-                    target_value: tv,
-                    timeout_ms: manifest.timeout_ms,
-                    cors_enabled: manifest.cors_enabled.unwrap_or(false),
-                    force_https: manifest.force_https.unwrap_or(false),
-                    basic_auth_user: manifest.basic_auth_user,
-                    basic_auth_pass: manifest.basic_auth_pass,
-                    spa_rewrite: manifest.spa_rewrite.unwrap_or(false),
-                    listen_port: manifest.listen_port,
-                    enabled,
-                    explicit_domain,
+                    path_prefix: None,
+                    target_type: "static_dir".to_string(),
+                    target_value: public_root,
+                    timeout_ms: None,
+                    cors_enabled: false,
+                    force_https: false,
+                    basic_auth_user: None,
+                    basic_auth_pass: None,
+                    spa_rewrite: false,
+                    listen_port: None,
+                    enabled: true,
+                    explicit_domain: dir_name.ends_with(&format!(".{suffix}")),
                     fs_entry: dir_name.clone(),
                 };
                 insert_with_priority(&mut by_route, &mut conflicts, app);
@@ -589,13 +572,25 @@ fn discover_from_symlink(
             .extension()
             .map(|ext| ext == "toml")
             .unwrap_or(false);
-        let routes = if is_toml {
-            parse_coulson_toml(&raw).unwrap_or_default()
-        } else {
-            parse_pow_file_routes(&raw).routes
-        };
+        if is_toml {
+            // Symlink points to a .coulson.toml file — use full manifest parsing
+            let manifest = parse_manifest(&raw)
+                .with_context(|| format!("invalid TOML in {}", resolved_target.display()))?;
+            // For symlink-to-file, resolve against the file's parent directory
+            let dir_path = resolved_target.parent().unwrap_or_else(|| Path::new("."));
+            let mut parse_warnings = Vec::new();
+            let apps = manifest_to_discovered_apps(
+                &manifest,
+                file_name,
+                dir_path,
+                suffix,
+                registry,
+                &mut parse_warnings,
+            )?;
+            return Ok(apps);
+        }
         let mut out = Vec::new();
-        for route in routes {
+        for route in parse_pow_file_routes(&raw).routes {
             out.push(DiscoveredStaticApp {
                 name: name.clone(),
                 kind: AppKind::Static,
@@ -619,62 +614,24 @@ fn discover_from_symlink(
     }
 
     if meta.is_dir() {
-        let routes_file = resolved_target.join("coulson.routes");
-        if routes_file.exists() {
-            let raw = fs::read_to_string(&routes_file)
-                .with_context(|| format!("failed reading {}", routes_file.display()))?;
-            let mut out = Vec::new();
-            for route in parse_pow_file_routes(&raw).routes {
-                out.push(DiscoveredStaticApp {
-                    name: name.clone(),
-                    kind: AppKind::Static,
-                    domain: domain.clone(),
-                    path_prefix: route.path_prefix,
-                    target_type: "tcp".to_string(),
-                    target_value: format!("{}:{}", route.target_host, route.target_port),
-                    timeout_ms: route.timeout_ms,
-                    cors_enabled: false,
-                    force_https: false,
-                    basic_auth_user: None,
-                    basic_auth_pass: None,
-                    spa_rewrite: false,
-                    listen_port: None,
-                    enabled: true,
-                    explicit_domain,
-                    fs_entry: file_name.to_string(),
-                });
-            }
-            return Ok(out);
-        }
-
-        // .coulson.toml in the directory
+        // Priority: .coulson.toml → .coulson → provider auto-detect → public/
         let coulson_toml_file = resolved_target.join(".coulson.toml");
         if coulson_toml_file.exists() {
             let raw = fs::read_to_string(&coulson_toml_file)
                 .with_context(|| format!("failed reading {}", coulson_toml_file.display()))?;
-            if let Ok(routes) = parse_coulson_toml(&raw) {
-                let mut out = Vec::new();
-                for route in routes {
-                    out.push(DiscoveredStaticApp {
-                        name: name.clone(),
-                        kind: AppKind::Static,
-                        domain: domain.clone(),
-                        path_prefix: route.path_prefix,
-                        target_type: "tcp".to_string(),
-                        target_value: format!("{}:{}", route.target_host, route.target_port),
-                        timeout_ms: route.timeout_ms,
-                        cors_enabled: false,
-                        force_https: false,
-                        basic_auth_user: None,
-                        basic_auth_pass: None,
-                        spa_rewrite: false,
-                        listen_port: None,
-                        enabled: true,
-                        explicit_domain,
-                        fs_entry: file_name.to_string(),
-                    });
-                }
-                return Ok(out);
+            let manifest = parse_manifest(&raw)
+                .with_context(|| format!("invalid TOML in {}", coulson_toml_file.display()))?;
+            let mut parse_warnings = Vec::new();
+            let apps = manifest_to_discovered_apps(
+                &manifest,
+                file_name,
+                &resolved_target,
+                suffix,
+                registry,
+                &mut parse_warnings,
+            )?;
+            if !apps.is_empty() {
+                return Ok(apps);
             }
         }
 
@@ -707,65 +664,39 @@ fn discover_from_symlink(
             return Ok(out);
         }
 
-        let port_file = resolved_target.join("coulson.port");
-        if !port_file.exists() {
-            // Auto-detect managed app via provider registry
-            if let Some((_prov, detected)) = registry.detect(&resolved_target, None) {
-                let root_str = resolved_target.to_string_lossy().to_string();
-                let app_kind = kind_str_to_app_kind(&detected.kind);
-                return Ok(vec![DiscoveredStaticApp {
-                    name,
-                    kind: app_kind,
-                    domain,
-                    path_prefix: None,
-                    target_type: "managed".to_string(),
-                    target_value: root_str,
-                    timeout_ms: None,
-                    cors_enabled: false,
-                    force_https: false,
-                    basic_auth_user: None,
-                    basic_auth_pass: None,
-                    spa_rewrite: false,
-                    listen_port: None,
-                    enabled: true,
-                    explicit_domain,
-                    fs_entry: file_name.to_string(),
-                }]);
-            }
-            if resolved_target.join("public").is_dir() {
-                let public_root = resolved_target.join("public").to_string_lossy().to_string();
-                return Ok(vec![DiscoveredStaticApp {
-                    name,
-                    kind: AppKind::Static,
-                    domain,
-                    path_prefix: None,
-                    target_type: "static_dir".to_string(),
-                    target_value: public_root,
-                    timeout_ms: None,
-                    cors_enabled: false,
-                    force_https: false,
-                    basic_auth_user: None,
-                    basic_auth_pass: None,
-                    spa_rewrite: false,
-                    listen_port: None,
-                    enabled: true,
-                    explicit_domain,
-                    fs_entry: file_name.to_string(),
-                }]);
-            }
-            return Ok(Vec::new());
+        // Auto-detect managed app via provider registry
+        if let Some((_prov, detected)) = registry.detect(&resolved_target, None) {
+            let root_str = resolved_target.to_string_lossy().to_string();
+            let app_kind = kind_str_to_app_kind(&detected.kind);
+            return Ok(vec![DiscoveredStaticApp {
+                name,
+                kind: app_kind,
+                domain,
+                path_prefix: None,
+                target_type: "managed".to_string(),
+                target_value: root_str,
+                timeout_ms: None,
+                cors_enabled: false,
+                force_https: false,
+                basic_auth_user: None,
+                basic_auth_pass: None,
+                spa_rewrite: false,
+                listen_port: None,
+                enabled: true,
+                explicit_domain,
+                fs_entry: file_name.to_string(),
+            }]);
         }
-        let raw = fs::read_to_string(&port_file)
-            .with_context(|| format!("failed reading {}", port_file.display()))?;
-        if let Some((target_host, target_port, timeout_ms)) = parse_port_proxy_target(&raw) {
+        if resolved_target.join("public").is_dir() {
+            let public_root = resolved_target.join("public").to_string_lossy().to_string();
             return Ok(vec![DiscoveredStaticApp {
                 name,
                 kind: AppKind::Static,
                 domain,
                 path_prefix: None,
-                target_type: "tcp".to_string(),
-                target_value: format!("{target_host}:{target_port}"),
-                timeout_ms,
+                target_type: "static_dir".to_string(),
+                target_value: public_root,
+                timeout_ms: None,
                 cors_enabled: false,
                 force_https: false,
                 basic_auth_user: None,
@@ -780,6 +711,164 @@ fn discover_from_symlink(
     }
 
     Ok(Vec::new())
+}
+
+/// Convert a CoulsonManifest into DiscoveredStaticApp entries.
+/// Handles both managed apps (when kind is set and provider detects) and static routes.
+fn manifest_to_discovered_apps(
+    manifest: &CoulsonManifest,
+    dir_name: &str,
+    dir_path: &Path,
+    suffix: &str,
+    registry: &ProviderRegistry,
+    parse_warnings: &mut Vec<String>,
+) -> anyhow::Result<Vec<DiscoveredStaticApp>> {
+    let name = manifest
+        .name
+        .clone()
+        .unwrap_or_else(|| sanitize_name(dir_name));
+    let explicit_domain = manifest.domain.is_some();
+    let domain_text = manifest
+        .domain
+        .as_ref()
+        .map(|d| format!("{d}.{suffix}"))
+        .unwrap_or_else(|| file_name_to_domain(dir_name, suffix));
+    let domain = DomainName::parse(&domain_text, suffix)
+        .with_context(|| format!("invalid domain '{}' in {}", domain_text, dir_path.display()))?;
+    let enabled = manifest.enabled.unwrap_or(true);
+    let fs_entry = dir_name.to_string();
+
+    // Build a serde_json::Value from manifest for provider detection
+    let manifest_value = manifest_to_json_value(manifest);
+    let is_managed = registry.detect(dir_path, Some(&manifest_value));
+
+    if let Some((_prov, detected)) = is_managed {
+        let root_str = dir_path.to_string_lossy().to_string();
+        let app_kind = kind_str_to_app_kind(&detected.kind);
+        return Ok(vec![DiscoveredStaticApp {
+            name,
+            kind: app_kind,
+            domain,
+            path_prefix: None,
+            target_type: "managed".to_string(),
+            target_value: root_str,
+            timeout_ms: None,
+            cors_enabled: manifest.cors.unwrap_or(false),
+            force_https: manifest.force_https.unwrap_or(false),
+            basic_auth_user: manifest.basic_auth_user.clone(),
+            basic_auth_pass: manifest.basic_auth_pass.clone(),
+            spa_rewrite: manifest.spa.unwrap_or(false),
+            listen_port: manifest.listen_port,
+            enabled,
+            explicit_domain,
+            fs_entry,
+        }]);
+    }
+
+    // Static routes from manifest
+    if let Some(routes) = &manifest.routes {
+        let mut out = Vec::new();
+        for route in routes {
+            let (target_host, target_port) = match parse_target_token(&route.target) {
+                Some(hp) => hp,
+                None => {
+                    parse_warnings.push(format!(
+                        "{}: invalid target '{}' in routes",
+                        dir_path.display(),
+                        route.target
+                    ));
+                    continue;
+                }
+            };
+            let app = DiscoveredStaticApp {
+                name: name.clone(),
+                kind: AppKind::Static,
+                domain: domain.clone(),
+                path_prefix: normalize_path_prefix(route.path.as_deref()),
+                target_type: "tcp".to_string(),
+                target_value: format!("{target_host}:{target_port}"),
+                timeout_ms: route.timeout.or(manifest.timeout),
+                cors_enabled: manifest.cors.unwrap_or(false),
+                force_https: manifest.force_https.unwrap_or(false),
+                basic_auth_user: manifest.basic_auth_user.clone(),
+                basic_auth_pass: manifest.basic_auth_pass.clone(),
+                spa_rewrite: manifest.spa.unwrap_or(false),
+                listen_port: manifest.listen_port,
+                enabled,
+                explicit_domain,
+                fs_entry: fs_entry.clone(),
+            };
+            out.push(app);
+        }
+        return Ok(out);
+    }
+
+    // Single route from port/host/socket
+    if let Some(socket) = &manifest.socket {
+        return Ok(vec![DiscoveredStaticApp {
+            name,
+            kind: AppKind::Static,
+            domain,
+            path_prefix: None,
+            target_type: "unix_socket".to_string(),
+            target_value: socket.clone(),
+            timeout_ms: manifest.timeout,
+            cors_enabled: manifest.cors.unwrap_or(false),
+            force_https: manifest.force_https.unwrap_or(false),
+            basic_auth_user: manifest.basic_auth_user.clone(),
+            basic_auth_pass: manifest.basic_auth_pass.clone(),
+            spa_rewrite: manifest.spa.unwrap_or(false),
+            listen_port: manifest.listen_port,
+            enabled,
+            explicit_domain,
+            fs_entry,
+        }]);
+    }
+
+    if let Some(port) = manifest.port {
+        let host = manifest
+            .host
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        return Ok(vec![DiscoveredStaticApp {
+            name,
+            kind: AppKind::Static,
+            domain,
+            path_prefix: None,
+            target_type: "tcp".to_string(),
+            target_value: format!("{host}:{port}"),
+            timeout_ms: manifest.timeout,
+            cors_enabled: manifest.cors.unwrap_or(false),
+            force_https: manifest.force_https.unwrap_or(false),
+            basic_auth_user: manifest.basic_auth_user.clone(),
+            basic_auth_pass: manifest.basic_auth_pass.clone(),
+            spa_rewrite: manifest.spa.unwrap_or(false),
+            listen_port: manifest.listen_port,
+            enabled,
+            explicit_domain,
+            fs_entry,
+        }]);
+    }
+
+    Ok(Vec::new())
+}
+
+/// Build a serde_json::Value from CoulsonManifest fields that providers need for detection.
+fn manifest_to_json_value(m: &CoulsonManifest) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    if let Some(ref v) = m.kind {
+        map.insert("kind".into(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = m.module {
+        map.insert("module".into(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = m.server {
+        map.insert("server".into(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = m.command {
+        map.insert("command".into(), serde_json::Value::String(v.clone()));
+    }
+    serde_json::Value::Object(map)
 }
 
 fn file_name_to_domain(file_name: &str, suffix: &str) -> String {
@@ -803,39 +892,13 @@ struct PowParseResult {
     warnings: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct CoulsonToml {
-    port: Option<u16>,
-    host: Option<String>,
-    #[allow(dead_code)]
-    kind: Option<String>,
-    #[allow(dead_code)]
-    module: Option<String>,
-    #[allow(dead_code)]
-    server: Option<String>,
-    #[allow(dead_code)]
-    command: Option<String>,
-    timeout: Option<u64>,
-    #[allow(dead_code)]
-    cors: Option<bool>,
-    #[allow(dead_code)]
-    spa: Option<bool>,
-    #[allow(dead_code)]
-    listen_port: Option<u16>,
-    routes: Option<Vec<CoulsonTomlRoute>>,
+fn parse_manifest(raw: &str) -> anyhow::Result<CoulsonManifest> {
+    toml::from_str(raw).context("invalid TOML in .coulson.toml")
 }
 
-#[derive(Deserialize)]
-struct CoulsonTomlRoute {
-    path: Option<String>,
-    target: String,
-    timeout: Option<u64>,
-}
-
-fn parse_coulson_toml(raw: &str) -> anyhow::Result<Vec<PowRoute>> {
-    let toml_cfg: CoulsonToml = toml::from_str(raw).context("invalid TOML in .coulson.toml")?;
-
-    if let Some(routes) = toml_cfg.routes {
+#[cfg(test)]
+fn manifest_to_pow_routes(manifest: &CoulsonManifest) -> anyhow::Result<Vec<PowRoute>> {
+    if let Some(routes) = &manifest.routes {
         let mut out = Vec::new();
         for route in routes {
             let (target_host, target_port) = parse_target_token(&route.target)
@@ -844,23 +907,26 @@ fn parse_coulson_toml(raw: &str) -> anyhow::Result<Vec<PowRoute>> {
                 path_prefix: normalize_path_prefix(route.path.as_deref()),
                 target_host,
                 target_port,
-                timeout_ms: route.timeout.or(toml_cfg.timeout),
+                timeout_ms: route.timeout.or(manifest.timeout),
             });
         }
         return Ok(out);
     }
 
-    if let Some(port) = toml_cfg.port {
-        let host = toml_cfg.host.unwrap_or_else(|| "127.0.0.1".to_string());
+    if let Some(port) = manifest.port {
+        let host = manifest
+            .host
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1".to_string());
         return Ok(vec![PowRoute {
             path_prefix: None,
             target_host: host,
             target_port: port,
-            timeout_ms: toml_cfg.timeout,
+            timeout_ms: manifest.timeout,
         }]);
     }
 
-    anyhow::bail!("TOML config must have either 'port' or 'routes'")
+    anyhow::bail!("TOML config must have either 'port', 'routes', or 'kind'")
 }
 
 fn parse_pow_file_routes(raw: &str) -> PowParseResult {
@@ -955,14 +1021,6 @@ fn parse_target_token(token: &str) -> Option<(String, u16)> {
         return None;
     }
     Some((host.to_string(), port))
-}
-
-fn parse_port_proxy_target(raw: &str) -> Option<(String, u16, Option<u64>)> {
-    let route = parse_pow_route_line(raw.trim())?;
-    if route.path_prefix.is_some() {
-        return None;
-    }
-    Some((route.target_host, route.target_port, route.timeout_ms))
 }
 
 /// Remove the filesystem entry from apps_root.
@@ -1114,22 +1172,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_plain_port_target() {
-        let out = parse_port_proxy_target("5006").expect("parse");
-        assert_eq!(out.0, "127.0.0.1");
-        assert_eq!(out.1, 5006);
-        assert_eq!(out.2, None);
-    }
-
-    #[test]
-    fn parses_http_host_port_target() {
-        let out = parse_port_proxy_target("http://1.2.3.4:8080").expect("parse");
-        assert_eq!(out.0, "1.2.3.4");
-        assert_eq!(out.1, 8080);
-        assert_eq!(out.2, None);
-    }
-
-    #[test]
     fn converts_file_name_to_domain() {
         assert_eq!(
             file_name_to_domain("myapp", "coulson.local"),
@@ -1241,10 +1283,15 @@ mod tests {
         );
     }
 
+    fn parse_toml_routes(raw: &str) -> anyhow::Result<Vec<PowRoute>> {
+        let manifest = parse_manifest(raw)?;
+        manifest_to_pow_routes(&manifest)
+    }
+
     #[test]
     fn parse_coulson_toml_port_only() {
         let raw = "port = 5006\n";
-        let routes = parse_coulson_toml(raw).expect("parse");
+        let routes = parse_toml_routes(raw).expect("parse");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].target_host, "127.0.0.1");
         assert_eq!(routes[0].target_port, 5006);
@@ -1254,7 +1301,7 @@ mod tests {
     #[test]
     fn parse_coulson_toml_port_with_host() {
         let raw = "port = 3000\nhost = \"192.168.1.1\"\n";
-        let routes = parse_coulson_toml(raw).expect("parse");
+        let routes = parse_toml_routes(raw).expect("parse");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].target_host, "192.168.1.1");
         assert_eq!(routes[0].target_port, 3000);
@@ -1273,7 +1320,7 @@ mod tests {
             target = "8080"
             timeout = 10000
         "#;
-        let routes = parse_coulson_toml(raw).expect("parse");
+        let routes = parse_toml_routes(raw).expect("parse");
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].path_prefix.as_deref(), Some("/api"));
         assert_eq!(routes[0].target_port, 3000);
@@ -1286,7 +1333,9 @@ mod tests {
     #[test]
     fn parse_coulson_toml_invalid() {
         let raw = "not_a_valid_field = true\n";
-        let result = parse_coulson_toml(raw);
+        // Parses fine (unknown fields ignored by serde), but has no port/routes/kind
+        let manifest = parse_manifest(raw).expect("parse");
+        let result = manifest_to_pow_routes(&manifest);
         assert!(result.is_err());
     }
 
@@ -1482,13 +1531,14 @@ mod tests {
     #[test]
     fn parse_coulson_toml_no_port_no_routes_errors() {
         let raw = "host = \"localhost\"\n";
-        assert!(parse_coulson_toml(raw).is_err());
+        let manifest = parse_manifest(raw).expect("parse");
+        assert!(manifest_to_pow_routes(&manifest).is_err());
     }
 
     #[test]
     fn parse_coulson_toml_with_timeout() {
         let raw = "port = 5006\ntimeout = 3000\n";
-        let routes = parse_coulson_toml(raw).expect("parse");
+        let routes = parse_toml_routes(raw).expect("parse");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].timeout_ms, Some(3000));
     }
@@ -1502,7 +1552,7 @@ mod tests {
             target = "127.0.0.1:3000"
             timeout = 10000
         "#;
-        let routes = parse_coulson_toml(raw).expect("parse");
+        let routes = parse_toml_routes(raw).expect("parse");
         assert_eq!(routes[0].timeout_ms, Some(10000));
     }
 
@@ -1514,7 +1564,7 @@ mod tests {
             [[routes]]
             target = "127.0.0.1:3000"
         "#;
-        let routes = parse_coulson_toml(raw).expect("parse");
+        let routes = parse_toml_routes(raw).expect("parse");
         assert_eq!(routes[0].timeout_ms, Some(5000));
     }
 
@@ -1525,7 +1575,7 @@ mod tests {
             path = "/api/"
             target = "127.0.0.1:3000"
         "#;
-        let routes = parse_coulson_toml(raw).expect("parse");
+        let routes = parse_toml_routes(raw).expect("parse");
         assert_eq!(routes[0].path_prefix.as_deref(), Some("/api"));
     }
 }

@@ -327,47 +327,67 @@ pub fn app_create_from_folder(state: &SharedState, path: &str) -> Result<AppSpec
         insert_and_reload(state.store.insert_static(&input))
     };
 
-    // 1. coulson.json
-    let manifest_path = folder.join("coulson.json");
-    if manifest_path.exists() {
-        let raw = std::fs::read_to_string(&manifest_path)
-            .map_err(|e| ServiceError::Internal(e.to_string()))?;
-        let manifest: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| ServiceError::Internal(format!("invalid coulson.json: {e}")))?;
+    // 1. .coulson.toml — use shared manifest parser
+    if let Some(result) = scanner::parse_toml_manifest(folder) {
+        let info = result.map_err(|e| ServiceError::Internal(e.to_string()))?;
 
-        if let Some((_prov, detected)) = state.provider_registry.detect(folder, Some(&manifest)) {
+        // Override name/domain from manifest if specified
+        let effective_name = info.name.unwrap_or_else(|| name.clone());
+        let effective_domain = if let Some(prefix) = &info.domain_prefix {
+            let domain_str = format!("{prefix}.{}", state.domain_suffix);
+            DomainName::parse(&domain_str, &state.domain_suffix)
+                .map_err(|e| ServiceError::InvalidParams(e.to_string()))?
+        } else {
+            domain.clone()
+        };
+
+        // Check if a provider can handle this (managed app)
+        if let Some((_prov, detected)) = state
+            .provider_registry
+            .detect(folder, Some(&info.manifest_json))
+        {
             let root_str = folder.to_string_lossy().to_string();
             return insert_and_reload(state.store.insert_managed(
-                &name,
-                &domain,
+                &effective_name,
+                &effective_domain,
                 &root_str,
                 &detected.kind,
                 None,
             ));
         }
 
-        if let Some(raw_port) = manifest.get("target_port").and_then(|v| v.as_u64()) {
-            if raw_port > u16::MAX as u64 {
-                return Err(ServiceError::InvalidParams(format!(
-                    "target_port out of range: {raw_port}"
-                )));
-            }
-            let port = raw_port as u16;
-            if port > 0 {
-                let host = manifest
-                    .get("target_host")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("127.0.0.1");
-                let target_value = format!("{host}:{port}");
-                return insert_tcp(&target_value);
-            }
+        // Reject multi-route manifests — scanner handles them via symlink + scan
+        if info.route_count > 1 {
+            return Err(ServiceError::InvalidParams(
+                "manifest defines multiple [[routes]]; use symlink + scanner for multi-route import"
+                    .to_string(),
+            ));
+        }
+
+        // Static route from manifest (port, socket, or first route target)
+        if !info.target_value.is_empty() {
+            let input = StaticAppInput {
+                name: &effective_name,
+                domain: &effective_domain,
+                path_prefix: info.path_prefix.as_deref(),
+                target_type: &info.target_type,
+                target_value: &info.target_value,
+                timeout_ms: info.timeout_ms,
+                cors_enabled: info.cors_enabled,
+                force_https: info.force_https,
+                basic_auth_user: info.basic_auth_user.as_deref(),
+                basic_auth_pass: info.basic_auth_pass.as_deref(),
+                spa_rewrite: info.spa_rewrite,
+                listen_port: info.listen_port,
+            };
+            return insert_and_reload(state.store.insert_static(&input));
         }
     }
 
-    // 2. coulson.routes
-    let routes_path = folder.join("coulson.routes");
-    if routes_path.exists() {
-        let raw = std::fs::read_to_string(&routes_path)
+    // 2. .coulson (pow format)
+    let coulson_file = folder.join(".coulson");
+    if coulson_file.exists() {
+        let raw = std::fs::read_to_string(&coulson_file)
             .map_err(|e| ServiceError::Internal(e.to_string()))?;
         if let Some(target_value) = parse_first_route_target(&raw) {
             return insert_tcp(&target_value);
@@ -906,7 +926,7 @@ fn validate_cname_unique(
     Ok(())
 }
 
-/// Parse the first route target from a coulson.routes file content.
+/// Parse the first route target from a pow-format file content.
 fn parse_first_route_target(raw: &str) -> Option<String> {
     for line in raw.lines() {
         let trimmed = line.trim();

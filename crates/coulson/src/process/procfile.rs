@@ -104,7 +104,7 @@ impl ProcessProvider for ProcfileProvider {
     }
 
     fn detect(&self, dir: &Path, manifest: Option<&Value>) -> Option<DetectedApp> {
-        // 1. coulson.json kind: "procfile" → direct match
+        // 1. manifest kind: "procfile" → direct match
         if let Some(m) = manifest {
             if m.get("kind").and_then(|v| v.as_str()) == Some("procfile") {
                 return Some(DetectedApp {
@@ -132,7 +132,7 @@ impl ProcessProvider for ProcfileProvider {
     fn resolve(&self, app: &ManagedApp) -> anyhow::Result<ProcessSpec> {
         let root = &app.root;
 
-        // 1. coulson.json command override
+        // 1. manifest command override
         if let Some(manifest) = &app.manifest {
             if let Some(cmd) = manifest.get("command").and_then(|v| v.as_str()) {
                 let port = resolve_port(&app.env_overrides)?;
