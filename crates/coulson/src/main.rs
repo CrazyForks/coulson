@@ -3055,17 +3055,7 @@ fn is_forward_service_loaded() -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn is_forward_configured() -> bool {
-    false
-}
-
-#[cfg(not(target_os = "macos"))]
 fn is_forward_configured_for_port(_http_port: u16) -> bool {
-    false
-}
-
-#[cfg(not(target_os = "macos"))]
-fn is_forward_https_configured() -> bool {
     false
 }
 
