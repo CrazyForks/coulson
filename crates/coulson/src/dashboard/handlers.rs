@@ -199,18 +199,17 @@ pub async fn frame_urls(State(state): State<DashboardState>, Path(id): Path<Stri
         _ => return html_response(StatusCode::NOT_FOUND, "Not found".to_string()),
     };
     let port = state.shared.listen_http.port();
-    let https_port = state.shared.listen_https.map(|a| a.port());
     let app_view = AppView::from_spec(&app, port, state.shared.use_default_http_port());
     let gtd = global_tunnel_domain(&state.shared);
-    let urls = build_urls(
-        &app,
-        port,
-        https_port,
-        state.shared.use_default_http_port(),
-        state.shared.use_default_https_port(),
-        &state.shared.domain_suffix,
-        gtd.as_deref(),
-    );
+    let url_ctx = crate::domain::UrlContext {
+        http_port: port,
+        https_port: state.shared.listen_https.map(|a| a.port()),
+        use_default_http_port: state.shared.use_default_http_port(),
+        use_default_https_port: state.shared.use_default_https_port(),
+        domain_suffix: &state.shared.domain_suffix,
+        global_tunnel_domain: gtd.as_deref(),
+    };
+    let urls = build_urls(&app, &url_ctx);
     let mut ctx = base_context(&state.shared);
     ctx.insert("app", &app_view);
     ctx.insert("urls", &urls);

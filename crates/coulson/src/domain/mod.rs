@@ -175,6 +175,100 @@ pub struct AppSpec {
     pub updated_at: OffsetDateTime,
 }
 
+/// Runtime context needed to build URLs for an app.
+pub struct UrlContext<'a> {
+    pub http_port: u16,
+    pub https_port: Option<u16>,
+    pub use_default_http_port: bool,
+    pub use_default_https_port: bool,
+    pub domain_suffix: &'a str,
+    pub global_tunnel_domain: Option<&'a str>,
+}
+
+/// Build HTTP/HTTPS URLs for a domain (localhost alias + primary + HTTPS).
+/// This is the shared core used by both `AppSpec::urls()` and CLI output.
+pub fn domain_urls(domain: &str, path: &str, ctx: &UrlContext<'_>) -> Vec<String> {
+    let mut urls = Vec::new();
+
+    // .localhost alias first (RFC 6761 — resolves to 127.0.0.1 without DNS)
+    if ctx.domain_suffix != crate::config::LOCALHOST_SUFFIX {
+        if let Some(prefix) = domain.strip_suffix(&format!(".{}", ctx.domain_suffix)) {
+            let lh = format!("{prefix}.{}", crate::config::LOCALHOST_SUFFIX);
+            urls.push(format_url(
+                "http",
+                &lh,
+                ctx.http_port,
+                path,
+                ctx.use_default_http_port,
+            ));
+        }
+    }
+
+    // Primary HTTP URL
+    urls.push(format_url(
+        "http",
+        domain,
+        ctx.http_port,
+        path,
+        ctx.use_default_http_port,
+    ));
+
+    // HTTPS URL
+    if let Some(hp) = ctx.https_port {
+        urls.push(format_url(
+            "https",
+            domain,
+            hp,
+            path,
+            ctx.use_default_https_port,
+        ));
+    }
+
+    urls
+}
+
+impl AppSpec {
+    /// Build all reachable URLs for this app.
+    pub fn urls(&self, ctx: &UrlContext<'_>) -> Vec<String> {
+        let path = self.path_prefix.as_deref().unwrap_or("/");
+        let mut urls = domain_urls(&self.domain.0, path, ctx);
+
+        // Tunnel URLs
+        if self.tunnel_mode.is_exposed() {
+            if let Some(ref td) = self.app_tunnel_domain {
+                let href = format!("https://{td}");
+                if !urls.contains(&href) {
+                    urls.push(href);
+                }
+            }
+        }
+        if matches!(self.tunnel_mode, TunnelMode::Global) {
+            if let Some(td) = ctx.global_tunnel_domain {
+                let href = format!("https://{}.{td}", self.name);
+                if !urls.contains(&href) {
+                    urls.push(href);
+                }
+            }
+        }
+        if let Some(ref url) = self.tunnel_url {
+            if !urls.contains(url) {
+                urls.push(url.clone());
+            }
+        }
+
+        urls
+    }
+}
+
+pub fn format_url(scheme: &str, host: &str, port: u16, path: &str, use_default: bool) -> String {
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    if use_default || port == default_port {
+        format!("{scheme}://{host}{path}")
+    } else {
+        format!("{scheme}://{host}:{port}{path}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -192,7 +192,8 @@ pub struct UrlView {
 impl AppView {
     pub fn from_spec(app: &AppSpec, port: u16, use_default_http_port: bool) -> Self {
         let path = app.path_prefix.as_deref().unwrap_or("/");
-        let domain_href = format_http_url(&app.domain.0, port, path, use_default_http_port);
+        let domain_href =
+            crate::domain::format_url("http", &app.domain.0, port, path, use_default_http_port);
         let target_port = if let BackendTarget::Tcp { port, .. } = &app.target {
             Some(*port)
         } else {
@@ -607,37 +608,17 @@ pub fn app_views(apps: &[AppSpec], port: u16, use_default_http_port: bool) -> Ve
         .collect()
 }
 
-pub fn build_urls(
-    app: &AppSpec,
-    port: u16,
-    https_port: Option<u16>,
-    use_default_http_port: bool,
-    use_default_https_port: bool,
-    domain_suffix: &str,
-    global_tunnel_domain: Option<&str>,
-) -> Vec<UrlView> {
-    let mut urls = Vec::new();
-    let path = app.path_prefix.as_deref().unwrap_or("/");
-    urls.push(UrlView {
-        href: format_http_url(&app.domain.0, port, path, use_default_http_port),
-        is_link: true,
-    });
-    if let Some(hp) = https_port {
-        urls.push(UrlView {
-            href: format_https_url(&app.domain.0, hp, path, use_default_https_port),
+pub fn build_urls(app: &AppSpec, ctx: &crate::domain::UrlContext<'_>) -> Vec<UrlView> {
+    let mut urls: Vec<UrlView> = app
+        .urls(ctx)
+        .into_iter()
+        .map(|href| UrlView {
+            href,
             is_link: true,
-        });
-    }
-    // .localhost alias URLs (RFC 6761 — zero-config resolution to 127.0.0.1)
-    if domain_suffix != crate::config::LOCALHOST_SUFFIX {
-        if let Some(prefix) = app.domain.0.strip_suffix(&format!(".{domain_suffix}")) {
-            let lh = format!("{prefix}.{}", crate::config::LOCALHOST_SUFFIX);
-            urls.push(UrlView {
-                href: format_http_url(&lh, port, path, use_default_http_port),
-                is_link: true,
-            });
-        }
-    }
+        })
+        .collect();
+
+    // Backend target URL (not a proxy URL, shown for info)
     match &app.target {
         BackendTarget::Tcp { host, port } => urls.push(UrlView {
             href: format!("http://{host}:{port}/"),
@@ -653,53 +634,7 @@ pub fn build_urls(
         }),
         _ => {}
     }
-    if app.tunnel_mode.is_exposed() {
-        if let Some(ref tunnel_domain) = app.app_tunnel_domain {
-            let href = format!("https://{tunnel_domain}");
-            if !urls.iter().any(|u| u.href == href) {
-                urls.push(UrlView {
-                    href,
-                    is_link: true,
-                });
-            }
-        }
-    }
-    if matches!(app.tunnel_mode, crate::domain::TunnelMode::Global) {
-        if let Some(td) = global_tunnel_domain {
-            let href = format!("https://{}.{td}", app.name);
-            if !urls.iter().any(|u| u.href == href) {
-                urls.push(UrlView {
-                    href,
-                    is_link: true,
-                });
-            }
-        }
-    }
-    if let Some(ref url) = app.tunnel_url {
-        if !urls.iter().any(|u| u.href == *url) {
-            urls.push(UrlView {
-                href: url.clone(),
-                is_link: true,
-            });
-        }
-    }
     urls
-}
-
-fn format_http_url(host: &str, port: u16, path: &str, use_default_port: bool) -> String {
-    if use_default_port || port == 80 {
-        format!("http://{host}{path}")
-    } else {
-        format!("http://{host}:{port}{path}")
-    }
-}
-
-fn format_https_url(host: &str, port: u16, path: &str, use_default_port: bool) -> String {
-    if use_default_port || port == 443 {
-        format!("https://{host}{path}")
-    } else {
-        format!("https://{host}:{port}{path}")
-    }
 }
 
 pub fn turbo_replace(target: &str, content: &str) -> String {

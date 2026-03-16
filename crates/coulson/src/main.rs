@@ -335,6 +335,11 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Open app URL in default browser
+    Open {
+        /// App name or domain (omit to match CWD)
+        name: Option<String>,
+    },
     /// Attach to a managed process's tmux session (Ctrl-B D to detach)
     Attach {
         /// App name or domain (omit to match CWD)
@@ -531,20 +536,18 @@ fn run_ls(cfg: CoulsonConfig, managed: Option<bool>, domain: Option<String>) -> 
 
     if let Some(ref name) = cwd_app {
         if let Some(app) = apps.iter().find(|a| a.name == *name) {
-            let port = RpcClient::new(&cfg.control_socket)
-                .call("health.ping", serde_json::json!({}))
-                .ok()
-                .and_then(|v| v.get("http_port").and_then(|p| p.as_u64()))
-                .map(|p| p as u16)
-                .unwrap_or_else(|| cfg.listen_http.port());
-            let suffix = if port == 80 {
-                String::new()
-            } else {
-                format!(":{port}")
+            let port = daemon_http_port(&cfg);
+            let ctx = domain::UrlContext {
+                http_port: port,
+                https_port: None,
+                use_default_http_port: state.use_default_http_port(),
+                use_default_https_port: state.use_default_https_port(),
+                domain_suffix: &cfg.domain_suffix,
+                global_tunnel_domain: None,
             };
-            println!("\n  {}", format!("http://{}{suffix}", app.domain.0).cyan());
-            if let Some(lh) = localhost_url(&app.domain.0, &cfg.domain_suffix, port) {
-                println!("  {}", lh.cyan());
+            println!();
+            for url in app.urls(&ctx) {
+                println!("  {}", url.cyan());
             }
         }
     }
@@ -1399,6 +1402,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Start { name } => run_process_action(cfg, name, "process.start"),
         Commands::Stop { name } => run_process_action(cfg, name, "process.stop"),
         Commands::Restart { name } => run_process_action(cfg, name, "process.restart"),
+        Commands::Open { name } => run_open(cfg, name),
         Commands::Attach { name } => run_attach(cfg, name),
         Commands::Trust { forward, pf, force } => run_trust(cfg, forward || pf, force),
         Commands::Forward {
@@ -1478,14 +1482,19 @@ fn daemon_http_port(cfg: &CoulsonConfig) -> u16 {
         .unwrap_or_else(|| cfg.listen_http.port())
 }
 
-/// Return the `.localhost` alias URL for a domain, or None if suffix is already localhost.
-fn localhost_url(domain: &str, suffix: &str, port: u16) -> Option<String> {
-    if suffix == LOCALHOST_SUFFIX {
-        return None;
+/// Print reachable URLs for a domain.
+fn print_app_urls(domain: &str, suffix: &str, port: u16) {
+    let ctx = domain::UrlContext {
+        http_port: port,
+        https_port: None,
+        use_default_http_port: false,
+        use_default_https_port: false,
+        domain_suffix: suffix,
+        global_tunnel_domain: None,
+    };
+    for url in domain::domain_urls(domain, "/", &ctx) {
+        println!("  {}", url.cyan());
     }
-    domain
-        .strip_suffix(&format!(".{suffix}"))
-        .map(|prefix| format!("http://{prefix}.{LOCALHOST_SUFFIX}:{port}"))
 }
 
 fn run_add_directory_inner(
@@ -1576,10 +1585,7 @@ fn run_add_directory_inner(
         );
         let hp = daemon_http_port(cfg);
         let domain = format!("{name}.{}", cfg.domain_suffix);
-        println!("  {}", format!("http://{domain}:{hp}").cyan());
-        if let Some(lh) = localhost_url(&domain, &cfg.domain_suffix, hp) {
-            println!("  {}", lh.cyan());
-        }
+        print_app_urls(&domain, &cfg.domain_suffix, hp);
         // Notify daemon to pick up the new app immediately
         let _ = RpcClient::new(&cfg.control_socket).call("apps.scan", serde_json::json!({}));
         if tunnel {
@@ -1626,10 +1632,7 @@ fn run_add_directory_inner(
         );
         let hp = daemon_http_port(cfg);
         let domain = format!("{name}.{}", cfg.domain_suffix);
-        println!("  {}", format!("http://{domain}:{hp}").cyan());
-        if let Some(lh) = localhost_url(&domain, &cfg.domain_suffix, hp) {
-            println!("  {}", lh.cyan());
-        }
+        print_app_urls(&domain, &cfg.domain_suffix, hp);
     } else {
         // No auto-detect, still create symlink (scanner will parse .coulson.toml/.coulson etc.)
         std::fs::create_dir_all(&cfg.apps_root)?;
@@ -1655,10 +1658,7 @@ fn run_add_directory_inner(
         );
         let hp = daemon_http_port(cfg);
         let domain = format!("{name}.{}", cfg.domain_suffix);
-        println!("  {}", format!("http://{domain}:{hp}").cyan());
-        if let Some(lh) = localhost_url(&domain, &cfg.domain_suffix, hp) {
-            println!("  {}", lh.cyan());
-        }
+        print_app_urls(&domain, &cfg.domain_suffix, hp);
         println!(
             "  {}",
             "Tip: use `coulson add <port>` to specify a target port, or add .coulson.toml/.coulson"
@@ -1793,10 +1793,7 @@ fn run_add_manual(
     };
     println!("  {} {domain} -> {display}", "+".green().bold());
     let hp = daemon_http_port(cfg);
-    println!("  {}", format!("http://{domain}:{hp}").cyan());
-    if let Some(lh) = localhost_url(&domain, &cfg.domain_suffix, hp) {
-        println!("  {}", lh.cyan());
-    }
+    print_app_urls(&domain, &cfg.domain_suffix, hp);
 
     // Notify daemon to pick up the new app
     let _ = RpcClient::new(&cfg.control_socket).call("apps.scan", serde_json::json!({}));
@@ -1835,10 +1832,7 @@ fn run_add_manual_rpc(
         .and_then(|v| v.as_u64())
         .unwrap_or(cfg.listen_http.port() as u64);
     println!("  {} {domain} -> unix:{target}", "+".green().bold());
-    println!("  {}", format!("http://{domain}:{http_port}").cyan());
-    if let Some(lh) = localhost_url(&domain, &cfg.domain_suffix, http_port as u16) {
-        println!("  {}", lh.cyan());
-    }
+    print_app_urls(&domain, &cfg.domain_suffix, http_port as u16);
     if tunnel {
         start_tunnel_after_add(cfg, name)?;
     }
@@ -2160,19 +2154,46 @@ fn run_process_action(
                     .and_then(|p| p.as_u64())
                     .map(|p| p as u16)
                     .unwrap_or_else(|| cfg.listen_http.port());
-                let suffix = if port == 80 {
-                    String::new()
-                } else {
-                    format!(":{port}")
-                };
-                println!("  {}", format!("http://{domain}{suffix}").cyan());
-                if let Some(lh) = localhost_url(domain, &cfg.domain_suffix, port) {
-                    println!("  {}", lh.cyan());
-                }
+                print_app_urls(domain, &cfg.domain_suffix, port);
             }
         }
     }
 
+    Ok(())
+}
+
+fn run_open(cfg: CoulsonConfig, name: Option<String>) -> anyhow::Result<()> {
+    let app_name = resolve_app_name(&cfg, name.as_deref())?;
+    let state = build_state(&cfg)?;
+    let domain_match = format!("{app_name}.{}", cfg.domain_suffix);
+    let all_apps = state.store.list_filtered(None, None)?;
+    let app = all_apps
+        .iter()
+        .find(|a| a.name == app_name || a.domain.0 == domain_match || a.domain.0 == app_name)
+        .with_context(|| format!("app not found: {app_name}"))?;
+
+    let port = daemon_http_port(&cfg);
+    let ctx = domain::UrlContext {
+        http_port: port,
+        https_port: None,
+        use_default_http_port: state.use_default_http_port(),
+        use_default_https_port: state.use_default_https_port(),
+        domain_suffix: &cfg.domain_suffix,
+        global_tunnel_domain: None,
+    };
+    let urls = app.urls(&ctx);
+    let url = urls
+        .first()
+        .with_context(|| format!("no URL available for {app_name}"))?;
+
+    println!("  Opening {}", url.cyan());
+    let status = std::process::Command::new("open")
+        .arg(url)
+        .status()
+        .context("failed to run `open`")?;
+    if !status.success() {
+        bail!("open exited with {status}");
+    }
     Ok(())
 }
 

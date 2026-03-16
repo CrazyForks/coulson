@@ -110,11 +110,8 @@ async fn mw_force_https(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let location = if use_default_https_port || https_port == 443 {
-        format!("https://{hostname}{pq}")
-    } else {
-        format!("https://{hostname}:{https_port}{pq}")
-    };
+    let location =
+        crate::domain::format_url("https", hostname, https_port, pq, use_default_https_port);
     let mut resp = ResponseHeader::build(302, None)?;
     resp.insert_header("location", &location)?;
     resp.insert_header("content-length", "0")?;
