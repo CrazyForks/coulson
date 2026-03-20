@@ -650,6 +650,10 @@ fn run_proxy_blocking(
     // certificates (which may contain unsupported critical extensions that crash rustls).
     let mut conf = pingora::server::configuration::ServerConf {
         threads: 4,
+        // Pingora defaults to 300s grace period which is far too long for a
+        // local dev gateway. Use short timeouts so SIGTERM exits promptly.
+        grace_period_seconds: Some(3),
+        graceful_shutdown_timeout_seconds: Some(5),
         ..Default::default()
     };
     if let Some(ref tls) = tls {
@@ -784,6 +788,8 @@ pub fn run_dedicated_proxy_blocking(
     // critical extensions that crash rustls. Use provided CA or /dev/null.
     let conf = pingora::server::configuration::ServerConf {
         ca_file: Some(ca_file.unwrap_or_else(|| "/dev/null".to_string())),
+        grace_period_seconds: Some(3),
+        graceful_shutdown_timeout_seconds: Some(5),
         ..Default::default()
     };
     let mut server = Server::new_with_opt_and_conf(None, conf);
