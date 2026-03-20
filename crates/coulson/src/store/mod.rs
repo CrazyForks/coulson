@@ -281,7 +281,7 @@ impl AppRepository {
             "rack" => AppKind::Rack,
             "node" => AppKind::Node,
             "procfile" => AppKind::Procfile,
-            "container" => AppKind::Container,
+            "container" | "docker" => AppKind::Container,
             _ => AppKind::Static,
         };
 
@@ -1131,7 +1131,7 @@ fn row_to_app(row: &rusqlite::Row<'_>, suffix: &str) -> rusqlite::Result<AppSpec
         "asgi" => AppKind::Asgi,
         "node" => AppKind::Node,
         "procfile" => AppKind::Procfile,
-        "container" => AppKind::Container,
+        "container" | "docker" => AppKind::Container,
         _ => AppKind::Static,
     };
 

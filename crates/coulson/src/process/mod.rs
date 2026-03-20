@@ -52,12 +52,24 @@ pub fn default_registry() -> ProviderRegistry {
     reg.register(asgi::AsgiProvider);
     reg.register(node::NodeProvider);
     reg.register(procfile::ProcfileProvider);
+    reg.register(docker::DockerProvider);
     reg
 }
 
 enum ProcessHandle {
-    Direct { child: Child },
-    Tmux { session_name: String },
+    Direct {
+        child: Child,
+    },
+    Tmux {
+        session_name: String,
+    },
+    Compose {
+        project_dir: PathBuf,
+        project_name: String,
+        compose_file: String,
+        /// Background `docker compose logs -f` process for continuous log capture.
+        log_follower: Option<Child>,
+    },
 }
 
 struct ManagedProcess {
@@ -243,13 +255,60 @@ impl ProcessManager {
 
         cleanup_listen_target(&spec.listen_target);
 
-        let log_path = sockets_dir.join(format!("{name}.log"));
-        let handle = self.spawn_process(name, &spec, &log_path, &sockets_dir)?;
+        let handle = if kind == "docker" {
+            // Docker Compose: run `docker compose up -d --build` synchronously,
+            // since it exits immediately after starting containers in the background.
+            let project_name = name.to_string();
+            // Extract compose file from args: ["compose", "-f", <file>, "-p", ...]
+            let compose_file = spec.args.get(2).cloned().unwrap_or_default();
+            let working_dir = spec.working_dir.clone();
+            let cmd = spec.command.clone();
+            let args = spec.args.clone();
+            let env = spec.env.clone();
 
-        const READY_TIMEOUT_SECS: u64 = 30;
+            let result = tokio::task::spawn_blocking(move || {
+                let mut command = std::process::Command::new(&cmd);
+                command
+                    .args(&args)
+                    .envs(&env)
+                    .current_dir(&working_dir)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                command.output()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("docker compose task panicked: {e}"))?
+            .with_context(|| "failed to run docker compose up")?;
+
+            if !result.status.success() {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                anyhow::bail!(
+                    "docker compose up failed (exit {}): {stderr}",
+                    result.status
+                );
+            }
+
+            let log_path = sockets_dir.join(format!("{name}.log"));
+            let log_follower =
+                spawn_compose_log_follower(root, &project_name, &compose_file, &log_path);
+
+            ProcessHandle::Compose {
+                project_dir: root.to_path_buf(),
+                project_name,
+                compose_file,
+                log_follower,
+            }
+        } else {
+            let log_path = sockets_dir.join(format!("{name}.log"));
+            self.spawn_process(name, &spec, &log_path, &sockets_dir)?
+        };
+
+        // Docker builds can be slow — use a longer readiness timeout.
+        let ready_timeout_secs: u64 = if kind == "docker" { 120 } else { 30 };
         if let Err(e) =
-            wait_for_ready(&spec.listen_target, Duration::from_secs(READY_TIMEOUT_SECS)).await
+            wait_for_ready(&spec.listen_target, Duration::from_secs(ready_timeout_secs)).await
         {
+            let log_path = sockets_dir.join(format!("{name}.log"));
             log_tail(&log_path, name);
             return Err(e);
         }
@@ -310,10 +369,12 @@ impl ProcessManager {
                         group.primary.listen_target.clone(),
                     ))
                 } else {
-                    const STARTUP_TIMEOUT_SECS: u64 = 30;
-                    if group.primary.started_at.elapsed()
-                        > Duration::from_secs(STARTUP_TIMEOUT_SECS)
-                    {
+                    let startup_timeout = if group.primary.kind == "docker" {
+                        120
+                    } else {
+                        30
+                    };
+                    if group.primary.started_at.elapsed() > Duration::from_secs(startup_timeout) {
                         Some(ExistingState::TimedOut)
                     } else {
                         Some(ExistingState::StillStarting)
@@ -339,16 +400,20 @@ impl ProcessManager {
             }
             Some(ExistingState::TimedOut) => {
                 let removed = self.processes.remove(&app_id).unwrap();
+                let startup_timeout = if removed.primary.kind == "docker" {
+                    120
+                } else {
+                    30
+                };
                 for companion in removed.companions {
                     kill_handle(companion.handle).await;
                 }
-                kill_handle(removed.primary.handle).await;
-                cleanup_listen_target(&removed.primary.listen_target);
                 let log_path = self.runtime_dir.join(format!("managed/{name}.log"));
                 log_tail(&log_path, name);
-                const STARTUP_TIMEOUT_SECS: u64 = 30;
+                kill_handle(removed.primary.handle).await;
+                cleanup_listen_target(&removed.primary.listen_target);
                 anyhow::bail!(
-                    "managed process for {name} (app_id={app_id}) failed to become ready within {STARTUP_TIMEOUT_SECS}s"
+                    "managed process for {name} (app_id={app_id}) failed to become ready within {startup_timeout}s"
                 );
             }
             Some(ExistingState::Exited) => {
@@ -378,8 +443,50 @@ impl ProcessManager {
 
         cleanup_listen_target(&spec.listen_target);
 
-        let log_path = sockets_dir.join(format!("{name}.log"));
-        let handle = self.spawn_process(name, &spec, &log_path, &sockets_dir)?;
+        let handle = if kind == "docker" {
+            let project_name = name.to_string();
+            let compose_file = spec.args.get(2).cloned().unwrap_or_default();
+            let working_dir = spec.working_dir.clone();
+            let cmd = spec.command.clone();
+            let args = spec.args.clone();
+            let env = spec.env.clone();
+
+            let result = tokio::task::spawn_blocking(move || {
+                let mut command = std::process::Command::new(&cmd);
+                command
+                    .args(&args)
+                    .envs(&env)
+                    .current_dir(&working_dir)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                command.output()
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("docker compose task panicked: {e}"))?
+            .with_context(|| "failed to run docker compose up")?;
+
+            if !result.status.success() {
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                anyhow::bail!(
+                    "docker compose up failed (exit {}): {stderr}",
+                    result.status
+                );
+            }
+
+            let log_path = sockets_dir.join(format!("{name}.log"));
+            let log_follower =
+                spawn_compose_log_follower(root, &project_name, &compose_file, &log_path);
+
+            ProcessHandle::Compose {
+                project_dir: root.to_path_buf(),
+                project_name,
+                compose_file,
+                log_follower,
+            }
+        } else {
+            let log_path = sockets_dir.join(format!("{name}.log"));
+            self.spawn_process(name, &spec, &log_path, &sockets_dir)?
+        };
 
         let companions =
             self.spawn_companions(app_id, name, root, kind, &companion_types, &sockets_dir);
@@ -889,6 +996,20 @@ fn handle_status(handle: &mut ProcessHandle) -> (u32, bool, &'static str) {
             };
             (pid, alive, "tmux")
         }
+        ProcessHandle::Compose {
+            project_dir,
+            project_name,
+            compose_file,
+            ..
+        } => {
+            let pid = compose_leader_pid(project_dir, project_name, compose_file).unwrap_or(0);
+            let alive = if pid != 0 {
+                compose_is_running(project_dir, project_name, compose_file)
+            } else {
+                false
+            };
+            (pid, alive, "compose")
+        }
     }
 }
 
@@ -899,6 +1020,12 @@ fn is_alive(handle: &mut ProcessHandle) -> bool {
         ProcessHandle::Tmux { session_name } => {
             tmux_has_session(session_name) && tmux_pane_alive(session_name)
         }
+        ProcessHandle::Compose {
+            project_dir,
+            project_name,
+            compose_file,
+            ..
+        } => compose_is_running(project_dir, project_name, compose_file),
     }
 }
 
@@ -920,6 +1047,163 @@ async fn kill_handle(handle: ProcessHandle) {
             }
             tmux_kill_session(&session_name);
         }
+        ProcessHandle::Compose {
+            project_dir,
+            project_name,
+            compose_file,
+            mut log_follower,
+        } => {
+            // Kill the log follower first
+            if let Some(ref mut child) = log_follower {
+                let _ = child.kill().await;
+            }
+            compose_down(&project_dir, &project_name, &compose_file).await;
+        }
+    }
+}
+
+// Docker Compose helper functions
+
+/// Build the common prefix args for all `docker compose` invocations.
+fn compose_base_args<'a>(project_name: &'a str, compose_file: &'a str) -> Vec<&'a str> {
+    vec!["compose", "-f", compose_file, "-p", project_name]
+}
+
+/// Check if any compose service containers are running.
+fn compose_is_running(project_dir: &Path, project_name: &str, compose_file: &str) -> bool {
+    let mut args = compose_base_args(project_name, compose_file);
+    args.extend(["ps", "--format", "json", "--status", "running"]);
+    let output = std::process::Command::new("docker")
+        .args(&args)
+        .current_dir(project_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    match output {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            !text.trim().is_empty()
+        }
+        Err(_) => false,
+    }
+}
+
+/// Spawn a `docker compose logs -f` process that continuously writes to a log file.
+fn spawn_compose_log_follower(
+    project_dir: &Path,
+    project_name: &str,
+    compose_file: &str,
+    log_path: &Path,
+) -> Option<Child> {
+    let log_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(path = %log_path.display(), error = %e, "failed to open compose log file");
+            return None;
+        }
+    };
+    let stderr_file = match log_file.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(error = %e, "failed to clone compose log file handle");
+            return None;
+        }
+    };
+
+    let mut args = compose_base_args(project_name, compose_file);
+    args.extend(["logs", "-f", "--no-color"]);
+    match Command::new("docker")
+        .args(&args)
+        .current_dir(project_dir)
+        .stdin(Stdio::null())
+        .stdout(stderr_file)
+        .stderr(log_file)
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => {
+            debug!(project = project_name, "spawned compose log follower");
+            Some(child)
+        }
+        Err(e) => {
+            warn!(project = project_name, error = %e, "failed to spawn compose log follower");
+            None
+        }
+    }
+}
+
+/// Get the PID of the first running container's leader process.
+fn compose_leader_pid(project_dir: &Path, project_name: &str, compose_file: &str) -> Option<u32> {
+    let mut args = compose_base_args(project_name, compose_file);
+    args.extend(["ps", "--format", "json", "--status", "running"]);
+    let output = std::process::Command::new("docker")
+        .args(&args)
+        .current_dir(project_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    // `docker compose ps --format json` outputs one JSON object per line
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
+            // The "ID" field is the container ID; get PID via `docker inspect`
+            if let Some(container_id) = obj.get("ID").and_then(|v| v.as_str()) {
+                if let Ok(inspect_out) = std::process::Command::new("docker")
+                    .args(["inspect", "--format", "{{.State.Pid}}", container_id])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .output()
+                {
+                    if let Ok(pid) = String::from_utf8_lossy(&inspect_out.stdout)
+                        .trim()
+                        .parse::<u32>()
+                    {
+                        if pid > 0 {
+                            return Some(pid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Run `docker compose down` to stop and remove containers.
+async fn compose_down(project_dir: &Path, project_name: &str, compose_file: &str) {
+    let dir = project_dir.to_path_buf();
+    let name = project_name.to_string();
+    let cf = compose_file.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut args = compose_base_args(&name, &cf);
+        args.push("down");
+        std::process::Command::new("docker")
+            .args(&args)
+            .current_dir(&dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+    })
+    .await;
+    match result {
+        Ok(Ok(output)) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!("docker compose down failed: {stderr}");
+            }
+        }
+        Ok(Err(e)) => warn!("failed to run docker compose down: {e}"),
+        Err(e) => warn!("docker compose down task panicked: {e}"),
     }
 }
 

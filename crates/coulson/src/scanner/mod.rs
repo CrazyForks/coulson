@@ -140,6 +140,10 @@ struct CoulsonManifest {
     basic_auth_pass: Option<String>,
     #[serde(default)]
     listen_port: Option<u16>,
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    compose_file: Option<String>,
     routes: Option<Vec<CoulsonManifestRoute>>,
     hooks: Option<crate::hooks::AppHooksConfig>,
 }
@@ -900,6 +904,15 @@ fn manifest_to_json_value(m: &CoulsonManifest) -> serde_json::Value {
     if let Some(ref v) = m.command {
         map.insert("command".into(), serde_json::Value::String(v.clone()));
     }
+    if let Some(v) = m.port {
+        map.insert("port".into(), serde_json::Value::Number(v.into()));
+    }
+    if let Some(ref v) = m.service {
+        map.insert("service".into(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = m.compose_file {
+        map.insert("compose_file".into(), serde_json::Value::String(v.clone()));
+    }
     serde_json::Value::Object(map)
 }
 
@@ -1154,7 +1167,7 @@ fn app_kind_to_str(kind: AppKind) -> &'static str {
         AppKind::Rack => "rack",
         AppKind::Node => "node",
         AppKind::Procfile => "procfile",
-        AppKind::Container => "container",
+        AppKind::Container => "docker",
         AppKind::Static => "static",
     }
 }
