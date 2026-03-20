@@ -671,39 +671,49 @@ fn run_proxy_blocking(
             dashboard_router,
         },
     );
-    service.add_tcp(bind);
-    // Also listen on IPv6 so mDNS-resolved AAAA connections work
+    // Bind with IPv6 support:
+    // - 0.0.0.0 → bind [::] instead (dual-stack covers both IPv4 and IPv6)
+    // - 127.0.0.1 → bind both 127.0.0.1 and [::1] (specific addresses, no conflict)
+    // - other → bind as-is (no IPv6 counterpart)
     if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
-        if addr.ip() == std::net::Ipv4Addr::LOCALHOST {
-            let v6_bind = format!("[::1]:{}", addr.port());
-            service.add_tcp(&v6_bind);
-        } else if addr.ip() == std::net::Ipv4Addr::UNSPECIFIED {
+        if addr.ip() == std::net::Ipv4Addr::UNSPECIFIED {
             let v6_bind = format!("[::]:{}", addr.port());
             service.add_tcp(&v6_bind);
+        } else {
+            service.add_tcp(bind);
+            if addr.ip() == std::net::Ipv4Addr::LOCALHOST {
+                let v6_bind = format!("[::1]:{}", addr.port());
+                service.add_tcp(&v6_bind);
+            }
         }
+    } else {
+        service.add_tcp(bind);
     }
 
     // TLS listener with HTTP/2 + HTTP/1.1 ALPN via dynamic SNI cert callback
     if let Some(tls) = tls {
-        let cb: pingora::listeners::TlsAcceptCallbacks = Box::new(tls.sni_callback.clone());
-        let mut tls_settings = pingora::listeners::tls::TlsSettings::with_callbacks(cb)?;
-        tls_settings.enable_h2();
-        service.add_tls_with_settings(&tls.bind, None, tls_settings);
+        let add_tls_listener = |svc: &mut pingora::services::listening::Service<_>,
+                                bind_addr: &str| {
+            let cb: pingora::listeners::TlsAcceptCallbacks = Box::new(tls.sni_callback.clone());
+            let mut settings = pingora::listeners::tls::TlsSettings::with_callbacks(cb)
+                .expect("TLS settings init");
+            settings.enable_h2();
+            svc.add_tls_with_settings(bind_addr, None, settings);
+        };
+
         if let Ok(addr) = tls.bind.parse::<std::net::SocketAddr>() {
-            let v6_bind = if addr.ip() == std::net::Ipv4Addr::LOCALHOST {
-                Some(format!("[::1]:{}", addr.port()))
-            } else if addr.ip() == std::net::Ipv4Addr::UNSPECIFIED {
-                Some(format!("[::]:{}", addr.port()))
+            if addr.ip() == std::net::Ipv4Addr::UNSPECIFIED {
+                let v6_bind = format!("[::]:{}", addr.port());
+                add_tls_listener(&mut service, &v6_bind);
             } else {
-                None
-            };
-            if let Some(v6_bind) = v6_bind {
-                let v6_cb: pingora::listeners::TlsAcceptCallbacks =
-                    Box::new(tls.sni_callback.clone());
-                let mut v6_settings = pingora::listeners::tls::TlsSettings::with_callbacks(v6_cb)?;
-                v6_settings.enable_h2();
-                service.add_tls_with_settings(&v6_bind, None, v6_settings);
+                add_tls_listener(&mut service, &tls.bind);
+                if addr.ip() == std::net::Ipv4Addr::LOCALHOST {
+                    let v6_bind = format!("[::1]:{}", addr.port());
+                    add_tls_listener(&mut service, &v6_bind);
+                }
             }
+        } else {
+            add_tls_listener(&mut service, &tls.bind);
         }
     }
 
