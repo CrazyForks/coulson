@@ -247,7 +247,12 @@ impl ProcessManager {
         let handle = self.spawn_process(name, &spec, &log_path, &sockets_dir)?;
 
         const READY_TIMEOUT_SECS: u64 = 30;
-        wait_for_ready(&spec.listen_target, Duration::from_secs(READY_TIMEOUT_SECS)).await?;
+        if let Err(e) =
+            wait_for_ready(&spec.listen_target, Duration::from_secs(READY_TIMEOUT_SECS)).await
+        {
+            log_tail(&log_path, name);
+            return Err(e);
+        }
 
         self.fire_hook(HookEvent::AppReady, app_id, name, root, kind);
 
@@ -339,6 +344,8 @@ impl ProcessManager {
                 }
                 kill_handle(removed.primary.handle).await;
                 cleanup_listen_target(&removed.primary.listen_target);
+                let log_path = self.runtime_dir.join(format!("managed/{name}.log"));
+                log_tail(&log_path, name);
                 const STARTUP_TIMEOUT_SECS: u64 = 30;
                 anyhow::bail!(
                     "managed process for {name} (app_id={app_id}) failed to become ready within {STARTUP_TIMEOUT_SECS}s"
@@ -978,6 +985,23 @@ fn tmux_kill_session(name: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+/// Log the last few lines of a managed process log file on startup failure.
+fn log_tail(log_path: &Path, name: &str) {
+    const TAIL_LINES: usize = 10;
+    if let Ok(content) = std::fs::read_to_string(log_path) {
+        let lines: Vec<&str> = content.lines().collect();
+        let start = lines.len().saturating_sub(TAIL_LINES);
+        let tail = lines[start..].join("\n");
+        if !tail.trim().is_empty() {
+            warn!(
+                app = name,
+                log = %log_path.display(),
+                "\n--- process log tail ---\n{tail}\n---"
+            );
+        }
+    }
 }
 
 /// Clean up resources associated with a listen target.

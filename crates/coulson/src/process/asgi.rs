@@ -44,7 +44,7 @@ impl ProcessProvider for AsgiProvider {
 
     fn resolve(&self, app: &ManagedApp) -> anyhow::Result<ProcessSpec> {
         let module = detect_module(&app.root, app.manifest.as_ref())?;
-        let server = find_asgi_server(&app.root, app.manifest.as_ref())?;
+        let binary = find_uvicorn(&app.root, app.manifest.as_ref())?;
         let socket_path = app.socket_path();
 
         let reload = matches!(
@@ -52,25 +52,13 @@ impl ProcessProvider for AsgiProvider {
             Some("1" | "true")
         );
 
-        let mut args = vec![module];
-        match server.server_type {
-            AsgiServer::Granian => {
-                args.extend([
-                    "--uds".into(),
-                    socket_path.to_string_lossy().to_string(),
-                    "--interface".into(),
-                    "asgi".into(),
-                ]);
-                if reload {
-                    args.push("--reload".into());
-                }
-            }
-            AsgiServer::Uvicorn => {
-                args.extend(["--uds".into(), socket_path.to_string_lossy().to_string()]);
-                if reload {
-                    args.push("--reload".into());
-                }
-            }
+        let mut args = vec![
+            module,
+            "--uds".into(),
+            socket_path.to_string_lossy().to_string(),
+        ];
+        if reload {
+            args.push("--reload".into());
         }
 
         let mut env = std::collections::HashMap::new();
@@ -78,7 +66,7 @@ impl ProcessProvider for AsgiProvider {
         env.remove("ASGI_RELOAD");
 
         Ok(ProcessSpec {
-            command: server.binary,
+            command: binary,
             args,
             env,
             working_dir: app.root.clone(),
@@ -87,27 +75,7 @@ impl ProcessProvider for AsgiProvider {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AsgiServer {
-    Granian,
-    Uvicorn,
-}
-
-impl std::fmt::Display for AsgiServer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AsgiServer::Granian => write!(f, "granian"),
-            AsgiServer::Uvicorn => write!(f, "uvicorn"),
-        }
-    }
-}
-
-struct AsgiServerInfo {
-    server_type: AsgiServer,
-    binary: PathBuf,
-}
-
-/// Detect the ASGI module to pass to granian / uvicorn.
+/// Detect the ASGI module to pass to uvicorn.
 /// Priority: manifest `module` field > app.py > main.py
 fn detect_module(root: &Path, manifest: Option<&Value>) -> anyhow::Result<String> {
     if let Some(m) = manifest {
@@ -129,93 +97,38 @@ fn detect_module(root: &Path, manifest: Option<&Value>) -> anyhow::Result<String
     )
 }
 
-/// Find the best available ASGI server for the given app directory.
+/// Find uvicorn binary for the given app directory.
 ///
 /// Resolution order:
-///   1. manifest `server` field (`"granian"` | `"uvicorn"`) → use that server
-///   2. manifest `command` field → use as binary path, infer server type from name
-///   3. Auto-detect: try uvicorn first (venv → PATH), then granian (venv → PATH)
-fn find_asgi_server(root: &Path, manifest: Option<&Value>) -> anyhow::Result<AsgiServerInfo> {
+///   1. manifest `command` field → use as binary path
+///   2. Search .venv/bin/ → venv/bin/ → PATH
+///
+/// If manifest `server` is set to something other than "uvicorn", warn and
+/// search for uvicorn anyway (granian support was removed).
+fn find_uvicorn(root: &Path, manifest: Option<&Value>) -> anyhow::Result<PathBuf> {
     if let Some(m) = manifest {
-        let server_pref = m.get("server").and_then(|v| v.as_str());
-        let command = m.get("command").and_then(|v| v.as_str());
-
-        // Explicit server preference
-        if let Some(server_name) = server_pref {
-            let server_type = match server_name {
-                "granian" => AsgiServer::Granian,
-                "uvicorn" => AsgiServer::Uvicorn,
-                other => {
-                    warn!(
-                        server = other,
-                        "unknown server in .coulson.toml, trying auto-detect"
-                    );
-                    return auto_detect_server(root);
-                }
-            };
-            if let Some(cmd) = command {
-                let path = PathBuf::from(cmd);
-                if path.exists() {
-                    return Ok(AsgiServerInfo {
-                        server_type,
-                        binary: path,
-                    });
-                }
+        if let Some(server) = m.get("server").and_then(|v| v.as_str()) {
+            if server != "uvicorn" {
                 warn!(
-                    command = cmd,
-                    ".coulson.toml command not found, searching defaults"
+                    server,
+                    "only uvicorn is supported as ASGI server, ignoring server={server}"
                 );
             }
-            let binary = find_server_binary(root, server_name)?;
-            return Ok(AsgiServerInfo {
-                server_type,
-                binary,
-            });
         }
 
-        // Command field without explicit server → infer type from binary name
-        if let Some(cmd) = command {
+        if let Some(cmd) = m.get("command").and_then(|v| v.as_str()) {
             let path = PathBuf::from(cmd);
             if path.exists() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                let server_type = if name.contains("uvicorn") {
-                    AsgiServer::Uvicorn
-                } else {
-                    AsgiServer::Granian
-                };
-                return Ok(AsgiServerInfo {
-                    server_type,
-                    binary: path,
-                });
+                return Ok(path);
             }
             warn!(
                 command = cmd,
-                ".coulson.toml command not found, trying defaults"
+                ".coulson.toml command not found, searching defaults"
             );
         }
     }
 
-    auto_detect_server(root)
-}
-
-/// Try uvicorn first (single-process, better for dev), then granian.
-fn auto_detect_server(root: &Path) -> anyhow::Result<AsgiServerInfo> {
-    if let Ok(binary) = find_server_binary(root, "uvicorn") {
-        return Ok(AsgiServerInfo {
-            server_type: AsgiServer::Uvicorn,
-            binary,
-        });
-    }
-    if let Ok(binary) = find_server_binary(root, "granian") {
-        return Ok(AsgiServerInfo {
-            server_type: AsgiServer::Granian,
-            binary,
-        });
-    }
-    bail!(
-        "no ASGI server found for {}: checked uvicorn and granian in .venv/bin/, venv/bin/, and PATH",
-        root.display()
-    )
+    find_server_binary(root, "uvicorn")
 }
 
 /// Look for a server binary in the app's virtualenv, then in PATH.
@@ -294,21 +207,6 @@ mod tests {
     }
 
     #[test]
-    fn server_display_names() {
-        assert_eq!(AsgiServer::Granian.to_string(), "granian");
-        assert_eq!(AsgiServer::Uvicorn.to_string(), "uvicorn");
-    }
-
-    #[test]
-    fn finds_granian_in_dot_venv() {
-        let root = temp_app_dir("find-granian-dotvenv");
-        place_venv_binary(&root, "granian");
-        let result = find_server_binary(&root, "granian").unwrap();
-        assert_eq!(result, root.join(".venv/bin/granian"));
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
     fn finds_uvicorn_in_dot_venv() {
         let root = temp_app_dir("find-uvicorn-dotvenv");
         place_venv_binary(&root, "uvicorn");
@@ -320,10 +218,10 @@ mod tests {
     #[test]
     fn prefers_dot_venv_over_venv() {
         let root = temp_app_dir("prefer-dotvenv");
-        place_venv_binary(&root, "granian");
-        place_venv_nondot_binary(&root, "granian");
-        let result = find_server_binary(&root, "granian").unwrap();
-        assert_eq!(result, root.join(".venv/bin/granian"));
+        place_venv_binary(&root, "uvicorn");
+        place_venv_nondot_binary(&root, "uvicorn");
+        let result = find_server_binary(&root, "uvicorn").unwrap();
+        assert_eq!(result, root.join(".venv/bin/uvicorn"));
         fs::remove_dir_all(&root).ok();
     }
 
@@ -337,112 +235,32 @@ mod tests {
     }
 
     #[test]
-    fn auto_detect_prefers_uvicorn() {
-        let root = temp_app_dir("auto-both");
-        place_venv_binary(&root, "granian");
-        place_venv_binary(&root, "uvicorn");
-        let info = auto_detect_server(&root).unwrap();
-        assert_eq!(info.server_type, AsgiServer::Uvicorn);
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn auto_detect_finds_uvicorn_when_no_granian() {
-        let root = temp_app_dir("auto-uvicorn-only");
-        place_venv_binary(&root, "uvicorn");
-        let info = auto_detect_server(&root).unwrap();
-        assert_eq!(info.server_type, AsgiServer::Uvicorn);
-        assert_eq!(info.binary, root.join(".venv/bin/uvicorn"));
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn manifest_server_selects_uvicorn() {
-        let root = temp_app_dir("manifest-uvicorn");
-        place_venv_binary(&root, "granian");
-        place_venv_binary(&root, "uvicorn");
-        let manifest = serde_json::json!({"server": "uvicorn"});
-        let info = find_asgi_server(&root, Some(&manifest)).unwrap();
-        assert_eq!(info.server_type, AsgiServer::Uvicorn);
-        assert_eq!(info.binary, root.join(".venv/bin/uvicorn"));
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn manifest_server_selects_granian() {
-        let root = temp_app_dir("manifest-granian");
-        place_venv_binary(&root, "granian");
-        place_venv_binary(&root, "uvicorn");
-        let manifest = serde_json::json!({"server": "granian"});
-        let info = find_asgi_server(&root, Some(&manifest)).unwrap();
-        assert_eq!(info.server_type, AsgiServer::Granian);
-        assert_eq!(info.binary, root.join(".venv/bin/granian"));
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn manifest_server_plus_command() {
-        let root = temp_app_dir("manifest-server-cmd");
-        place_venv_binary(&root, "uvicorn");
-        let custom = root.join(".venv/bin/uvicorn");
-        let manifest =
-            serde_json::json!({"server": "uvicorn", "command": custom.to_string_lossy().as_ref()});
-        let info = find_asgi_server(&root, Some(&manifest)).unwrap();
-        assert_eq!(info.server_type, AsgiServer::Uvicorn);
-        assert_eq!(info.binary, custom);
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn manifest_command_infers_uvicorn() {
+    fn find_uvicorn_from_manifest_command() {
         let root = temp_app_dir("manifest-cmd-uvicorn");
         place_venv_binary(&root, "uvicorn");
-        let uvicorn_path = root.join(".venv/bin/uvicorn");
-        let manifest = serde_json::json!({"command": uvicorn_path.to_string_lossy().as_ref()});
-        let info = find_asgi_server(&root, Some(&manifest)).unwrap();
-        assert_eq!(info.server_type, AsgiServer::Uvicorn);
-        assert_eq!(info.binary, uvicorn_path);
+        let custom = root.join(".venv/bin/uvicorn");
+        let manifest = serde_json::json!({"command": custom.to_string_lossy().as_ref()});
+        let result = find_uvicorn(&root, Some(&manifest)).unwrap();
+        assert_eq!(result, custom);
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn manifest_command_infers_granian() {
-        let root = temp_app_dir("manifest-cmd-granian");
-        place_venv_binary(&root, "granian");
-        let granian_path = root.join(".venv/bin/granian");
-        let manifest = serde_json::json!({"command": granian_path.to_string_lossy().as_ref()});
-        let info = find_asgi_server(&root, Some(&manifest)).unwrap();
-        assert_eq!(info.server_type, AsgiServer::Granian);
-        assert_eq!(info.binary, granian_path);
+    fn find_uvicorn_ignores_granian_server_field() {
+        let root = temp_app_dir("manifest-granian-ignored");
+        place_venv_binary(&root, "uvicorn");
+        let manifest = serde_json::json!({"server": "granian"});
+        let result = find_uvicorn(&root, Some(&manifest)).unwrap();
+        assert_eq!(result, root.join(".venv/bin/uvicorn"));
         fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn no_manifest_auto_detects_uvicorn() {
+    fn find_uvicorn_no_manifest() {
         let root = temp_app_dir("no-manifest-uvicorn");
         place_venv_binary(&root, "uvicorn");
-        let info = find_asgi_server(&root, None).unwrap();
-        assert_eq!(info.server_type, AsgiServer::Uvicorn);
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn no_manifest_auto_detects_granian() {
-        let root = temp_app_dir("no-manifest-granian");
-        place_venv_binary(&root, "granian");
-        let info = find_asgi_server(&root, None).unwrap();
-        assert_eq!(info.server_type, AsgiServer::Granian);
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn manifest_unknown_server_falls_back() {
-        let root = temp_app_dir("manifest-unknown");
-        place_venv_binary(&root, "uvicorn");
-        let manifest = serde_json::json!({"server": "hypercorn"});
-        let info = find_asgi_server(&root, Some(&manifest)).unwrap();
-        // Falls back to auto-detect → finds uvicorn
-        assert_eq!(info.server_type, AsgiServer::Uvicorn);
+        let result = find_uvicorn(&root, None).unwrap();
+        assert_eq!(result, root.join(".venv/bin/uvicorn"));
         fs::remove_dir_all(&root).ok();
     }
 
@@ -515,23 +333,11 @@ mod tests {
     }
 
     #[test]
-    fn reload_enabled_uvicorn() {
+    fn reload_enabled() {
         let root = temp_app_dir("reload-uvicorn");
         fs::write(root.join("app.py"), "").unwrap();
         place_venv_binary(&root, "uvicorn");
         let app = make_managed_app(&root, vec![("ASGI_RELOAD", "1")]);
-        let spec = AsgiProvider.resolve(&app).unwrap();
-        assert!(spec.args.contains(&"--reload".to_string()));
-        assert!(!spec.env.contains_key("ASGI_RELOAD"));
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn reload_enabled_granian() {
-        let root = temp_app_dir("reload-granian");
-        fs::write(root.join("app.py"), "").unwrap();
-        place_venv_binary(&root, "granian");
-        let app = make_managed_app(&root, vec![("ASGI_RELOAD", "true")]);
         let spec = AsgiProvider.resolve(&app).unwrap();
         assert!(spec.args.contains(&"--reload".to_string()));
         assert!(!spec.env.contains_key("ASGI_RELOAD"));
@@ -547,5 +353,11 @@ mod tests {
         let spec = AsgiProvider.resolve(&app).unwrap();
         assert!(!spec.args.contains(&"--reload".to_string()));
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn allocate_port_returns_nonzero() {
+        let port = super::super::provider::allocate_port().unwrap();
+        assert!(port > 0);
     }
 }
