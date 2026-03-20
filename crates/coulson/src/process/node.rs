@@ -33,6 +33,12 @@ impl ProcessProvider for NodeProvider {
             }
         }
 
+        // If a Procfile with a web process exists, defer to ProcfileProvider —
+        // the developer explicitly defined a start command.
+        if has_procfile_web(dir) {
+            return None;
+        }
+
         // Convention: package.json with scripts.dev or scripts.start
         let pkg_path = dir.join("package.json");
         if pkg_path.exists() {
@@ -224,6 +230,21 @@ fn detect_main_entry(root: &Path, pkg: &Value) -> anyhow::Result<String> {
     )
 }
 
+/// Check if a Procfile.dev or Procfile with a `web:` process exists.
+fn has_procfile_web(dir: &Path) -> bool {
+    let content = if let Ok(c) = std::fs::read_to_string(dir.join("Procfile.dev")) {
+        c
+    } else if let Ok(c) = std::fs::read_to_string(dir.join("Procfile")) {
+        c
+    } else {
+        return false;
+    };
+    content.lines().any(|l| {
+        let trimmed = l.trim();
+        trimmed.starts_with("web:") || trimmed.starts_with("web :")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +380,55 @@ mod tests {
     fn detect_main_entry_fails_no_entry() {
         let dir = temp_dir("main-none");
         assert!(detect_main_entry(&dir, &Value::Null).is_err());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_node_defers_to_procfile_with_web() {
+        let dir = temp_dir("detect-procfile-defer");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"dev":"next dev"}}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("Procfile"), "web: bin/rails s -p $PORT").unwrap();
+        let p = NodeProvider;
+        assert!(p.detect(&dir, None).is_none(), "should defer to Procfile");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_node_ignores_procfile_without_web() {
+        let dir = temp_dir("detect-procfile-no-web");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"dev":"next dev"}}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("Procfile"), "worker: sidekiq").unwrap();
+        let p = NodeProvider;
+        assert!(
+            p.detect(&dir, None).is_some(),
+            "no web: in Procfile, should still detect Node"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_node_forced_by_manifest_despite_procfile() {
+        let dir = temp_dir("detect-node-forced");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"scripts":{"dev":"next dev"}}"#,
+        )
+        .unwrap();
+        fs::write(dir.join("Procfile"), "web: bin/rails s").unwrap();
+        let manifest = serde_json::json!({ "kind": "node" });
+        let p = NodeProvider;
+        assert!(
+            p.detect(&dir, Some(&manifest)).is_some(),
+            "kind=node should force Node provider"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
