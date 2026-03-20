@@ -205,8 +205,34 @@ jobs:
           path: build/appcast.xml
           retention-days: 30
 
+  build-linux:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y capnproto cmake
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Rust daemon
+        run: cargo build --release -p coulson
+
+      - name: Upload daemon artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: coulson-linux-x86_64
+          path: target/release/coulson
+          retention-days: 30
+
   release:
-    needs: build
+    needs: [build, build-linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -215,6 +241,11 @@ jobs:
         uses: actions/download-artifact@v5
         with:
           path: artifacts
+
+      - name: Rename daemon binaries with platform suffix
+        run: |
+          mv artifacts/coulson-macos-arm64/coulson artifacts/coulson-macos-arm64/coulson-macos-arm64
+          mv artifacts/coulson-linux-x86_64/coulson artifacts/coulson-linux-x86_64/coulson-linux-x86_64
 
       - name: Display structure of downloaded files
         run: ls -R artifacts
@@ -249,11 +280,13 @@ jobs:
 
             ## Downloads
             - `Coulson-*.dmg` - macOS app (Apple Silicon)
-            - `coulson-macos-arm64` - CLI daemon only
+            - `coulson-macos-arm64` - CLI daemon (macOS)
+            - `coulson-linux-x86_64` - CLI daemon (Linux)
             - `appcast.xml` - Sparkle update feed
           files: |
             artifacts/Coulson-app-dmg/Coulson-*.dmg
-            artifacts/coulson-macos-arm64/coulson
+            artifacts/coulson-macos-arm64/coulson-macos-arm64
+            artifacts/coulson-linux-x86_64/coulson-linux-x86_64
             artifacts/appcast/appcast.xml
           draft: false
           prerelease: true
