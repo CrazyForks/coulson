@@ -5,6 +5,7 @@ mod credentials;
 mod dashboard;
 mod domain;
 mod forward;
+mod hooks;
 mod launchd;
 mod mdns;
 mod process;
@@ -37,6 +38,7 @@ use tabled::Tabled;
 
 use crate::config::{CoulsonConfig, LOCALHOST_SUFFIX};
 use crate::domain::{BackendTarget, TunnelMode};
+use crate::hooks::HookManager;
 use crate::process::{ProcessManagerHandle, ProviderRegistry};
 use crate::rpc_client::RpcClient;
 use crate::share::ShareSigner;
@@ -101,6 +103,7 @@ pub struct SharedState {
     pub network_change_tx: broadcast::Sender<()>,
     pub certs_dir: std::path::PathBuf,
     pub runtime_dir: std::path::PathBuf,
+    pub hook_manager: Arc<HookManager>,
     /// Cached privileged-port status with TTL to avoid per-request disk I/O.
     forward_cache: Arc<Mutex<(bool, std::time::Instant)>>,
 }
@@ -443,11 +446,16 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
     let (network_change_tx, _) = broadcast::channel(4);
     let idle_timeout = Duration::from_secs(cfg.idle_timeout_secs);
     let registry = Arc::new(process::default_registry());
+    let hook_manager = Arc::new(HookManager::new(
+        cfg.apps_root.join("hooks"),
+        cfg.hook_timeout_secs,
+    ));
     let process_manager = process::new_process_manager(
         idle_timeout,
         Arc::clone(&registry),
         cfg.runtime_dir.clone(),
         cfg.process_backend,
+        Arc::clone(&hook_manager),
     );
 
     Ok(SharedState {
@@ -474,6 +482,7 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
         network_change_tx,
         certs_dir: cfg.certs_dir.clone(),
         runtime_dir: cfg.runtime_dir.clone(),
+        hook_manager,
         forward_cache: Arc::new(Mutex::new((
             is_forward_configured_for_port(cfg.listen_http.port()) || is_pf_configured(cfg),
             std::time::Instant::now(),

@@ -2,6 +2,7 @@ use thiserror::Error;
 
 use crate::credentials;
 use crate::domain::{AppSpec, DomainName, TunnelMode};
+use crate::hooks::{HookContext, HookEvent};
 use crate::runtime;
 use crate::runtime::ScanWarningsFile;
 use crate::scanner::{self, ScanStats};
@@ -56,18 +57,38 @@ pub fn app_get_by_id(state: &SharedState, app_id: i64) -> Result<AppSpec, Servic
 
 pub fn app_delete(state: &SharedState, app_id: i64) -> Result<(), ServiceError> {
     let app = app_get_by_id(state, app_id)?;
+    // Snapshot per-app hooks before fs removal (which triggers watcher → clear_all_app_hooks)
+    let app_hooks_snapshot = state.hook_manager.take_app_hooks(app_id);
     if let Some(ref fs_entry) = app.fs_entry {
         scanner::remove_app_fs_entry(&state.apps_root, fs_entry);
     }
+    let ctx = hook_context_for_app(HookEvent::AppRemove, &app, state);
+
+    let restore_hooks = |snapshot: Option<crate::hooks::AppHooksConfig>| {
+        if let Some(config) = snapshot {
+            state.hook_manager.register_app_hooks(app_id, config);
+        }
+    };
+
     match state.store.delete(app_id) {
         Ok(true) => {
             state
                 .reload_routes()
                 .map_err(|e| ServiceError::Internal(e.to_string()))?;
+            let hm = state.hook_manager.clone();
+            tokio::spawn(async move {
+                hm.fire_with_hooks(&ctx, app_hooks_snapshot.as_ref()).await;
+            });
             Ok(())
         }
-        Ok(false) => Err(ServiceError::NotFound),
-        Err(e) => Err(ServiceError::Internal(e.to_string())),
+        Ok(false) => {
+            restore_hooks(app_hooks_snapshot);
+            Err(ServiceError::NotFound)
+        }
+        Err(e) => {
+            restore_hooks(app_hooks_snapshot);
+            Err(ServiceError::Internal(e.to_string()))
+        }
     }
 }
 
@@ -96,6 +117,20 @@ pub fn apps_scan(state: &SharedState) -> Result<ScanStats, ServiceError> {
     state
         .reload_routes()
         .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+    let ctx = HookContext {
+        event: HookEvent::ScanComplete,
+        app_id: None,
+        app_name: None,
+        app_domain: None,
+        app_root: None,
+        app_url: None,
+        app_kind: None,
+        tunnel_url: None,
+    };
+    let hm = state.hook_manager.clone();
+    tokio::spawn(async move { hm.fire(&ctx).await });
+
     Ok(stats)
 }
 
@@ -284,6 +319,11 @@ pub fn app_create(state: &SharedState, params: &CreateAppParams) -> Result<AppSp
     state
         .reload_routes()
         .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+    let ctx = hook_context_for_app(HookEvent::AppAdd, &app, state);
+    let hm = state.hook_manager.clone();
+    tokio::spawn(async move { hm.fire(&ctx).await });
+
     Ok(app)
 }
 
@@ -924,6 +964,32 @@ fn validate_cname_unique(
         }
     }
     Ok(())
+}
+
+fn hook_context_for_app(event: HookEvent, app: &AppSpec, state: &SharedState) -> HookContext {
+    use crate::domain::BackendTarget;
+    let port = state.listen_http.port();
+    let domain_str = &app.domain.0;
+    let url = if state.use_default_http_port() {
+        format!("http://{domain_str}")
+    } else {
+        format!("http://{domain_str}:{port}")
+    };
+    let app_root = match &app.target {
+        BackendTarget::Managed { root, .. } => Some(std::path::PathBuf::from(root)),
+        BackendTarget::StaticDir { root } => Some(std::path::PathBuf::from(root)),
+        _ => None,
+    };
+    HookContext {
+        event,
+        app_id: Some(app.id.0),
+        app_name: Some(app.name.clone()),
+        app_domain: Some(domain_str.clone()),
+        app_root,
+        app_url: Some(url),
+        app_kind: Some(format!("{:?}", app.kind).to_ascii_lowercase()),
+        tunnel_url: app.tunnel_url.clone(),
+    }
 }
 
 /// Parse the first route target from a pow-format file content.

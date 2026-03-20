@@ -20,6 +20,7 @@ use tracing::{debug, info, warn};
 use std::process::Stdio;
 
 use crate::config::ProcessBackend;
+use crate::hooks::{HookContext, HookEvent, HookManager};
 use provider::{ManagedApp, ProcessSpec};
 
 /// Dedicated tmux socket name — isolates coulson sessions from user's own tmux.
@@ -32,12 +33,14 @@ pub fn new_process_manager(
     registry: Arc<ProviderRegistry>,
     runtime_dir: PathBuf,
     backend: ProcessBackend,
+    hook_manager: Arc<HookManager>,
 ) -> ProcessManagerHandle {
     Arc::new(tokio::sync::Mutex::new(ProcessManager::new(
         idle_timeout,
         registry,
         runtime_dir,
         backend,
+        hook_manager,
     )))
 }
 
@@ -75,6 +78,10 @@ struct CompanionProcess {
 struct ProcessGroup {
     primary: ManagedProcess,
     companions: Vec<CompanionProcess>,
+    /// App name, preserved for hook context on stop/idle events.
+    name: String,
+    /// App root directory, preserved for hook context on stop/idle events.
+    root: PathBuf,
 }
 
 pub struct ProcessManager {
@@ -83,6 +90,7 @@ pub struct ProcessManager {
     registry: Arc<ProviderRegistry>,
     runtime_dir: PathBuf,
     use_tmux: bool,
+    hook_manager: Arc<HookManager>,
 }
 
 pub enum StartStatus {
@@ -111,6 +119,7 @@ impl ProcessManager {
         registry: Arc<ProviderRegistry>,
         runtime_dir: PathBuf,
         backend: ProcessBackend,
+        hook_manager: Arc<HookManager>,
     ) -> Self {
         let use_tmux = match backend {
             ProcessBackend::Tmux => {
@@ -137,7 +146,23 @@ impl ProcessManager {
             registry,
             runtime_dir,
             use_tmux,
+            hook_manager,
         }
+    }
+
+    fn fire_hook(&self, event: HookEvent, app_id: i64, name: &str, root: &Path, kind: &str) {
+        let ctx = HookContext {
+            event,
+            app_id: Some(app_id),
+            app_name: Some(name.to_string()),
+            app_domain: None,
+            app_root: Some(root.to_path_buf()),
+            app_url: None,
+            app_kind: Some(kind.to_string()),
+            tunnel_url: None,
+        };
+        let hm = self.hook_manager.clone();
+        tokio::spawn(async move { hm.fire(&ctx).await });
     }
 
     /// Whether the tmux backend is active.
@@ -214,6 +239,8 @@ impl ProcessManager {
             "starting managed process via {prov_name} provider",
         );
 
+        self.fire_hook(HookEvent::AppStart, app_id, name, root, kind);
+
         cleanup_listen_target(&spec.listen_target);
 
         let log_path = sockets_dir.join(format!("{name}.log"));
@@ -221,6 +248,8 @@ impl ProcessManager {
 
         const READY_TIMEOUT_SECS: u64 = 30;
         wait_for_ready(&spec.listen_target, Duration::from_secs(READY_TIMEOUT_SECS)).await?;
+
+        self.fire_hook(HookEvent::AppReady, app_id, name, root, kind);
 
         let companions =
             self.spawn_companions(app_id, name, root, kind, &companion_types, &sockets_dir);
@@ -238,6 +267,8 @@ impl ProcessManager {
                     ready: true,
                 },
                 companions,
+                name: name.to_string(),
+                root: root.to_path_buf(),
             },
         );
 
@@ -252,40 +283,77 @@ impl ProcessManager {
         root: &Path,
         kind: &str,
     ) -> anyhow::Result<StartStatus> {
-        if let Some(group) = self.processes.get_mut(&app_id) {
+        // Check existing process state in a limited scope to avoid borrow conflicts
+        enum ExistingState {
+            AlreadyReady(ListenTarget),
+            JustBecameReady(ListenTarget),
+            StillStarting,
+            TimedOut,
+            Exited,
+        }
+        let existing = if let Some(group) = self.processes.get_mut(&app_id) {
             if is_alive(&mut group.primary.handle) {
                 if group.primary.ready {
                     group.primary.last_active = Instant::now();
-                    return Ok(StartStatus::Ready(group.primary.listen_target.clone()));
-                }
-                // Not yet marked ready — probe
-                if quick_ready_check(&group.primary.listen_target).await {
+                    Some(ExistingState::AlreadyReady(
+                        group.primary.listen_target.clone(),
+                    ))
+                } else if quick_ready_check(&group.primary.listen_target).await {
                     group.primary.ready = true;
                     group.primary.last_active = Instant::now();
-                    return Ok(StartStatus::Ready(group.primary.listen_target.clone()));
-                }
-                // Still not ready — check startup timeout
-                const STARTUP_TIMEOUT_SECS: u64 = 30;
-                if group.primary.started_at.elapsed() > Duration::from_secs(STARTUP_TIMEOUT_SECS) {
-                    let removed = self.processes.remove(&app_id).unwrap();
-                    for companion in removed.companions {
-                        kill_handle(companion.handle).await;
+                    Some(ExistingState::JustBecameReady(
+                        group.primary.listen_target.clone(),
+                    ))
+                } else {
+                    const STARTUP_TIMEOUT_SECS: u64 = 30;
+                    if group.primary.started_at.elapsed()
+                        > Duration::from_secs(STARTUP_TIMEOUT_SECS)
+                    {
+                        Some(ExistingState::TimedOut)
+                    } else {
+                        Some(ExistingState::StillStarting)
                     }
-                    kill_handle(removed.primary.handle).await;
-                    cleanup_listen_target(&removed.primary.listen_target);
-                    anyhow::bail!(
-                        "managed process for {name} (app_id={app_id}) failed to become ready within {STARTUP_TIMEOUT_SECS}s"
-                    );
                 }
+            } else {
+                Some(ExistingState::Exited)
+            }
+        } else {
+            None
+        };
+
+        match existing {
+            Some(ExistingState::AlreadyReady(target)) => {
+                return Ok(StartStatus::Ready(target));
+            }
+            Some(ExistingState::JustBecameReady(target)) => {
+                self.fire_hook(HookEvent::AppReady, app_id, name, root, kind);
+                return Ok(StartStatus::Ready(target));
+            }
+            Some(ExistingState::StillStarting) => {
                 return Ok(StartStatus::Starting);
             }
-            info!(app_id, "managed process exited, will restart");
-            let removed = self.processes.remove(&app_id).unwrap();
-            for companion in removed.companions {
-                kill_handle(companion.handle).await;
+            Some(ExistingState::TimedOut) => {
+                let removed = self.processes.remove(&app_id).unwrap();
+                for companion in removed.companions {
+                    kill_handle(companion.handle).await;
+                }
+                kill_handle(removed.primary.handle).await;
+                cleanup_listen_target(&removed.primary.listen_target);
+                const STARTUP_TIMEOUT_SECS: u64 = 30;
+                anyhow::bail!(
+                    "managed process for {name} (app_id={app_id}) failed to become ready within {STARTUP_TIMEOUT_SECS}s"
+                );
             }
-            kill_handle(removed.primary.handle).await;
-            cleanup_listen_target(&removed.primary.listen_target);
+            Some(ExistingState::Exited) => {
+                info!(app_id, "managed process exited, will restart");
+                let removed = self.processes.remove(&app_id).unwrap();
+                for companion in removed.companions {
+                    kill_handle(companion.handle).await;
+                }
+                kill_handle(removed.primary.handle).await;
+                cleanup_listen_target(&removed.primary.listen_target);
+            }
+            None => {} // No existing process, proceed to spawn
         }
 
         let (spec, sockets_dir, prov_name, companion_types) =
@@ -298,6 +366,8 @@ impl ProcessManager {
             root = %root.display(),
             "starting managed process via {prov_name} provider (non-blocking)",
         );
+
+        self.fire_hook(HookEvent::AppStart, app_id, name, root, kind);
 
         cleanup_listen_target(&spec.listen_target);
 
@@ -320,6 +390,8 @@ impl ProcessManager {
                     ready: false,
                 },
                 companions,
+                name: name.to_string(),
+                root: root.to_path_buf(),
             },
         );
 
@@ -335,6 +407,18 @@ impl ProcessManager {
             }
             kill_handle(group.primary.handle).await;
             cleanup_listen_target(&group.primary.listen_target);
+            let ctx = HookContext {
+                event: HookEvent::AppStop,
+                app_id: Some(app_id),
+                app_name: Some(group.name),
+                app_domain: None,
+                app_root: Some(group.root),
+                app_url: None,
+                app_kind: Some(group.primary.kind),
+                tunnel_url: None,
+            };
+            let hm = self.hook_manager.clone();
+            tokio::spawn(async move { hm.fire(&ctx).await });
             true
         } else {
             false
@@ -366,11 +450,36 @@ impl ProcessManager {
                     listen = %listen_target_display(&group.primary.listen_target),
                     "reaping idle managed process"
                 );
+                // Fire AppIdle before reaping
+                let idle_ctx = HookContext {
+                    event: HookEvent::AppIdle,
+                    app_id: Some(*app_id),
+                    app_name: Some(group.name.clone()),
+                    app_domain: None,
+                    app_root: Some(group.root.clone()),
+                    app_url: None,
+                    app_kind: Some(group.primary.kind.clone()),
+                    tunnel_url: None,
+                };
+                self.hook_manager.fire(&idle_ctx).await;
                 for companion in group.companions {
                     kill_handle(companion.handle).await;
                 }
                 kill_handle(group.primary.handle).await;
                 cleanup_listen_target(&group.primary.listen_target);
+                // Fire AppStop after kill
+                let stop_ctx = HookContext {
+                    event: HookEvent::AppStop,
+                    app_id: Some(*app_id),
+                    app_name: Some(group.name),
+                    app_domain: None,
+                    app_root: Some(group.root),
+                    app_url: None,
+                    app_kind: Some(group.primary.kind),
+                    tunnel_url: None,
+                };
+                let hm = self.hook_manager.clone();
+                tokio::spawn(async move { hm.fire(&stop_ctx).await });
             }
         }
 

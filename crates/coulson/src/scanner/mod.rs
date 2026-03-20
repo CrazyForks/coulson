@@ -141,6 +141,7 @@ struct CoulsonManifest {
     #[serde(default)]
     listen_port: Option<u16>,
     routes: Option<Vec<CoulsonManifestRoute>>,
+    hooks: Option<crate::hooks::AppHooksConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,8 +183,10 @@ pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanStats> {
     let mut inserted = 0usize;
     let mut updated = 0usize;
     let mut skipped_manual = 0usize;
+    // Clear all per-app hooks before re-registering from scan results.
+    state.hook_manager.clear_all_app_hooks();
     for app in &discovered.apps {
-        let (_, op) = match app.target_type.as_str() {
+        let (spec, op) = match app.target_type.as_str() {
             "managed" => {
                 let kind_str = app_kind_to_str(app.kind);
                 state.store.upsert_scanned_managed(
@@ -225,8 +228,23 @@ pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanStats> {
             )?,
         };
         match op {
-            ScanUpsertResult::Inserted => inserted += 1,
-            ScanUpsertResult::Updated => updated += 1,
+            ScanUpsertResult::Inserted => {
+                inserted += 1;
+                // Register per-app hooks only for scan-owned apps
+                if let Some(ref hooks_config) = app.hooks {
+                    state
+                        .hook_manager
+                        .register_app_hooks(spec.id.0, hooks_config.clone());
+                }
+            }
+            ScanUpsertResult::Updated => {
+                updated += 1;
+                if let Some(ref hooks_config) = app.hooks {
+                    state
+                        .hook_manager
+                        .register_app_hooks(spec.id.0, hooks_config.clone());
+                }
+            }
             ScanUpsertResult::SkippedManual => skipped_manual += 1,
         }
         let domain_prefix = domain_to_db(&app.domain.0, &state.domain_suffix);
@@ -275,6 +293,7 @@ struct DiscoveredStaticApp {
     enabled: bool,
     explicit_domain: bool,
     fs_entry: String,
+    hooks: Option<crate::hooks::AppHooksConfig>,
 }
 
 struct DiscoverResult {
@@ -377,6 +396,7 @@ fn discover(
                     enabled: true,
                     explicit_domain: file_name.ends_with(&format!(".{suffix}")),
                     fs_entry: file_name.clone(),
+                    hooks: None,
                 };
                 insert_with_priority(&mut by_route, &mut conflicts, app);
             }
@@ -445,6 +465,7 @@ fn discover(
                         enabled: true,
                         explicit_domain,
                         fs_entry: dir_name.clone(),
+                        hooks: None,
                     };
                     insert_with_priority(&mut by_route, &mut conflicts, app);
                 }
@@ -480,6 +501,7 @@ fn discover(
                     enabled: true,
                     explicit_domain: dir_name.ends_with(&format!(".{suffix}")),
                     fs_entry: dir_name.clone(),
+                    hooks: None,
                 };
                 insert_with_priority(&mut by_route, &mut conflicts, app);
             } else if entry.path().join("public").is_dir() {
@@ -509,6 +531,7 @@ fn discover(
                     enabled: true,
                     explicit_domain: dir_name.ends_with(&format!(".{suffix}")),
                     fs_entry: dir_name.clone(),
+                    hooks: None,
                 };
                 insert_with_priority(&mut by_route, &mut conflicts, app);
             }
@@ -608,6 +631,7 @@ fn discover_from_symlink(
                 enabled: true,
                 explicit_domain,
                 fs_entry: file_name.to_string(),
+                hooks: None,
             });
         }
         return Ok(out);
@@ -659,6 +683,7 @@ fn discover_from_symlink(
                     enabled: true,
                     explicit_domain,
                     fs_entry: file_name.to_string(),
+                    hooks: None,
                 });
             }
             return Ok(out);
@@ -685,6 +710,7 @@ fn discover_from_symlink(
                 enabled: true,
                 explicit_domain,
                 fs_entry: file_name.to_string(),
+                hooks: None,
             }]);
         }
         if resolved_target.join("public").is_dir() {
@@ -706,6 +732,7 @@ fn discover_from_symlink(
                 enabled: true,
                 explicit_domain,
                 fs_entry: file_name.to_string(),
+                hooks: None,
             }]);
         }
     }
@@ -737,6 +764,7 @@ fn manifest_to_discovered_apps(
         .with_context(|| format!("invalid domain '{}' in {}", domain_text, dir_path.display()))?;
     let enabled = manifest.enabled.unwrap_or(true);
     let fs_entry = dir_name.to_string();
+    let hooks = manifest.hooks.clone();
 
     // Build a serde_json::Value from manifest for provider detection
     let manifest_value = manifest_to_json_value(manifest);
@@ -762,6 +790,7 @@ fn manifest_to_discovered_apps(
             enabled,
             explicit_domain,
             fs_entry,
+            hooks,
         }]);
     }
 
@@ -797,6 +826,7 @@ fn manifest_to_discovered_apps(
                 enabled,
                 explicit_domain,
                 fs_entry: fs_entry.clone(),
+                hooks: hooks.clone(),
             };
             out.push(app);
         }
@@ -822,6 +852,7 @@ fn manifest_to_discovered_apps(
             enabled,
             explicit_domain,
             fs_entry,
+            hooks: hooks.clone(),
         }]);
     }
 
@@ -847,6 +878,7 @@ fn manifest_to_discovered_apps(
             enabled,
             explicit_domain,
             fs_entry,
+            hooks,
         }]);
     }
 
@@ -1207,6 +1239,7 @@ mod tests {
                 enabled: true,
                 explicit_domain: false,
                 fs_entry: "myapp".to_string(),
+                hooks: None,
             },
         );
         insert_with_priority(
@@ -1229,6 +1262,7 @@ mod tests {
                 enabled: true,
                 explicit_domain: true,
                 fs_entry: "myapp.coulson.local".to_string(),
+                hooks: None,
             },
         );
         let winner = map.get("myapp.coulson.local|").expect("winner");

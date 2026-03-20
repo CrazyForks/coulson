@@ -81,6 +81,7 @@ pub struct CoulsonConfig {
     pub certs_dir: PathBuf,
     pub runtime_dir: PathBuf,
     pub process_backend: ProcessBackend,
+    pub hook_timeout_secs: u64,
 }
 
 impl Default for CoulsonConfig {
@@ -118,6 +119,7 @@ impl Default for CoulsonConfig {
             certs_dir: xdg_config_home().join(format!("{DIR_NAME}/certs")),
             runtime_dir,
             process_backend: ProcessBackend::Auto,
+            hook_timeout_secs: 60,
         }
     }
 }
@@ -169,6 +171,9 @@ impl CoulsonConfig {
             cfg.process_backend = parse_process_backend(v)
                 .with_context(|| format!("invalid process_backend in config.toml: {v}"))?;
         }
+        if let Some(v) = file.hook_timeout_secs {
+            cfg.hook_timeout_secs = v;
+        }
 
         // Layer 3: Environment variables (highest priority)
         if let Ok(addr) = env::var("COULSON_LISTEN_HTTP") {
@@ -219,6 +224,11 @@ impl CoulsonConfig {
         }
         if let Ok(path) = env::var("COULSON_RUNTIME_DIR") {
             cfg.runtime_dir = PathBuf::from(&path);
+        }
+        if let Ok(raw) = env::var("COULSON_HOOK_TIMEOUT_SECS") {
+            cfg.hook_timeout_secs = raw
+                .parse()
+                .with_context(|| format!("invalid COULSON_HOOK_TIMEOUT_SECS: {raw}"))?;
         }
         if let Ok(raw) = env::var("COULSON_PROCESS_BACKEND") {
             cfg.process_backend = parse_process_backend(&raw)
@@ -320,6 +330,7 @@ struct ConfigFile {
     certs_dir: Option<String>,
     runtime_dir: Option<String>,
     process_backend: Option<String>,
+    hook_timeout_secs: Option<u64>,
 }
 
 impl ConfigFile {
@@ -374,7 +385,8 @@ impl ConfigFile {
             inspect_max_requests,
             certs_dir,
             runtime_dir,
-            process_backend
+            process_backend,
+            hook_timeout_secs
         );
     }
 }
