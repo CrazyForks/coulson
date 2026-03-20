@@ -124,7 +124,7 @@ pub fn apps_scan(state: &SharedState) -> Result<ScanStats, ServiceError> {
         app_name: None,
         app_domain: None,
         app_root: None,
-        app_url: None,
+        app_urls: Vec::new(),
         app_kind: None,
         tunnel_url: None,
     };
@@ -967,14 +967,16 @@ fn validate_cname_unique(
 }
 
 fn hook_context_for_app(event: HookEvent, app: &AppSpec, state: &SharedState) -> HookContext {
-    use crate::domain::BackendTarget;
-    let port = state.listen_http.port();
-    let domain_str = &app.domain.0;
-    let url = if state.use_default_http_port() {
-        format!("http://{domain_str}")
-    } else {
-        format!("http://{domain_str}:{port}")
+    use crate::domain::{BackendTarget, UrlContext};
+    let url_ctx = UrlContext {
+        http_port: state.listen_http.port(),
+        https_port: state.listen_https.map(|a| a.port()),
+        use_default_http_port: state.use_default_http_port(),
+        use_default_https_port: state.use_default_https_port(),
+        domain_suffix: &state.domain_suffix,
+        global_tunnel_domain: None,
     };
+    let app_urls = app.urls(&url_ctx);
     let app_root = match &app.target {
         BackendTarget::Managed { root, .. } => Some(std::path::PathBuf::from(root)),
         BackendTarget::StaticDir { root } => Some(std::path::PathBuf::from(root)),
@@ -984,9 +986,9 @@ fn hook_context_for_app(event: HookEvent, app: &AppSpec, state: &SharedState) ->
         event,
         app_id: Some(app.id.0),
         app_name: Some(app.name.clone()),
-        app_domain: Some(domain_str.clone()),
+        app_domain: Some(app.domain.0.clone()),
         app_root,
-        app_url: Some(url),
+        app_urls,
         app_kind: Some(format!("{:?}", app.kind).to_ascii_lowercase()),
         tunnel_url: app.tunnel_url.clone(),
     }

@@ -157,7 +157,7 @@ impl ProcessManager {
             app_name: Some(name.to_string()),
             app_domain: None,
             app_root: Some(root.to_path_buf()),
-            app_url: None,
+            app_urls: Vec::new(),
             app_kind: Some(kind.to_string()),
             tunnel_url: None,
         };
@@ -413,7 +413,7 @@ impl ProcessManager {
                 app_name: Some(group.name),
                 app_domain: None,
                 app_root: Some(group.root),
-                app_url: None,
+                app_urls: Vec::new(),
                 app_kind: Some(group.primary.kind),
                 tunnel_url: None,
             };
@@ -457,7 +457,7 @@ impl ProcessManager {
                     app_name: Some(group.name.clone()),
                     app_domain: None,
                     app_root: Some(group.root.clone()),
-                    app_url: None,
+                    app_urls: Vec::new(),
                     app_kind: Some(group.primary.kind.clone()),
                     tunnel_url: None,
                 };
@@ -474,7 +474,7 @@ impl ProcessManager {
                     app_name: Some(group.name),
                     app_domain: None,
                     app_root: Some(group.root),
-                    app_url: None,
+                    app_urls: Vec::new(),
                     app_kind: Some(group.primary.kind),
                     tunnel_url: None,
                 };

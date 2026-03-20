@@ -43,7 +43,8 @@ pub struct HookContext {
     pub app_name: Option<String>,
     pub app_domain: Option<String>,
     pub app_root: Option<PathBuf>,
-    pub app_url: Option<String>,
+    /// All reachable URLs (.localhost, primary, HTTPS, tunnel).
+    pub app_urls: Vec<String>,
     pub app_kind: Option<String>,
     pub tunnel_url: Option<String>,
 }
@@ -223,8 +224,11 @@ impl HookManager {
         if let Some(ref root) = ctx.app_root {
             command.env("COULSON_APP_ROOT", root.as_os_str());
         }
-        if let Some(ref url) = ctx.app_url {
+        if let Some(url) = ctx.app_urls.first() {
             command.env("COULSON_APP_URL", url);
+        }
+        if !ctx.app_urls.is_empty() {
+            command.env("COULSON_APP_URLS", ctx.app_urls.join(","));
         }
         if let Some(ref tunnel_url) = ctx.tunnel_url {
             command.env("COULSON_TUNNEL_URL", tunnel_url);
@@ -273,14 +277,11 @@ fn build_webhook_payload(ctx: &HookContext) -> serde_json::Value {
             "id": ctx.app_id,
             "name": ctx.app_name,
             "domain": ctx.app_domain,
-            "url": ctx.app_url,
+            "urls": ctx.app_urls,
             "root": ctx.app_root.as_ref().map(|p| p.to_string_lossy().to_string()),
             "kind": ctx.app_kind,
+            "tunnel_url": ctx.tunnel_url,
         });
-    }
-
-    if let Some(ref url) = ctx.tunnel_url {
-        payload["tunnel_url"] = serde_json::json!(url);
     }
 
     payload
