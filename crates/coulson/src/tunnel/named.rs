@@ -146,6 +146,12 @@ pub async fn delete_named_tunnel(
         .context("failed to contact Cloudflare API for tunnel deletion")?;
 
     let status = resp.status();
+
+    // 404 = tunnel already deleted, treat as success for idempotency
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+
     let body: CfApiResponse<serde_json::Value> = resp
         .json()
         .await
@@ -291,6 +297,12 @@ pub async fn delete_dns_record(
         .context("failed to contact CF DNS API for record deletion")?;
 
     let status = resp.status();
+
+    // 404 = record already deleted, treat as success for idempotency
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+
     let body: CfApiResponse<serde_json::Value> = resp
         .json()
         .await

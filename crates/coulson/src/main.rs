@@ -1761,6 +1761,18 @@ fn run_add_manual(
     std::fs::create_dir_all(&cfg.apps_root)?;
     let link_path = cfg.apps_root.join(name);
     if link_path.exists() || link_path.symlink_metadata().is_ok() {
+        // Idempotent: if existing powfile has the same target, treat as success
+        if let Ok(content) = std::fs::read_to_string(&link_path) {
+            if content.trim() == target {
+                let domain = if name.contains('.') {
+                    name.to_string()
+                } else {
+                    format!("{name}.{}", cfg.domain_suffix)
+                };
+                println!("{} {domain} already registered", "=".bold());
+                return Ok(());
+            }
+        }
         bail!("{} already exists", link_path.display());
     }
 
@@ -1898,7 +1910,8 @@ fn run_rm_by_name(cfg: &CoulsonConfig, name: &str) -> anyhow::Result<()> {
     }
 
     if !removed_file && !removed_db {
-        bail!("app not found: {name}");
+        println!("{} {bare_name} not found, nothing to remove", "=".bold());
+        return Ok(());
     }
 
     if removed_file {

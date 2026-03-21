@@ -310,6 +310,8 @@ impl ProcessManager {
         {
             let log_path = sockets_dir.join(format!("{name}.log"));
             log_tail(&log_path, name);
+            // Clean up the started process/containers to avoid leaking resources
+            kill_handle(handle).await;
             return Err(e);
         }
 

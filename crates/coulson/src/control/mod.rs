@@ -570,13 +570,34 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 );
             }
 
-            // Check if already connected
+            // Idempotent: if already set up, return current tunnel info
             if state.named_tunnel.lock().is_some() {
-                return render_err(
+                let tunnel_id = state
+                    .store
+                    .get_setting("named_tunnel.credentials")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| {
+                        serde_json::from_str::<tunnel::TunnelCredentials>(&s)
+                            .ok()
+                            .map(|c| c.tunnel_id)
+                    })
+                    .unwrap_or_default();
+                let domain = state
+                    .store
+                    .get_setting("named_tunnel.domain")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let cname_target = format!("{tunnel_id}.cfargotunnel.com");
+                return ok_response(
                     req.request_id,
-                    ControlError::InvalidParams(
-                        "named tunnel already active, disconnect first".to_string(),
-                    ),
+                    json!({
+                        "tunnel_id": tunnel_id,
+                        "cname_target": cname_target,
+                        "domain": domain,
+                        "already_setup": true,
+                    }),
                 );
             }
 
@@ -791,7 +812,7 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 }
             }
 
-            // Delete DNS CNAME record (best-effort)
+            // Delete DNS CNAME record (404 is handled as Ok by delete_dns_record)
             if let (Ok(Some(zone_id)), Ok(Some(record_id))) = (
                 state.store.get_setting("named_tunnel.zone_id"),
                 state.store.get_setting("named_tunnel.dns_record_id"),
@@ -799,7 +820,7 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 if let Err(e) =
                     tunnel::named::delete_dns_record(&api_token, &zone_id, &record_id).await
                 {
-                    tracing::warn!(error = %e, "failed to delete DNS CNAME during teardown");
+                    return internal_error(req.request_id, e.to_string());
                 }
             }
 
@@ -819,11 +840,21 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
             Ok(json!({ "torn_down": true }))
         }
         "named_tunnel.connect" => {
-            if state.named_tunnel.lock().is_some() {
-                return render_err(
-                    req.request_id,
-                    ControlError::InvalidParams("named tunnel already connected".to_string()),
-                );
+            // Idempotent: if already connected, return current state
+            {
+                let guard = state.named_tunnel.lock();
+                if guard.is_some() {
+                    let domain = state
+                        .store
+                        .get_setting("named_tunnel.domain")
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    return ok_response(
+                        req.request_id,
+                        json!({ "connected": true, "domain": domain, "already_connected": true }),
+                    );
+                }
             }
 
             let params: NamedTunnelConnectParams = parse_params!(req);
@@ -912,12 +943,8 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 info!("named tunnel disconnected");
                 Ok(json!({ "disconnected": true }))
             }
-            None => {
-                return render_err(
-                    req.request_id,
-                    ControlError::InvalidParams("no named tunnel connected".to_string()),
-                );
-            }
+            // Idempotent: already disconnected
+            None => Ok(json!({ "disconnected": false })),
         },
         "named_tunnel.status" => {
             let guard = state.named_tunnel.lock();
