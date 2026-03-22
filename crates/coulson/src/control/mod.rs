@@ -66,6 +66,44 @@ impl From<ServiceError> for ControlError {
     }
 }
 
+/// Validate a tunnel domain string (e.g. "example.com", "dev.example.com").
+/// Rejects empty, wildcard (`*`), IP addresses, domains with protocols/paths,
+/// and domains that don't have at least one dot.
+fn validate_tunnel_domain(domain: &str) -> Result<(), String> {
+    let d = domain.trim();
+    if d.is_empty() {
+        return Err("domain cannot be empty".to_string());
+    }
+    if d.contains('*') {
+        return Err(format!(
+            "domain must not contain wildcards: {d} (use bare domain like example.com)"
+        ));
+    }
+    if d.contains("://") {
+        return Err(format!("domain must not include a scheme: {d}"));
+    }
+    if d.contains('/') || d.contains('?') || d.contains('#') {
+        return Err(format!("domain must not include path or query: {d}"));
+    }
+    if d.contains(':') {
+        return Err(format!("domain must not include a port: {d}"));
+    }
+    if d.contains(' ') {
+        return Err(format!("domain must not contain spaces: {d}"));
+    }
+    // Must have at least one dot (e.g. "example.com", not just "localhost")
+    if !d.contains('.') {
+        return Err(format!(
+            "domain must be a fully qualified name with at least one dot: {d}"
+        ));
+    }
+    // Reject bare IP addresses (v4)
+    if d.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Err(format!("domain must not be an IP address: {d}"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct AppIdParams {
     app_id: i64,
@@ -380,6 +418,13 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
         "app.update" => {
             let params: UpdateSettingsParams = parse_params!(req);
 
+            // Validate tunnel domain if provided
+            if let Some(ref domain) = params.app_tunnel_domain {
+                if let Err(msg) = validate_tunnel_domain(domain) {
+                    return render_err(req.request_id, ControlError::InvalidParams(msg));
+                }
+            }
+
             // Apply non-tunnel settings
             if let Err(e) = service::app_update_settings(
                 state,
@@ -563,11 +608,8 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
         "named_tunnel.setup" => {
             let params: NamedTunnelSetupParams = parse_params!(req);
 
-            if params.domain.trim().is_empty() {
-                return render_err(
-                    req.request_id,
-                    ControlError::InvalidParams("domain cannot be empty".to_string()),
-                );
+            if let Err(msg) = validate_tunnel_domain(&params.domain) {
+                return render_err(req.request_id, ControlError::InvalidParams(msg));
             }
 
             // Idempotent: if already set up, return current tunnel info
@@ -861,13 +903,14 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
 
             // If token+domain provided, decode and persist before connecting
             if let (Some(token), Some(domain)) = (&params.token, &params.domain) {
-                if token.trim().is_empty() || domain.trim().is_empty() {
+                if token.trim().is_empty() {
                     return render_err(
                         req.request_id,
-                        ControlError::InvalidParams(
-                            "token and domain must not be empty".to_string(),
-                        ),
+                        ControlError::InvalidParams("token must not be empty".to_string()),
                     );
+                }
+                if let Err(msg) = validate_tunnel_domain(domain) {
+                    return render_err(req.request_id, ControlError::InvalidParams(msg));
                 }
                 let credentials = match tunnel::decode_tunnel_token(token) {
                     Ok(v) => v,
@@ -1026,11 +1069,8 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
         "tunnel.app_setup" => {
             let params: AppTunnelSetupParams = parse_params!(req);
 
-            if params.domain.trim().is_empty() {
-                return render_err(
-                    req.request_id,
-                    ControlError::InvalidParams("domain cannot be empty".to_string()),
-                );
+            if let Err(msg) = validate_tunnel_domain(&params.domain) {
+                return render_err(req.request_id, ControlError::InvalidParams(msg));
             }
 
             // Check if app already has a tunnel
