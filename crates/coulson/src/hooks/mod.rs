@@ -297,3 +297,108 @@ async fn fire_webhook(client: &reqwest::Client, url: &str, payload: &serde_json:
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_event_as_str() {
+        assert_eq!(HookEvent::AppAdd.as_str(), "app_add");
+        assert_eq!(HookEvent::AppReady.as_str(), "app_ready");
+        assert_eq!(HookEvent::TunnelStart.as_str(), "tunnel_start");
+        assert_eq!(HookEvent::TunnelStop.as_str(), "tunnel_stop");
+        assert_eq!(HookEvent::ScanComplete.as_str(), "scan_complete");
+    }
+
+    #[test]
+    fn webhook_payload_includes_app_info() {
+        let ctx = HookContext {
+            event: HookEvent::TunnelStart,
+            app_id: Some(42),
+            app_name: Some("myapp".to_string()),
+            app_domain: Some("myapp.coulson.local".to_string()),
+            app_root: Some(std::path::PathBuf::from("/tmp/myapp")),
+            app_urls: vec![
+                "http://myapp.localhost:8080/".to_string(),
+                "https://myapp.example.com".to_string(),
+            ],
+            app_kind: Some("asgi".to_string()),
+            tunnel_url: Some("https://myapp.example.com".to_string()),
+        };
+        let payload = build_webhook_payload(&ctx);
+        assert_eq!(payload["event"], "tunnel_start");
+        assert_eq!(payload["app"]["id"], 42);
+        assert_eq!(payload["app"]["name"], "myapp");
+        assert_eq!(payload["app"]["domain"], "myapp.coulson.local");
+        assert_eq!(payload["app"]["tunnel_url"], "https://myapp.example.com");
+        let urls = payload["app"]["urls"].as_array().unwrap();
+        assert_eq!(urls.len(), 2);
+    }
+
+    #[test]
+    fn webhook_payload_without_app() {
+        let ctx = HookContext {
+            event: HookEvent::ScanComplete,
+            app_id: None,
+            app_name: None,
+            app_domain: None,
+            app_root: None,
+            app_urls: Vec::new(),
+            app_kind: None,
+            tunnel_url: None,
+        };
+        let payload = build_webhook_payload(&ctx);
+        assert_eq!(payload["event"], "scan_complete");
+        assert!(payload.get("app").is_none());
+    }
+
+    #[test]
+    fn app_hooks_config_get_action() {
+        let config = AppHooksConfig {
+            skip_global: false,
+            app_add: None,
+            app_remove: None,
+            app_start: None,
+            app_ready: Some(HookActionConfig {
+                run: Some("echo ready".to_string()),
+                webhook: None,
+            }),
+            app_stop: None,
+            app_idle: None,
+            tunnel_start: Some(HookActionConfig {
+                run: None,
+                webhook: Some("https://hooks.example.com".to_string()),
+            }),
+            tunnel_stop: None,
+        };
+        assert!(config.get_action(&HookEvent::AppReady).is_some());
+        assert!(config.get_action(&HookEvent::TunnelStart).is_some());
+        assert!(config.get_action(&HookEvent::AppStart).is_none());
+        assert!(config.get_action(&HookEvent::ScanComplete).is_none());
+    }
+
+    #[test]
+    fn app_hooks_config_deserialize_from_toml() {
+        let toml_str = r#"
+skip_global = true
+
+[tunnel_start]
+webhook = "https://hooks.example.com/tunnel"
+
+[app_ready]
+run = "mise run db:migrate"
+webhook = "https://hooks.example.com/ready"
+"#;
+        let config: AppHooksConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.skip_global);
+        let ts = config.tunnel_start.as_ref().unwrap();
+        assert!(ts.run.is_none());
+        assert_eq!(
+            ts.webhook.as_deref(),
+            Some("https://hooks.example.com/tunnel")
+        );
+        let ar = config.app_ready.as_ref().unwrap();
+        assert_eq!(ar.run.as_deref(), Some("mise run db:migrate"));
+    }
+}

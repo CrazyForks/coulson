@@ -450,13 +450,27 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
         cfg.apps_root.join("hooks"),
         cfg.hook_timeout_secs,
     ));
-    let process_manager = process::new_process_manager(
+    let process_manager = process::new_process_manager(process::ProcessManagerConfig {
         idle_timeout,
-        Arc::clone(&registry),
-        cfg.runtime_dir.clone(),
-        cfg.process_backend,
-        Arc::clone(&hook_manager),
-    );
+        registry: Arc::clone(&registry),
+        runtime_dir: cfg.runtime_dir.clone(),
+        backend: cfg.process_backend,
+        hook_manager: Arc::clone(&hook_manager),
+        store: Arc::clone(&store),
+        http_port: cfg.listen_http.port(),
+        https_port: cfg.listen_https.map(|a| a.port()),
+        use_default_http_port: cfg.listen_http.port() == 80
+            || is_forward_configured_for_port(cfg.listen_http.port())
+            || is_pf_configured_quick(&cfg.listen_http, &cfg.listen_https),
+        use_default_https_port: cfg.listen_https.is_some()
+            && (cfg.listen_https.map(|a| a.port()) == Some(443)
+                || cfg
+                    .listen_https
+                    .map(|a| is_forward_https_configured_for_port(a.port()))
+                    .unwrap_or(false)
+                || is_pf_configured_quick(&cfg.listen_http, &cfg.listen_https)),
+        domain_suffix: cfg.domain_suffix.clone(),
+    });
 
     Ok(SharedState {
         store,

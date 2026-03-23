@@ -585,6 +585,12 @@ pub async fn app_set_tunnel_mode(
 
         // Teardown old mode (best-effort)
         match old_mode {
+            TunnelMode::Quick | TunnelMode::Named | TunnelMode::Global => {
+                fire_tunnel_hook(HookEvent::TunnelStop, &app, state, None);
+            }
+            TunnelMode::None => {}
+        }
+        match old_mode {
             TunnelMode::Quick => {
                 let _ = tunnel::stop_tunnel(&state.tunnels, app_id);
                 let _ = state.store.update_tunnel_url(app_id, None);
@@ -615,6 +621,7 @@ pub async fn app_set_tunnel_mode(
                             .set_tunnel_mode(app_id, TunnelMode::Quick)
                             .map_err(|e| ServiceError::Internal(e.to_string()))?;
                         let _ = state.reload_routes();
+                        fire_tunnel_hook(HookEvent::TunnelStart, &app, state, Some(&url));
                         return Ok(TunnelModeResult {
                             tunnel_mode: TunnelMode::Quick,
                             tunnel_url: Some(url),
@@ -674,6 +681,13 @@ pub async fn app_set_tunnel_mode(
                                 TunnelMode::Named,
                             );
                             let _ = state.reload_routes();
+                            let tunnel_url = format!("https://{tunnel_domain}");
+                            fire_tunnel_hook(
+                                HookEvent::TunnelStart,
+                                &app,
+                                state,
+                                Some(&tunnel_url),
+                            );
                             return Ok(TunnelModeResult {
                                 tunnel_mode: TunnelMode::Named,
                                 tunnel_url: None,
@@ -717,6 +731,13 @@ pub async fn app_set_tunnel_mode(
                                 )
                                 .map_err(|e| ServiceError::Internal(e.to_string()))?;
                             let _ = state.reload_routes();
+                            let tunnel_url = format!("https://{tunnel_domain}");
+                            fire_tunnel_hook(
+                                HookEvent::TunnelStart,
+                                &app,
+                                state,
+                                Some(&tunnel_url),
+                            );
                             return Ok(TunnelModeResult {
                                 tunnel_mode: TunnelMode::Named,
                                 tunnel_url: None,
@@ -835,6 +856,8 @@ pub async fn app_set_tunnel_mode(
                     )
                     .map_err(|e| ServiceError::Internal(e.to_string()))?;
                 let _ = state.reload_routes();
+                let tunnel_url = format!("https://{tunnel_domain}");
+                fire_tunnel_hook(HookEvent::TunnelStart, &app, state, Some(&tunnel_url));
                 return Ok(TunnelModeResult {
                     tunnel_mode: TunnelMode::Named,
                     tunnel_url: None,
@@ -844,8 +867,21 @@ pub async fn app_set_tunnel_mode(
                     reconnected: false,
                 });
             }
-            // None / Global
-            _ => {
+            TunnelMode::Global => {
+                state
+                    .store
+                    .set_tunnel_mode(app_id, new_mode)
+                    .map_err(|e| ServiceError::Internal(e.to_string()))?;
+                let _ = state.reload_routes();
+                // Global mode: app is now reachable via the global named tunnel
+                let tunnel_url = state
+                    .named_tunnel
+                    .lock()
+                    .as_ref()
+                    .map(|h| format!("https://{}.{}", app.name, h.tunnel_domain));
+                fire_tunnel_hook(HookEvent::TunnelStart, &app, state, tunnel_url.as_deref());
+            }
+            TunnelMode::None => {
                 state
                     .store
                     .set_tunnel_mode(app_id, new_mode)
@@ -992,6 +1028,25 @@ fn hook_context_for_app(event: HookEvent, app: &AppSpec, state: &SharedState) ->
         app_kind: Some(format!("{:?}", app.kind).to_ascii_lowercase()),
         tunnel_url: app.tunnel_url.clone(),
     }
+}
+
+/// Fire a tunnel lifecycle hook (TunnelStart / TunnelStop) for a per-app tunnel.
+fn fire_tunnel_hook(
+    event: HookEvent,
+    app: &AppSpec,
+    state: &SharedState,
+    tunnel_url: Option<&str>,
+) {
+    let mut ctx = hook_context_for_app(event, app, state);
+    // Override tunnel_url with the freshly obtained value (may not be in DB yet)
+    if let Some(url) = tunnel_url {
+        ctx.tunnel_url = Some(url.to_string());
+        if !ctx.app_urls.contains(&url.to_string()) {
+            ctx.app_urls.push(url.to_string());
+        }
+    }
+    let hm = state.hook_manager.clone();
+    tokio::spawn(async move { hm.fire(&ctx).await });
 }
 
 /// Parse the first route target from a pow-format file content.

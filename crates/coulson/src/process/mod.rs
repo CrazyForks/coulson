@@ -20,7 +20,9 @@ use tracing::{debug, info, warn};
 use std::process::Stdio;
 
 use crate::config::ProcessBackend;
+use crate::domain::UrlContext;
 use crate::hooks::{HookContext, HookEvent, HookManager};
+use crate::store::AppRepository;
 use provider::{ManagedApp, ProcessSpec};
 
 /// Dedicated tmux socket name — isolates coulson sessions from user's own tmux.
@@ -28,20 +30,22 @@ const TMUX_SOCKET: &str = "coulson";
 
 pub type ProcessManagerHandle = Arc<tokio::sync::Mutex<ProcessManager>>;
 
-pub fn new_process_manager(
-    idle_timeout: Duration,
-    registry: Arc<ProviderRegistry>,
-    runtime_dir: PathBuf,
-    backend: ProcessBackend,
-    hook_manager: Arc<HookManager>,
-) -> ProcessManagerHandle {
-    Arc::new(tokio::sync::Mutex::new(ProcessManager::new(
-        idle_timeout,
-        registry,
-        runtime_dir,
-        backend,
-        hook_manager,
-    )))
+pub struct ProcessManagerConfig {
+    pub idle_timeout: Duration,
+    pub registry: Arc<ProviderRegistry>,
+    pub runtime_dir: PathBuf,
+    pub backend: ProcessBackend,
+    pub hook_manager: Arc<HookManager>,
+    pub store: Arc<AppRepository>,
+    pub http_port: u16,
+    pub https_port: Option<u16>,
+    pub use_default_http_port: bool,
+    pub use_default_https_port: bool,
+    pub domain_suffix: String,
+}
+
+pub fn new_process_manager(cfg: ProcessManagerConfig) -> ProcessManagerHandle {
+    Arc::new(tokio::sync::Mutex::new(ProcessManager::new(cfg)))
 }
 
 /// Create the default provider registry with all built-in providers.
@@ -103,6 +107,12 @@ pub struct ProcessManager {
     runtime_dir: PathBuf,
     use_tmux: bool,
     hook_manager: Arc<HookManager>,
+    store: Arc<AppRepository>,
+    http_port: u16,
+    https_port: Option<u16>,
+    use_default_http_port: bool,
+    use_default_https_port: bool,
+    domain_suffix: String,
 }
 
 pub enum StartStatus {
@@ -126,14 +136,8 @@ pub struct ProcessInfo {
 }
 
 impl ProcessManager {
-    pub fn new(
-        idle_timeout: Duration,
-        registry: Arc<ProviderRegistry>,
-        runtime_dir: PathBuf,
-        backend: ProcessBackend,
-        hook_manager: Arc<HookManager>,
-    ) -> Self {
-        let use_tmux = match backend {
+    fn new(cfg: ProcessManagerConfig) -> Self {
+        let use_tmux = match cfg.backend {
             ProcessBackend::Tmux => {
                 if !tmux_available() {
                     warn!("COULSON_PROCESS_BACKEND=tmux but tmux not found in PATH");
@@ -154,24 +158,46 @@ impl ProcessManager {
 
         Self {
             processes: HashMap::new(),
-            idle_timeout,
-            registry,
-            runtime_dir,
+            idle_timeout: cfg.idle_timeout,
+            registry: cfg.registry,
+            runtime_dir: cfg.runtime_dir,
             use_tmux,
-            hook_manager,
+            hook_manager: cfg.hook_manager,
+            store: cfg.store,
+            http_port: cfg.http_port,
+            https_port: cfg.https_port,
+            use_default_http_port: cfg.use_default_http_port,
+            use_default_https_port: cfg.use_default_https_port,
+            domain_suffix: cfg.domain_suffix,
         }
     }
 
     fn fire_hook(&self, event: HookEvent, app_id: i64, name: &str, root: &Path, kind: &str) {
+        // Try to enrich context from the store (domain, URLs, tunnel info)
+        let (domain, app_urls, tunnel_url) = if let Ok(Some(app)) = self.store.get_by_id(app_id) {
+            let url_ctx = UrlContext {
+                http_port: self.http_port,
+                https_port: self.https_port,
+                use_default_http_port: self.use_default_http_port,
+                use_default_https_port: self.use_default_https_port,
+                domain_suffix: &self.domain_suffix,
+                global_tunnel_domain: None,
+            };
+            let urls = app.urls(&url_ctx);
+            (Some(app.domain.0.clone()), urls, app.tunnel_url.clone())
+        } else {
+            (None, Vec::new(), None)
+        };
+
         let ctx = HookContext {
             event,
             app_id: Some(app_id),
             app_name: Some(name.to_string()),
-            app_domain: None,
+            app_domain: domain,
             app_root: Some(root.to_path_buf()),
-            app_urls: Vec::new(),
+            app_urls,
             app_kind: Some(kind.to_string()),
-            tunnel_url: None,
+            tunnel_url,
         };
         let hm = self.hook_manager.clone();
         tokio::spawn(async move { hm.fire(&ctx).await });

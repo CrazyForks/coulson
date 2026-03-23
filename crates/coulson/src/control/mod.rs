@@ -1258,3 +1258,65 @@ fn ok_response(request_id: String, result: serde_json::Value) -> ResponseEnvelop
 fn internal_error(request_id: String, message: String) -> ResponseEnvelope {
     render_err(request_id, ControlError::Internal(message))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- validate_tunnel_domain --
+
+    #[test]
+    fn valid_domains() {
+        assert!(validate_tunnel_domain("example.com").is_ok());
+        assert!(validate_tunnel_domain("dev.example.com").is_ok());
+        assert!(validate_tunnel_domain("a.b.c.d.example.com").is_ok());
+        assert!(validate_tunnel_domain("  example.com  ").is_ok()); // trimmed
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(validate_tunnel_domain("").is_err());
+        assert!(validate_tunnel_domain("  ").is_err());
+    }
+
+    #[test]
+    fn rejects_wildcard() {
+        assert!(validate_tunnel_domain("*.example.com").is_err());
+        assert!(validate_tunnel_domain("example.*.com").is_err());
+    }
+
+    #[test]
+    fn rejects_scheme() {
+        assert!(validate_tunnel_domain("https://example.com").is_err());
+        assert!(validate_tunnel_domain("http://example.com").is_err());
+    }
+
+    #[test]
+    fn rejects_path_query_fragment() {
+        assert!(validate_tunnel_domain("example.com/path").is_err());
+        assert!(validate_tunnel_domain("example.com?q=1").is_err());
+        assert!(validate_tunnel_domain("example.com#frag").is_err());
+    }
+
+    #[test]
+    fn rejects_port() {
+        assert!(validate_tunnel_domain("example.com:8080").is_err());
+    }
+
+    #[test]
+    fn rejects_spaces() {
+        assert!(validate_tunnel_domain("example .com").is_err());
+    }
+
+    #[test]
+    fn rejects_single_label() {
+        assert!(validate_tunnel_domain("localhost").is_err());
+        assert!(validate_tunnel_domain("myapp").is_err());
+    }
+
+    #[test]
+    fn rejects_ip_address() {
+        assert!(validate_tunnel_domain("127.0.0.1").is_err());
+        assert!(validate_tunnel_domain("192.168.1.1").is_err());
+    }
+}
