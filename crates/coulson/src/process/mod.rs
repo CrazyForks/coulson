@@ -1031,6 +1031,33 @@ pub async fn prefetch_env_url(root: &Path) -> anyhow::Result<Option<HashMap<Stri
     Ok(Some(env))
 }
 
+/// Encapsulates the lock-drop-prefetch-relock dance for starting a managed process.
+///
+/// If the process is already alive, skips the env_url prefetch entirely.
+/// Otherwise, drops the PM lock, fetches env_url, re-acquires the lock,
+/// and calls `ensure_started`.
+pub async fn prepare_and_ensure_started(
+    pm: &ProcessManagerHandle,
+    app_id: i64,
+    name: &str,
+    root: &Path,
+    kind: &str,
+) -> anyhow::Result<StartStatus> {
+    let env_url_env = {
+        let mut guard = pm.lock().await;
+        if guard.has_live_process(app_id) {
+            None
+        } else {
+            drop(guard);
+            prefetch_env_url(root).await?
+        }
+    };
+    let mut guard = pm.lock().await;
+    guard
+        .ensure_started(app_id, name, root, kind, env_url_env)
+        .await
+}
+
 /// Build the full shell command string from a ProcessSpec.
 /// Procfile specs have an empty command and a single args element (the raw shell command).
 /// ASGI/Node specs have a binary command and separate args.
