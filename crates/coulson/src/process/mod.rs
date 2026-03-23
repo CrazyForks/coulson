@@ -238,22 +238,11 @@ impl ProcessManager {
             cleanup_listen_target(&removed.primary.listen_target);
         }
 
-        let (mut spec, sockets_dir, prov_name, companion_types) =
+        let (mut spec, sockets_dir, prov_name, companion_types, manifest) =
             self.resolve_spec(app_id, name, root, kind)?;
 
-        // Merge pre-fetched env_url vars, then re-apply [env] so local config wins
         if let Some(remote_env) = env_url_env {
-            spec.env.extend(remote_env);
-            // Re-apply [env] from manifest so explicit local values override remote
-            if let Some(ref manifest) = load_coulson_toml_manifest(root) {
-                if let Some(env_obj) = manifest.get("env").and_then(|v| v.as_object()) {
-                    for (k, v) in env_obj {
-                        if let Some(val) = v.as_str() {
-                            spec.env.insert(k.clone(), val.to_string());
-                        }
-                    }
-                }
-            }
+            merge_remote_env(&mut spec, remote_env, &manifest);
         }
 
         info!(
@@ -445,21 +434,11 @@ impl ProcessManager {
             None => {} // No existing process, proceed to spawn
         }
 
-        let (mut spec, sockets_dir, prov_name, companion_types) =
+        let (mut spec, sockets_dir, prov_name, companion_types, manifest) =
             self.resolve_spec(app_id, name, root, kind)?;
 
-        // Merge pre-fetched env_url vars, then re-apply [env] so local config wins
         if let Some(remote_env) = env_url_env {
-            spec.env.extend(remote_env);
-            if let Some(ref manifest) = load_coulson_toml_manifest(root) {
-                if let Some(env_obj) = manifest.get("env").and_then(|v| v.as_object()) {
-                    for (k, v) in env_obj {
-                        if let Some(val) = v.as_str() {
-                            spec.env.insert(k.clone(), val.to_string());
-                        }
-                    }
-                }
-            }
+            merge_remote_env(&mut spec, remote_env, &manifest);
         }
 
         info!(
@@ -639,13 +618,22 @@ impl ProcessManager {
     }
 
     /// Resolve a ProcessSpec from the provider registry.
+    /// Returns the spec, sockets directory, provider name, companion types,
+    /// and the loaded `.coulson.toml` manifest (if any) for env re-application.
+    #[allow(clippy::type_complexity)]
     fn resolve_spec(
         &self,
         app_id: i64,
         name: &str,
         root: &Path,
         kind: &str,
-    ) -> anyhow::Result<(ProcessSpec, PathBuf, String, Vec<String>)> {
+    ) -> anyhow::Result<(
+        ProcessSpec,
+        PathBuf,
+        String,
+        Vec<String>,
+        Option<serde_json::Value>,
+    )> {
         let prov = self
             .registry
             .get(kind)
@@ -688,15 +676,7 @@ impl ProcessManager {
         spec.env.remove("COULSON_MANAGED_SERVICES");
 
         // Inject [env] from .coulson.toml (overrides provider defaults and .coulsonrc)
-        if let Some(ref manifest) = managed_app.manifest {
-            if let Some(env_obj) = manifest.get("env").and_then(|v| v.as_object()) {
-                for (k, v) in env_obj {
-                    if let Some(val) = v.as_str() {
-                        spec.env.insert(k.clone(), val.to_string());
-                    }
-                }
-            }
-        }
+        apply_manifest_env(&mut spec, &managed_app.manifest);
 
         let _ = app_id; // used in caller for logging
         Ok((
@@ -704,6 +684,7 @@ impl ProcessManager {
             sockets_dir,
             prov.display_name().to_string(),
             companion_types,
+            managed_app.manifest,
         ))
     }
 
@@ -933,6 +914,30 @@ fn load_coulson_toml_manifest(root: &Path) -> Option<serde_json::Value> {
         Err(e) => {
             tracing::error!(path = %toml_path.display(), %e, "failed to convert .coulson.toml to JSON");
             None
+        }
+    }
+}
+
+/// Merge pre-fetched remote env vars into a spec, then re-apply `[env]` from
+/// the manifest so local config wins over remote values.
+fn merge_remote_env(
+    spec: &mut ProcessSpec,
+    remote_env: HashMap<String, String>,
+    manifest: &Option<serde_json::Value>,
+) {
+    spec.env.extend(remote_env);
+    apply_manifest_env(spec, manifest);
+}
+
+/// Apply `[env]` section from a `.coulson.toml` manifest into a ProcessSpec.
+fn apply_manifest_env(spec: &mut ProcessSpec, manifest: &Option<serde_json::Value>) {
+    if let Some(m) = manifest {
+        if let Some(env_obj) = m.get("env").and_then(|v| v.as_object()) {
+            for (k, v) in env_obj {
+                if let Some(val) = v.as_str() {
+                    spec.env.insert(k.clone(), val.to_string());
+                }
+            }
         }
     }
 }
