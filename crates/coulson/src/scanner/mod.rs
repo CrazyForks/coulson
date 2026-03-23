@@ -146,6 +146,15 @@ struct CoulsonManifest {
     compose_file: Option<String>,
     routes: Option<Vec<CoulsonManifestRoute>>,
     hooks: Option<crate::hooks::AppHooksConfig>,
+    #[serde(default)]
+    #[allow(dead_code)] // read via manifest_to_json_value() serialization
+    env: Option<std::collections::HashMap<String, String>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    env_url: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    env_url_headers: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]

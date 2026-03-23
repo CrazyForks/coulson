@@ -531,41 +531,50 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                     );
                 }
             };
+            if req.method == "process.stop" {
+                let mut pm = state.process_manager.lock().await;
+                let killed = pm.kill_process(params.app_id).await;
+                return ok_response(req.request_id, json!({ "stopped": killed }));
+            }
+            // Pre-fetch env_url outside the lock (only needed for start/restart)
+            let env_url_env =
+                match crate::process::prefetch_env_url(std::path::Path::new(&root)).await {
+                    Ok(v) => v,
+                    Err(e) => return internal_error(req.request_id, e.to_string()),
+                };
+            // start and restart both ensure the process is running;
+            // restart kills first.
             let mut pm = state.process_manager.lock().await;
-            match req.method.as_str() {
-                "process.stop" => {
-                    let killed = pm.kill_process(params.app_id).await;
-                    Ok(json!({ "stopped": killed }))
-                }
-                _ => {
-                    // start and restart both ensure the process is running;
-                    // restart kills first.
-                    if req.method == "process.restart" {
-                        pm.kill_process(params.app_id).await;
-                    }
-                    match pm
-                        .ensure_running(params.app_id, &name, std::path::Path::new(&root), &kind)
-                        .await
-                    {
-                        Ok(listen_target) => {
-                            let listen_json = match &listen_target {
-                                crate::process::ListenTarget::Uds(path) => {
-                                    json!({ "type": "uds", "path": path.to_string_lossy() })
-                                }
-                                crate::process::ListenTarget::Tcp { host, port } => {
-                                    json!({ "type": "tcp", "host": host, "port": port })
-                                }
-                            };
-                            let action = if req.method == "process.restart" {
-                                "restarted"
-                            } else {
-                                "started"
-                            };
-                            Ok(json!({ action: true, "listen": listen_json }))
+            if req.method == "process.restart" {
+                pm.kill_process(params.app_id).await;
+            }
+            match pm
+                .ensure_running(
+                    params.app_id,
+                    &name,
+                    std::path::Path::new(&root),
+                    &kind,
+                    env_url_env,
+                )
+                .await
+            {
+                Ok(listen_target) => {
+                    let listen_json = match &listen_target {
+                        crate::process::ListenTarget::Uds(path) => {
+                            json!({ "type": "uds", "path": path.to_string_lossy() })
                         }
-                        Err(e) => return internal_error(req.request_id, e.to_string()),
-                    }
+                        crate::process::ListenTarget::Tcp { host, port } => {
+                            json!({ "type": "tcp", "host": host, "port": port })
+                        }
+                    };
+                    let action = if req.method == "process.restart" {
+                        "restarted"
+                    } else {
+                        "started"
+                    };
+                    Ok(json!({ action: true, "listen": listen_json }))
                 }
+                Err(e) => return internal_error(req.request_id, e.to_string()),
             }
         }
         "apps.warnings" => service::apps_warnings(state)

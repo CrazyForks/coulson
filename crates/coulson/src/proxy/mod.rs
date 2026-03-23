@@ -255,9 +255,22 @@ impl ProxyHttp for BridgeProxy {
                     } = route.target
                     {
                         let root_path = std::path::PathBuf::from(root);
+                        // Only prefetch env_url if the process isn't already ready
+                        let env_url_env =
+                            {
+                                let mut pm = self.process_manager.lock().await;
+                                if pm.has_live_process(*app_id) {
+                                    None
+                                } else {
+                                    drop(pm);
+                                    crate::process::prefetch_env_url(&root_path).await.map_err(
+                                        |e| Error::explain(ErrorType::ConnectError, format!("{e}")),
+                                    )?
+                                }
+                            };
                         let status = {
                             let mut pm = self.process_manager.lock().await;
-                            pm.ensure_started(*app_id, name, &root_path, kind)
+                            pm.ensure_started(*app_id, name, &root_path, kind, env_url_env)
                                 .await
                                 .map_err(|e| {
                                     Error::explain(ErrorType::ConnectError, format!("{e}"))
@@ -381,9 +394,20 @@ impl ProxyHttp for BridgeProxy {
         } = route.target
         {
             let root_path = std::path::PathBuf::from(root);
+            let env_url_env = {
+                let mut pm = self.process_manager.lock().await;
+                if pm.has_live_process(*app_id) {
+                    None
+                } else {
+                    drop(pm);
+                    crate::process::prefetch_env_url(&root_path)
+                        .await
+                        .map_err(|e| Error::explain(ErrorType::ConnectError, format!("{e}")))?
+                }
+            };
             let status = {
                 let mut pm = self.process_manager.lock().await;
-                pm.ensure_started(*app_id, name, &root_path, kind)
+                pm.ensure_started(*app_id, name, &root_path, kind, env_url_env)
                     .await
                     .map_err(|e| Error::explain(ErrorType::ConnectError, format!("{e}")))?
             };
@@ -1280,11 +1304,14 @@ async fn await_managed_ready(
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
     const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
     let deadline = tokio::time::Instant::now() + MAX_WAIT;
+    let env_url_env = crate::process::prefetch_env_url(root)
+        .await
+        .map_err(|e| Error::explain(ErrorType::ConnectError, format!("{e}")))?;
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
         let status = {
             let mut pm = pm.lock().await;
-            pm.ensure_started(app_id, name, root, kind)
+            pm.ensure_started(app_id, name, root, kind, env_url_env.clone())
                 .await
                 .map_err(|e| Error::explain(ErrorType::ConnectError, format!("{e}")))?
         };

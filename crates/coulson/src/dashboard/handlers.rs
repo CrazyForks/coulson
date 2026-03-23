@@ -507,10 +507,19 @@ pub async fn action_restart_process(
             root, kind, name, ..
         } = &app.target
         {
+            let env_url_env = match crate::process::prefetch_env_url(std::path::Path::new(root))
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(app_id, error = %e, "env_url fetch failed, aborting restart");
+                    return Redirect::to("/processes");
+                }
+            };
             let mut pm = state.shared.process_manager.lock().await;
             pm.kill_process(app_id).await;
             let _ = pm
-                .ensure_running(app_id, name, std::path::Path::new(root), kind)
+                .ensure_running(app_id, name, std::path::Path::new(root), kind, env_url_env)
                 .await;
         }
     }

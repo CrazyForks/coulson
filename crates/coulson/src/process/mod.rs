@@ -208,6 +208,16 @@ impl ProcessManager {
         self.use_tmux
     }
 
+    /// Quick check: is there a live process for this app_id (ready or starting)?
+    /// Used by proxy to skip env_url prefetch when process already exists.
+    pub fn has_live_process(&mut self, app_id: i64) -> bool {
+        if let Some(group) = self.processes.get_mut(&app_id) {
+            is_alive(&mut group.primary.handle)
+        } else {
+            false
+        }
+    }
+
     pub fn list_status(&mut self) -> Vec<ProcessInfo> {
         let now = Instant::now();
         let mut result = Vec::new();
@@ -244,12 +254,14 @@ impl ProcessManager {
     }
 
     /// Returns the listen target for the managed app, starting the process if needed.
+    /// `env_url_env` should be pre-fetched outside the lock via `prefetch_env_url()`.
     pub async fn ensure_running(
         &mut self,
         app_id: i64,
         name: &str,
         root: &Path,
         kind: &str,
+        env_url_env: Option<HashMap<String, String>>,
     ) -> anyhow::Result<ListenTarget> {
         // Check if already running and alive
         if let Some(group) = self.processes.get_mut(&app_id) {
@@ -266,8 +278,23 @@ impl ProcessManager {
             cleanup_listen_target(&removed.primary.listen_target);
         }
 
-        let (spec, sockets_dir, prov_name, companion_types) =
+        let (mut spec, sockets_dir, prov_name, companion_types) =
             self.resolve_spec(app_id, name, root, kind)?;
+
+        // Merge pre-fetched env_url vars, then re-apply [env] so local config wins
+        if let Some(remote_env) = env_url_env {
+            spec.env.extend(remote_env);
+            // Re-apply [env] from manifest so explicit local values override remote
+            if let Some(ref manifest) = load_coulson_toml_manifest(root) {
+                if let Some(env_obj) = manifest.get("env").and_then(|v| v.as_object()) {
+                    for (k, v) in env_obj {
+                        if let Some(val) = v.as_str() {
+                            spec.env.insert(k.clone(), val.to_string());
+                        }
+                    }
+                }
+            }
+        }
 
         info!(
             app_id,
@@ -368,12 +395,14 @@ impl ProcessManager {
     }
 
     /// Non-blocking variant: spawns the process if needed but does NOT wait for readiness.
+    /// `env_url_env` should be pre-fetched outside the lock via `prefetch_env_url()`.
     pub async fn ensure_started(
         &mut self,
         app_id: i64,
         name: &str,
         root: &Path,
         kind: &str,
+        env_url_env: Option<HashMap<String, String>>,
     ) -> anyhow::Result<StartStatus> {
         // Check existing process state in a limited scope to avoid borrow conflicts
         enum ExistingState {
@@ -456,8 +485,22 @@ impl ProcessManager {
             None => {} // No existing process, proceed to spawn
         }
 
-        let (spec, sockets_dir, prov_name, companion_types) =
+        let (mut spec, sockets_dir, prov_name, companion_types) =
             self.resolve_spec(app_id, name, root, kind)?;
+
+        // Merge pre-fetched env_url vars, then re-apply [env] so local config wins
+        if let Some(remote_env) = env_url_env {
+            spec.env.extend(remote_env);
+            if let Some(ref manifest) = load_coulson_toml_manifest(root) {
+                if let Some(env_obj) = manifest.get("env").and_then(|v| v.as_object()) {
+                    for (k, v) in env_obj {
+                        if let Some(val) = v.as_str() {
+                            spec.env.insert(k.clone(), val.to_string());
+                        }
+                    }
+                }
+            }
+        }
 
         info!(
             app_id,
@@ -697,6 +740,17 @@ impl ProcessManager {
         // Do not pass COULSON_MANAGED_SERVICES to child processes
         spec.env.remove("COULSON_MANAGED_SERVICES");
 
+        // Inject [env] from .coulson.toml (overrides provider defaults and .coulsonrc)
+        if let Some(ref manifest) = managed_app.manifest {
+            if let Some(env_obj) = manifest.get("env").and_then(|v| v.as_object()) {
+                for (k, v) in env_obj {
+                    if let Some(val) = v.as_str() {
+                        spec.env.insert(k.clone(), val.to_string());
+                    }
+                }
+            }
+        }
+
         let _ = app_id; // used in caller for logging
         Ok((
             spec,
@@ -934,6 +988,95 @@ fn load_coulson_toml_manifest(root: &Path) -> Option<serde_json::Value> {
             None
         }
     }
+}
+
+/// Parse environment variables from a response body.
+/// JSON (`content_type` contains "json"): `{"KEY": "value", ...}`
+/// Otherwise dotenv format: `KEY=value` per line.
+fn parse_env_body(body: &str, content_type: &str) -> anyhow::Result<HashMap<String, String>> {
+    let mut env = HashMap::new();
+    if content_type.contains("json") {
+        let obj: serde_json::Value =
+            serde_json::from_str(body).context("env_url returned invalid JSON")?;
+        if let Some(map) = obj.as_object() {
+            for (k, v) in map {
+                match v {
+                    serde_json::Value::String(s) => {
+                        env.insert(k.clone(), s.clone());
+                    }
+                    other => {
+                        env.insert(k.clone(), other.to_string());
+                    }
+                }
+            }
+        }
+    } else {
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            if let Some((k, v)) = line.split_once('=') {
+                let v = v.trim_matches('"').trim_matches('\'');
+                env.insert(k.trim().to_string(), v.to_string());
+            }
+        }
+    }
+    Ok(env)
+}
+
+/// Fetch environment variables from a remote URL (env_url in .coulson.toml).
+/// Supports JSON object `{"KEY": "value"}` and dotenv `KEY=value` formats,
+/// auto-detected by Content-Type header.
+async fn fetch_env_url(
+    url: &str,
+    headers: Option<&serde_json::Value>,
+) -> anyhow::Result<HashMap<String, String>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let mut req = client.get(url);
+    if let Some(hdrs) = headers.and_then(|v| v.as_object()) {
+        for (k, v) in hdrs {
+            if let Some(val) = v.as_str() {
+                req = req.header(k.as_str(), val);
+            }
+        }
+    }
+    let resp = req.send().await.context("failed to fetch env_url")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("env_url returned {}", resp.status());
+    }
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = resp.text().await.context("failed to read env_url body")?;
+
+    parse_env_body(&body, &content_type)
+}
+
+/// Pre-fetch environment variables from `env_url` in `.coulson.toml`.
+/// Call this OUTSIDE the ProcessManager lock to avoid blocking other operations.
+/// Returns `Ok(None)` if no `env_url` is configured, `Ok(Some(...))` on success,
+/// or `Err` if `env_url` is configured but the fetch failed.
+pub async fn prefetch_env_url(root: &Path) -> anyhow::Result<Option<HashMap<String, String>>> {
+    let manifest = match load_coulson_toml_manifest(root) {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+    let url = match manifest.get("env_url").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return Ok(None),
+    };
+    let env = fetch_env_url(url, manifest.get("env_url_headers"))
+        .await
+        .with_context(|| format!("failed to fetch env_url {url}"))?;
+    debug!(url, count = env.len(), "pre-fetched env from env_url");
+    Ok(Some(env))
 }
 
 /// Build the full shell command string from a ProcessSpec.
@@ -1437,5 +1580,160 @@ mod tests {
     fn parse_managed_services_no_web() {
         let result = parse_managed_services(Some("worker,scheduler"));
         assert_eq!(result, vec!["worker", "scheduler"]);
+    }
+
+    // -- env body parsing --
+
+    #[test]
+    fn parse_env_body_json() {
+        let body = r#"{"DB_URL": "postgres://localhost/db", "PORT": "5000"}"#;
+        let env = parse_env_body(body, "application/json").unwrap();
+        assert_eq!(env.get("DB_URL").unwrap(), "postgres://localhost/db");
+        assert_eq!(env.get("PORT").unwrap(), "5000");
+    }
+
+    #[test]
+    fn parse_env_body_json_non_string_values() {
+        let body = r#"{"COUNT": 42, "ENABLED": true}"#;
+        let env = parse_env_body(body, "application/json").unwrap();
+        assert_eq!(env.get("COUNT").unwrap(), "42");
+        assert_eq!(env.get("ENABLED").unwrap(), "true");
+    }
+
+    #[test]
+    fn parse_env_body_json_empty_object() {
+        let env = parse_env_body("{}", "application/json").unwrap();
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn parse_env_body_json_invalid() {
+        let result = parse_env_body("not json", "application/json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_env_body_dotenv() {
+        let body = "DB_URL=postgres://localhost/db\nPORT=5000\n";
+        let env = parse_env_body(body, "text/plain").unwrap();
+        assert_eq!(env.get("DB_URL").unwrap(), "postgres://localhost/db");
+        assert_eq!(env.get("PORT").unwrap(), "5000");
+    }
+
+    #[test]
+    fn parse_env_body_dotenv_with_quotes() {
+        let body = "SECRET=\"my secret\"\nKEY='value'\n";
+        let env = parse_env_body(body, "text/plain").unwrap();
+        assert_eq!(env.get("SECRET").unwrap(), "my secret");
+        assert_eq!(env.get("KEY").unwrap(), "value");
+    }
+
+    #[test]
+    fn parse_env_body_dotenv_with_export() {
+        let body = "export DB=postgres\nexport PORT=3000\n";
+        let env = parse_env_body(body, "text/plain").unwrap();
+        assert_eq!(env.get("DB").unwrap(), "postgres");
+        assert_eq!(env.get("PORT").unwrap(), "3000");
+    }
+
+    #[test]
+    fn parse_env_body_dotenv_comments_and_blanks() {
+        let body = "# comment\n\nKEY=value\n  # another comment\n";
+        let env = parse_env_body(body, "text/plain").unwrap();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env.get("KEY").unwrap(), "value");
+    }
+
+    #[test]
+    fn parse_env_body_dotenv_empty() {
+        let env = parse_env_body("", "text/plain").unwrap();
+        assert!(env.is_empty());
+    }
+
+    // -- .coulson.toml [env] injection into ProcessSpec --
+
+    #[test]
+    fn manifest_env_injected_into_spec() {
+        use std::fs;
+        let dir =
+            std::env::temp_dir().join(format!("coulson-test-env-inject-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Create a .coulson.toml with [env]
+        fs::write(
+            dir.join(".coulson.toml"),
+            r#"
+kind = "procfile"
+[env]
+MY_VAR = "from_toml"
+OVERRIDE = "toml_wins"
+"#,
+        )
+        .unwrap();
+
+        // Create a Procfile so procfile provider detects it
+        fs::write(dir.join("Procfile"), "web: echo hello").unwrap();
+
+        let manifest = load_coulson_toml_manifest(&dir);
+        assert!(manifest.is_some());
+        let manifest = manifest.unwrap();
+        let env_obj = manifest.get("env").and_then(|v| v.as_object());
+        assert!(env_obj.is_some());
+        let env_obj = env_obj.unwrap();
+        assert_eq!(
+            env_obj.get("MY_VAR").and_then(|v| v.as_str()),
+            Some("from_toml")
+        );
+        assert_eq!(
+            env_obj.get("OVERRIDE").and_then(|v| v.as_str()),
+            Some("toml_wins")
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- prefetch_env_url returns None when no env_url configured --
+
+    #[tokio::test]
+    async fn prefetch_env_url_none_when_no_manifest() {
+        let dir =
+            std::env::temp_dir().join(format!("coulson-test-prefetch-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // No .coulson.toml at all
+        let result = prefetch_env_url(&dir).await.unwrap();
+        assert!(result.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn prefetch_env_url_none_when_no_env_url_field() {
+        let dir = std::env::temp_dir().join(format!(
+            "coulson-test-prefetch-nofield-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".coulson.toml"), "kind = \"asgi\"\n").unwrap();
+        let result = prefetch_env_url(&dir).await.unwrap();
+        assert!(result.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn prefetch_env_url_err_when_url_unreachable() {
+        let dir =
+            std::env::temp_dir().join(format!("coulson-test-prefetch-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".coulson.toml"),
+            "env_url = \"http://127.0.0.1:1/nonexistent\"\n",
+        )
+        .unwrap();
+        let result = prefetch_env_url(&dir).await;
+        assert!(result.is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
