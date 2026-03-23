@@ -20,9 +20,7 @@ use tracing::{debug, info, warn};
 use std::process::Stdio;
 
 use crate::config::ProcessBackend;
-use crate::domain::UrlContext;
-use crate::hooks::{HookContext, HookEvent, HookManager};
-use crate::store::AppRepository;
+use crate::hooks::{HookContextFactory, HookEvent, HookManager};
 use provider::{ManagedApp, ProcessSpec};
 
 /// Dedicated tmux socket name — isolates coulson sessions from user's own tmux.
@@ -36,12 +34,7 @@ pub struct ProcessManagerConfig {
     pub runtime_dir: PathBuf,
     pub backend: ProcessBackend,
     pub hook_manager: Arc<HookManager>,
-    pub store: Arc<AppRepository>,
-    pub http_port: u16,
-    pub https_port: Option<u16>,
-    pub use_default_http_port: bool,
-    pub use_default_https_port: bool,
-    pub domain_suffix: String,
+    pub hook_factory: HookContextFactory,
 }
 
 pub fn new_process_manager(cfg: ProcessManagerConfig) -> ProcessManagerHandle {
@@ -107,12 +100,7 @@ pub struct ProcessManager {
     runtime_dir: PathBuf,
     use_tmux: bool,
     hook_manager: Arc<HookManager>,
-    store: Arc<AppRepository>,
-    http_port: u16,
-    https_port: Option<u16>,
-    use_default_http_port: bool,
-    use_default_https_port: bool,
-    domain_suffix: String,
+    hook_factory: HookContextFactory,
 }
 
 pub enum StartStatus {
@@ -163,42 +151,14 @@ impl ProcessManager {
             runtime_dir: cfg.runtime_dir,
             use_tmux,
             hook_manager: cfg.hook_manager,
-            store: cfg.store,
-            http_port: cfg.http_port,
-            https_port: cfg.https_port,
-            use_default_http_port: cfg.use_default_http_port,
-            use_default_https_port: cfg.use_default_https_port,
-            domain_suffix: cfg.domain_suffix,
+            hook_factory: cfg.hook_factory,
         }
     }
 
     fn fire_hook(&self, event: HookEvent, app_id: i64, name: &str, root: &Path, kind: &str) {
-        // Try to enrich context from the store (domain, URLs, tunnel info)
-        let (domain, app_urls, tunnel_url) = if let Ok(Some(app)) = self.store.get_by_id(app_id) {
-            let url_ctx = UrlContext {
-                http_port: self.http_port,
-                https_port: self.https_port,
-                use_default_http_port: self.use_default_http_port,
-                use_default_https_port: self.use_default_https_port,
-                domain_suffix: &self.domain_suffix,
-                global_tunnel_domain: None,
-            };
-            let urls = app.urls(&url_ctx);
-            (Some(app.domain.0.clone()), urls, app.tunnel_url.clone())
-        } else {
-            (None, Vec::new(), None)
-        };
-
-        let ctx = HookContext {
-            event,
-            app_id: Some(app_id),
-            app_name: Some(name.to_string()),
-            app_domain: domain,
-            app_root: Some(root.to_path_buf()),
-            app_urls,
-            app_kind: Some(kind.to_string()),
-            tunnel_url,
-        };
+        let ctx = self
+            .hook_factory
+            .context_for_process(event, app_id, name, root, kind);
         let hm = self.hook_manager.clone();
         tokio::spawn(async move { hm.fire(&ctx).await });
     }
@@ -592,18 +552,13 @@ impl ProcessManager {
             }
             kill_handle(group.primary.handle).await;
             cleanup_listen_target(&group.primary.listen_target);
-            let ctx = HookContext {
-                event: HookEvent::AppStop,
-                app_id: Some(app_id),
-                app_name: Some(group.name),
-                app_domain: None,
-                app_root: Some(group.root),
-                app_urls: Vec::new(),
-                app_kind: Some(group.primary.kind),
-                tunnel_url: None,
-            };
-            let hm = self.hook_manager.clone();
-            tokio::spawn(async move { hm.fire(&ctx).await });
+            self.fire_hook(
+                HookEvent::AppStop,
+                app_id,
+                &group.name,
+                &group.root,
+                &group.primary.kind,
+            );
             true
         } else {
             false
@@ -636,16 +591,13 @@ impl ProcessManager {
                     "reaping idle managed process"
                 );
                 // Fire AppIdle before reaping
-                let idle_ctx = HookContext {
-                    event: HookEvent::AppIdle,
-                    app_id: Some(*app_id),
-                    app_name: Some(group.name.clone()),
-                    app_domain: None,
-                    app_root: Some(group.root.clone()),
-                    app_urls: Vec::new(),
-                    app_kind: Some(group.primary.kind.clone()),
-                    tunnel_url: None,
-                };
+                let idle_ctx = self.hook_factory.context_for_process(
+                    HookEvent::AppIdle,
+                    *app_id,
+                    &group.name,
+                    &group.root,
+                    &group.primary.kind,
+                );
                 self.hook_manager.fire(&idle_ctx).await;
                 for companion in group.companions {
                     kill_handle(companion.handle).await;
@@ -653,18 +605,13 @@ impl ProcessManager {
                 kill_handle(group.primary.handle).await;
                 cleanup_listen_target(&group.primary.listen_target);
                 // Fire AppStop after kill
-                let stop_ctx = HookContext {
-                    event: HookEvent::AppStop,
-                    app_id: Some(*app_id),
-                    app_name: Some(group.name),
-                    app_domain: None,
-                    app_root: Some(group.root),
-                    app_urls: Vec::new(),
-                    app_kind: Some(group.primary.kind),
-                    tunnel_url: None,
-                };
-                let hm = self.hook_manager.clone();
-                tokio::spawn(async move { hm.fire(&stop_ctx).await });
+                self.fire_hook(
+                    HookEvent::AppStop,
+                    *app_id,
+                    &group.name,
+                    &group.root,
+                    &group.primary.kind,
+                );
             }
         }
 

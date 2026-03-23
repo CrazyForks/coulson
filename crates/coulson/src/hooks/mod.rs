@@ -1,11 +1,15 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::RwLock;
 use serde::Deserialize;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
+
+use crate::domain::{BackendTarget, UrlContext};
+use crate::store::AppRepository;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
@@ -47,6 +51,102 @@ pub struct HookContext {
     pub app_urls: Vec<String>,
     pub app_kind: Option<String>,
     pub tunnel_url: Option<String>,
+}
+
+/// Shared factory for building `HookContext` from app data or minimal process info.
+///
+/// Encapsulates the port/suffix/store context that was previously duplicated
+/// across `service.rs::hook_context_for_app` and `process/mod.rs::fire_hook`.
+#[derive(Clone)]
+pub struct HookContextFactory {
+    store: Arc<AppRepository>,
+    http_port: u16,
+    https_port: Option<u16>,
+    use_default_http_port: bool,
+    use_default_https_port: bool,
+    domain_suffix: String,
+}
+
+impl HookContextFactory {
+    pub fn new(
+        store: Arc<AppRepository>,
+        http_port: u16,
+        https_port: Option<u16>,
+        use_default_http_port: bool,
+        use_default_https_port: bool,
+        domain_suffix: String,
+    ) -> Self {
+        Self {
+            store,
+            http_port,
+            https_port,
+            use_default_http_port,
+            use_default_https_port,
+            domain_suffix,
+        }
+    }
+
+    fn url_context(&self) -> UrlContext<'_> {
+        UrlContext {
+            http_port: self.http_port,
+            https_port: self.https_port,
+            use_default_http_port: self.use_default_http_port,
+            use_default_https_port: self.use_default_https_port,
+            domain_suffix: &self.domain_suffix,
+            global_tunnel_domain: None,
+        }
+    }
+
+    /// Build context from a full `AppSpec` (used by service.rs where the app is already loaded).
+    pub fn context_for_app(&self, event: HookEvent, app: &crate::domain::AppSpec) -> HookContext {
+        let url_ctx = self.url_context();
+        let app_urls = app.urls(&url_ctx);
+        let app_root = match &app.target {
+            BackendTarget::Managed { root, .. } => Some(PathBuf::from(root)),
+            BackendTarget::StaticDir { root } => Some(PathBuf::from(root)),
+            _ => None,
+        };
+        HookContext {
+            event,
+            app_id: Some(app.id.0),
+            app_name: Some(app.name.clone()),
+            app_domain: Some(app.domain.0.clone()),
+            app_root,
+            app_urls,
+            app_kind: Some(format!("{:?}", app.kind).to_ascii_lowercase()),
+            tunnel_url: app.tunnel_url.clone(),
+        }
+    }
+
+    /// Build context from minimal process info, enriching via store lookup.
+    /// Falls back to empty domain/urls when the app is not found in the store.
+    pub fn context_for_process(
+        &self,
+        event: HookEvent,
+        app_id: i64,
+        name: &str,
+        root: &Path,
+        kind: &str,
+    ) -> HookContext {
+        let (domain, app_urls, tunnel_url) = if let Ok(Some(app)) = self.store.get_by_id(app_id) {
+            let url_ctx = self.url_context();
+            let urls = app.urls(&url_ctx);
+            (Some(app.domain.0.clone()), urls, app.tunnel_url.clone())
+        } else {
+            (None, Vec::new(), None)
+        };
+
+        HookContext {
+            event,
+            app_id: Some(app_id),
+            app_name: Some(name.to_string()),
+            app_domain: domain,
+            app_root: Some(root.to_path_buf()),
+            app_urls,
+            app_kind: Some(kind.to_string()),
+            tunnel_url,
+        }
+    }
 }
 
 /// Per-app hook configuration parsed from `.coulson.toml` `[hooks]` section.

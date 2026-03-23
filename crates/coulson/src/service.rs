@@ -62,7 +62,9 @@ pub fn app_delete(state: &SharedState, app_id: i64) -> Result<(), ServiceError> 
     if let Some(ref fs_entry) = app.fs_entry {
         scanner::remove_app_fs_entry(&state.apps_root, fs_entry);
     }
-    let ctx = hook_context_for_app(HookEvent::AppRemove, &app, state);
+    let ctx = state
+        .hook_factory()
+        .context_for_app(HookEvent::AppRemove, &app);
 
     let restore_hooks = |snapshot: Option<crate::hooks::AppHooksConfig>| {
         if let Some(config) = snapshot {
@@ -320,7 +322,9 @@ pub fn app_create(state: &SharedState, params: &CreateAppParams) -> Result<AppSp
         .reload_routes()
         .map_err(|e| ServiceError::Internal(e.to_string()))?;
 
-    let ctx = hook_context_for_app(HookEvent::AppAdd, &app, state);
+    let ctx = state
+        .hook_factory()
+        .context_for_app(HookEvent::AppAdd, &app);
     let hm = state.hook_manager.clone();
     tokio::spawn(async move { hm.fire(&ctx).await });
 
@@ -1002,34 +1006,6 @@ fn validate_cname_unique(
     Ok(())
 }
 
-fn hook_context_for_app(event: HookEvent, app: &AppSpec, state: &SharedState) -> HookContext {
-    use crate::domain::{BackendTarget, UrlContext};
-    let url_ctx = UrlContext {
-        http_port: state.listen_http.port(),
-        https_port: state.listen_https.map(|a| a.port()),
-        use_default_http_port: state.use_default_http_port(),
-        use_default_https_port: state.use_default_https_port(),
-        domain_suffix: &state.domain_suffix,
-        global_tunnel_domain: None,
-    };
-    let app_urls = app.urls(&url_ctx);
-    let app_root = match &app.target {
-        BackendTarget::Managed { root, .. } => Some(std::path::PathBuf::from(root)),
-        BackendTarget::StaticDir { root } => Some(std::path::PathBuf::from(root)),
-        _ => None,
-    };
-    HookContext {
-        event,
-        app_id: Some(app.id.0),
-        app_name: Some(app.name.clone()),
-        app_domain: Some(app.domain.0.clone()),
-        app_root,
-        app_urls,
-        app_kind: Some(format!("{:?}", app.kind).to_ascii_lowercase()),
-        tunnel_url: app.tunnel_url.clone(),
-    }
-}
-
 /// Fire a tunnel lifecycle hook (TunnelStart / TunnelStop) for a per-app tunnel.
 fn fire_tunnel_hook(
     event: HookEvent,
@@ -1037,7 +1013,7 @@ fn fire_tunnel_hook(
     state: &SharedState,
     tunnel_url: Option<&str>,
 ) {
-    let mut ctx = hook_context_for_app(event, app, state);
+    let mut ctx = state.hook_factory().context_for_app(event, app);
     // Override tunnel_url with the freshly obtained value (may not be in DB yet)
     if let Some(url) = tunnel_url {
         ctx.tunnel_url = Some(url.to_string());
