@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coulson v0.4.0 Release Notes</title>
+<style>
+  :root {
+    --fg: #1e293b;
+    --fg-secondary: #64748b;
+    --bg: #ffffff;
+    --border: #e2e8f0;
+    --accent: #0284c7;
+    --tag-bg: #f0f9ff;
+    --tag-fg: #0369a1;
+    --code-bg: #f8fafc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e2e8f0;
+      --fg-secondary: #94a3b8;
+      --bg: #0f172a;
+      --border: #1e293b;
+      --accent: #38bdf8;
+      --tag-bg: #0c4a6e;
+      --tag-fg: #7dd3fc;
+      --code-bg: #1e293b;
+    }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--fg);
+    background: var(--bg);
+    padding: 16px;
+    -webkit-font-smoothing: antialiased;
+  }
+  h2 {
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .meta {
+    font-size: 12px;
+    color: var(--fg-secondary);
+    margin-bottom: 12px;
+  }
+  .section { margin-bottom: 14px; }
+  .section-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-secondary);
+    margin-bottom: 6px;
+  }
+  ul {
+    list-style: none;
+    padding: 0;
+  }
+  li {
+    position: relative;
+    padding-left: 16px;
+    margin-bottom: 4px;
+    font-size: 13px;
+  }
+  li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 7px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+  .tag {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 500;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--tag-bg);
+    color: var(--tag-fg);
+    margin-left: 4px;
+    vertical-align: middle;
+  }
+  code {
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 12px;
+    background: var(--code-bg);
+    padding: 1px 4px;
+    border-radius: 3px;
+  }
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 14px 0;
+  }
+  a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h2>Coulson 0.4.0</h2>
+<div class="meta">March 24, 2026</div>
+
+<div class="section">
+  <div class="section-title">New</div>
+  <ul>
+    <li>Docker Compose provider — auto-detect and manage Compose apps with idle reaping <span class="tag">process</span></li>
+    <li>Launchd socket activation replaces pf for port 80/443 forwarding <span class="tag">forward</span></li>
+    <li>Hook mechanism for app lifecycle events (<code>app_add</code>, <code>app_ready</code>, <code>app_stop</code>, etc.) <span class="tag">hooks</span></li>
+    <li>Per-app hooks via <code>[hooks]</code> section in <code>.coulson.toml</code> with shell + webhook support <span class="tag">hooks</span></li>
+    <li>Tunnel lifecycle hooks: <code>tunnel_start</code> / <code>tunnel_stop</code> <span class="tag">hooks</span></li>
+    <li>Env injection via <code>[env]</code>, <code>env_url</code>, and <code>env_url_headers</code> in <code>.coulson.toml</code> <span class="tag">process</span></li>
+    <li>Per-app cname alias for custom domain routing <span class="tag">proxy</span></li>
+    <li>CLI <code>coulson open</code> command to open app URL in browser <span class="tag">cli</span></li>
+    <li>Block non-browser clients until managed process is ready (instead of 502) <span class="tag">proxy</span></li>
+    <li>mDNS periodic health check to detect stale registrations <span class="tag">mdns</span></li>
+    <li>Linux x86_64 build in CI <span class="tag">ci</span></li>
+  </ul>
+</div>
+
+<div class="section">
+  <div class="section-title">Fixed</div>
+  <ul>
+    <li>Dual-stack bind panic — use <code>[::]</code> instead of <code>0.0.0.0</code> <span class="tag">proxy</span></li>
+    <li>Graceful shutdown shortened from 300s to 3s+5s <span class="tag">proxy</span></li>
+    <li>Node provider defers to Procfile when <code>web</code> process exists <span class="tag">process</span></li>
+    <li>Dashboard domain links now include port when forward target doesn't match <span class="tag">dashboard</span></li>
+    <li>Rebuild mDNS daemon on network change (Wi-Fi switch, sleep/wake) <span class="tag">mdns</span></li>
+    <li>Tunnel domain validation rejects wildcards, IPs, and malformed input <span class="tag">control</span></li>
+    <li>CLI and tunnel commands made idempotent for provisioning safety <span class="tag">cli</span></li>
+    <li>Cross-platform build fix for non-macOS forward stubs <span class="tag">build</span></li>
+  </ul>
+</div>
+
+<div class="section">
+  <div class="section-title">Changed</div>
+  <ul>
+    <li>Unified app configuration to <code>.coulson.toml</code> — legacy formats deprecated <span class="tag">config</span></li>
+    <li>Dropped granian support — uvicorn is now the only ASGI server <span class="tag">process</span></li>
+    <li><code>X-Forwarded-Host</code> header added to upstream requests <span class="tag">proxy</span></li>
+    <li>Hook context factory extracted — cleaner internal architecture <span class="tag">refactor</span></li>
+    <li>Process manager env injection consolidated — manifest loaded once per start <span class="tag">refactor</span></li>
+  </ul>
+</div>
+
+<hr>
+<div class="meta">
+  <a href="https://github.com/ratazzi/coulson">View on GitHub</a>
+</div>
+
+</body>
+</html>
