@@ -91,6 +91,8 @@ struct ProcessGroup {
     name: String,
     /// App root directory, preserved for hook context on stop/idle events.
     root: PathBuf,
+    /// Per-app idle timeout override from `.coulson.toml`.
+    idle_timeout: Option<Duration>,
 }
 
 pub struct ProcessManager {
@@ -322,6 +324,7 @@ impl ProcessManager {
         let companions =
             self.spawn_companions(app_id, name, root, kind, &companion_types, &sockets_dir);
 
+        let app_idle_timeout = manifest_idle_timeout(&manifest);
         let now = Instant::now();
         self.processes.insert(
             app_id,
@@ -337,6 +340,7 @@ impl ProcessManager {
                 companions,
                 name: name.to_string(),
                 root: root.to_path_buf(),
+                idle_timeout: app_idle_timeout,
             },
         );
 
@@ -501,6 +505,7 @@ impl ProcessManager {
         let companions =
             self.spawn_companions(app_id, name, root, kind, &companion_types, &sockets_dir);
 
+        let app_idle_timeout = manifest_idle_timeout(&manifest);
         let now = Instant::now();
         self.processes.insert(
             app_id,
@@ -516,6 +521,7 @@ impl ProcessManager {
                 companions,
                 name: name.to_string(),
                 root: root.to_path_buf(),
+                idle_timeout: app_idle_timeout,
             },
         );
 
@@ -553,10 +559,11 @@ impl ProcessManager {
     /// Kill processes idle longer than the configured timeout. Returns count reaped.
     pub async fn reap_idle(&mut self) -> usize {
         let now = Instant::now();
-        let timeout = self.idle_timeout;
+        let global_timeout = self.idle_timeout;
         let mut to_remove = Vec::new();
 
         for (app_id, group) in &self.processes {
+            let timeout = group.idle_timeout.unwrap_or(global_timeout);
             if now.duration_since(group.primary.last_active) > timeout {
                 to_remove.push(*app_id);
             }
@@ -888,6 +895,15 @@ impl ProcessManager {
 
         Ok(ProcessHandle::Tmux { session_name })
     }
+}
+
+/// Extract `idle_timeout_secs` from a `.coulson.toml` manifest JSON value.
+fn manifest_idle_timeout(manifest: &Option<serde_json::Value>) -> Option<Duration> {
+    manifest
+        .as_ref()?
+        .get("idle_timeout_secs")?
+        .as_u64()
+        .map(Duration::from_secs)
 }
 
 /// Load `.coulson.toml` from app root and convert to serde_json::Value for providers.
