@@ -23,8 +23,11 @@ Coulson gives every project its own domain (`myapp.coulson.local`). Cookies, sto
 - **Zero-config routing** — directory/file name becomes the domain (`myapp` → `myapp.coulson.local`)
 - **Auto-managed Python ASGI** — starts on first request, stops after idle timeout
 - **Auto-managed Node.js** — detects package manager and start script, starts on first request
+- **Auto-managed Docker Compose** — `docker compose up` on first request, `down` on idle
 - **Static directory hosting** — just drop a `public` directory
 - **Multi-route** — path-prefix routing to different backends under one domain
+- **`.coulson.toml`** — per-app configuration for routes, env, hooks, and proxy options
+- **Lifecycle hooks** — run scripts or fire webhooks on app start/stop/ready events
 - **mDNS** — `.local` domains work out of the box, LAN and mobile devices connect directly
 - **Cloudflare Tunnel** — one command generates a public URL for sharing
 - **Web Dashboard + Menu bar app** — visual management
@@ -50,7 +53,7 @@ sudo coulson trust
 Take over ports 80/443 so you can omit port numbers when accessing:
 
 ```bash
-sudo coulson trust --pf
+sudo coulson trust --forward
 ```
 
 ## Quick Start
@@ -142,6 +145,25 @@ COULSON_MANAGED_SERVICES=web,worker
 
 All listed process types from the Procfile are started together and share the same lifecycle — idle timeout reaps the entire group.
 
+### Docker Compose App
+
+Projects with a `compose.yml` (or `docker-compose.yml`) are auto-managed:
+
+```
+~/Projects/myapp/
+  compose.yml         # services: web: ...
+```
+
+```bash
+ln -s ~/Projects/myapp ~/.coulson/myapp
+```
+
+```bash
+curl -i http://myapp.coulson.local:18080/
+```
+
+First request runs `docker compose up -d --build`. Idle containers are stopped via `docker compose down` after the idle timeout. Port discovery uses compose port mappings or `$PORT` env var.
+
 ### Static Directory
 
 Projects with a `public` subdirectory are automatically served as static files:
@@ -175,6 +197,61 @@ DATABASE_URL=postgres://localhost/myapp_dev
 
 When `PORT` is set, the app always starts on that fixed port instead of auto-allocating one. Supports `KEY=VALUE` format with `#` comments, optional quoting, and `export` prefix.
 
+### `.coulson.toml` — Per-App Configuration
+
+For full control, add a `.coulson.toml` in the app directory:
+
+```toml
+name = "myapp"
+domain = "myapp"            # prefix only, suffix appended at runtime
+kind = "asgi"               # asgi, node, procfile, docker
+
+# Process
+module = "mymodule:app"     # ASGI module
+server = "uvicorn"          # ASGI server
+
+# Proxy options
+port = 5006
+timeout = 5000
+cors = false
+spa = false
+
+# Remote env injection (fetched before each cold start)
+env_url = "https://vault.example.com/env/myapp"
+env_url_headers = { Authorization = "Bearer xxx" }
+
+# Environment variables
+[env]
+DATABASE_URL = "postgres://localhost/myapp_dev"
+
+# Multi-route
+[[routes]]
+path = "/api"
+target = "127.0.0.1:3000"
+timeout = 30000
+
+# Lifecycle hooks
+[hooks]
+[hooks.app_ready]
+run = "mise run db:migrate"
+webhook = "https://hooks.slack.com/xxx"
+```
+
+### Global Hooks
+
+Coulson fires hooks on app lifecycle events. Global hooks are executable scripts in `~/.coulson/hooks/`:
+
+```
+~/.coulson/hooks/
+  app_ready             # runs when any app becomes ready
+  app_stop              # runs when any app stops
+  scan_complete         # runs after directory scan
+```
+
+Per-app hooks are configured via `[hooks]` in `.coulson.toml` (see above). Each hook receives `COULSON_APP_NAME`, `COULSON_APP_URL`, `COULSON_APP_DOMAIN`, and other context as environment variables.
+
+Per-app events: `app_add`, `app_remove`, `app_start`, `app_ready`, `app_stop`, `app_idle`, `tunnel_start`, `tunnel_stop`. Global-only events: `scan_complete`.
+
 ## Cloudflare Tunnel
 
 Start/stop tunnels via CLI:
@@ -206,7 +283,7 @@ All projects share one Tunnel connection — no per-app setup needed, new projec
 ## Management
 
 - **Web Dashboard**: `http://coulson.local:18080`
-- **CLI**: `coulson ls`, `coulson add`, `coulson restart`
+- **CLI**: `coulson ls`, `coulson add`, `coulson restart`, `coulson open`
 - **Menu bar app**: Coulson.app menu bar icon
 
 ## Configuration
