@@ -321,6 +321,9 @@ enum Commands {
         /// Number of lines to show (default: 100)
         #[arg(short = 'n', long, default_value = "100")]
         lines: usize,
+        /// Print the log file path and exit
+        #[arg(long)]
+        path: bool,
     },
     /// Show running managed processes
     Ps,
@@ -1438,7 +1441,8 @@ async fn main() -> anyhow::Result<()> {
             name,
             follow,
             lines,
-        } => run_logs(cfg, name, follow, lines),
+            path,
+        } => run_logs(cfg, name, follow, lines, path),
         Commands::Ps => run_ps(cfg),
         Commands::Start { name } => run_process_action(cfg, name, "process.start"),
         Commands::Stop { name } => run_process_action(cfg, name, "process.stop"),
@@ -2302,6 +2306,7 @@ fn run_logs(
     name: Option<String>,
     follow: bool,
     lines: usize,
+    path: bool,
 ) -> anyhow::Result<()> {
     let client = RpcClient::new(&cfg.control_socket);
 
@@ -2327,12 +2332,19 @@ fn run_logs(
         .runtime_dir
         .join("managed")
         .join(format!("{bare_name}.log"));
+
+    if path {
+        println!("{}", log_path.display());
+        return Ok(());
+    }
+
     if !log_path.exists() {
         bail!(
             "no logs found for {bare_name} (expected {})",
             log_path.display()
         );
     }
+
     let log_path = log_path.to_string_lossy();
 
     if follow {
