@@ -208,27 +208,44 @@ jobs:
   build-linux:
     needs: check
     if: needs.check.outputs.should_build == 'true'
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            artifact: coulson-linux-x86_64
+            cross_packages: ""
+          - target: aarch64-unknown-linux-gnu
+            artifact: coulson-linux-aarch64
+            cross_packages: gcc-aarch64-linux-gnu
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y capnproto cmake
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto cmake ${{ matrix.cross_packages }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
       - name: Build Rust daemon
-        run: cargo build --release -p coulson
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release -p coulson --target ${{ matrix.target }}
 
       - name: Upload daemon artifact
         uses: actions/upload-artifact@v5
         with:
-          name: coulson-linux-x86_64
-          path: target/release/coulson
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.target }}/release/coulson
           retention-days: 30
 
   release:
@@ -246,6 +263,7 @@ jobs:
         run: |
           mv artifacts/coulson-macos-arm64/coulson artifacts/coulson-macos-arm64/coulson-macos-arm64
           mv artifacts/coulson-linux-x86_64/coulson artifacts/coulson-linux-x86_64/coulson-linux-x86_64
+          mv artifacts/coulson-linux-aarch64/coulson artifacts/coulson-linux-aarch64/coulson-linux-aarch64
 
       - name: Display structure of downloaded files
         run: ls -R artifacts
@@ -281,12 +299,14 @@ jobs:
             ## Downloads
             - `Coulson-*.dmg` - macOS app (Apple Silicon)
             - `coulson-macos-arm64` - CLI daemon (macOS)
-            - `coulson-linux-x86_64` - CLI daemon (Linux)
+            - `coulson-linux-x86_64` - CLI daemon (Linux x86_64)
+            - `coulson-linux-aarch64` - CLI daemon (Linux aarch64)
             - `appcast.xml` - Sparkle update feed
           files: |
             artifacts/Coulson-app-dmg/Coulson-*.dmg
             artifacts/coulson-macos-arm64/coulson-macos-arm64
             artifacts/coulson-linux-x86_64/coulson-linux-x86_64
+            artifacts/coulson-linux-aarch64/coulson-linux-aarch64
             artifacts/appcast/appcast.xml
           draft: false
           prerelease: true
