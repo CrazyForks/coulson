@@ -216,7 +216,7 @@ jobs:
             cross_packages: ""
           - target: aarch64-unknown-linux-gnu
             artifact: coulson-linux-aarch64
-            cross_packages: gcc-aarch64-linux-gnu
+            cross_packages: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
