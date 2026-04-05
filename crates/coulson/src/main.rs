@@ -527,14 +527,16 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
 
 fn run_scan_once(cfg: CoulsonConfig) -> anyhow::Result<()> {
     let state = build_state(&cfg)?;
-    let stats = scanner::sync_from_apps_root(&state)?;
-    runtime::write_scan_warnings(&state.scan_warnings_path, &stats)?;
+    let result = scanner::sync_from_apps_root(&state)?;
+    runtime::write_scan_warnings(&state.scan_warnings_path, &result.stats)?;
     state.reload_routes()?;
+    // No hook firing here: `coulson scan` is offline tooling without a running
+    // daemon, so app URLs are not reachable and hooks would be meaningless.
     println!(
         "{}",
         serde_json::to_string(&serde_json::json!({
             "ok": true,
-            "scan": stats
+            "scan": result.stats
         }))?
     );
     Ok(())
@@ -1018,14 +1020,15 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
     let state = build_state(&cfg)?;
 
     let startup_scan = scanner::sync_from_apps_root(&state)?;
-    runtime::write_scan_warnings(&state.scan_warnings_path, &startup_scan)?;
+    runtime::write_scan_warnings(&state.scan_warnings_path, &startup_scan.stats)?;
     state.reload_routes()?;
+    // app_add hooks deferred until after proxy is listening (see below).
     info!(
-        discovered = startup_scan.discovered,
-        inserted = startup_scan.inserted,
-        updated = startup_scan.updated,
-        skipped_manual = startup_scan.skipped_manual,
-        pruned = startup_scan.pruned,
+        discovered = startup_scan.stats.discovered,
+        inserted = startup_scan.stats.inserted,
+        updated = startup_scan.stats.updated,
+        skipped_manual = startup_scan.stats.skipped_manual,
+        pruned = startup_scan.stats.pruned,
         "startup apps scan completed"
     );
 
@@ -1180,6 +1183,11 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
         }
     });
 
+    // Fire app_add hooks after proxy task is spawned. Hooks run via
+    // tokio::spawn + shell fork, so the proxy will be listening by the time
+    // the hook process actually executes.
+    service::fire_app_add_hooks(&state, &startup_scan.added_apps);
+
     let control_state = state.clone();
     let control_socket = cfg.control_socket.clone();
     let control_task = tokio::spawn(async move {
@@ -1212,9 +1220,9 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
 
         while rx.recv().await.is_some() {
             match scanner::sync_from_apps_root(&watch_state) {
-                Ok(stats) => {
+                Ok(result) => {
                     if let Err(err) =
-                        runtime::write_scan_warnings(&watch_state.scan_warnings_path, &stats)
+                        runtime::write_scan_warnings(&watch_state.scan_warnings_path, &result.stats)
                     {
                         error!(error = %err, "failed to write scan warnings");
                     }
@@ -1223,18 +1231,21 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
                             let _ = watch_state
                                 .change_tx
                                 .send("detail-tunnel,detail-features,detail-urls".to_string());
+                            service::fire_app_add_hooks(&watch_state, &result.added_apps);
                         }
-                        Ok(false) => {}
+                        Ok(false) => {
+                            service::fire_app_add_hooks(&watch_state, &result.added_apps);
+                        }
                         Err(err) => {
                             error!(error = %err, "failed to reload routes after fs event");
                         }
                     }
                     debug!(
-                        discovered = stats.discovered,
-                        inserted = stats.inserted,
-                        updated = stats.updated,
-                        skipped_manual = stats.skipped_manual,
-                        pruned = stats.pruned,
+                        discovered = result.stats.discovered,
+                        inserted = result.stats.inserted,
+                        updated = result.stats.updated,
+                        skipped_manual = result.stats.skipped_manual,
+                        pruned = result.stats.pruned,
                         "apps scan completed from fs event"
                     );
                 }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::domain::{AppKind, DomainName};
+use crate::domain::{AppKind, AppSpec, DomainName};
 use crate::process::ProviderRegistry;
 use crate::store::{domain_to_db, route_key, ScanUpsertResult, StaticAppInput};
 use crate::SharedState;
@@ -181,7 +181,13 @@ pub struct ScanStats {
     pub has_issues: bool,
 }
 
-pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanStats> {
+pub struct ScanResult {
+    pub stats: ScanStats,
+    /// Apps newly inserted during this scan (for firing `app_add` hooks after route reload).
+    pub added_apps: Vec<AppSpec>,
+}
+
+pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanResult> {
     let skip_paths: Vec<&Path> = vec![
         state.scan_warnings_path.as_path(),
         state.sqlite_path.as_path(),
@@ -196,6 +202,7 @@ pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanStats> {
     let mut inserted = 0usize;
     let mut updated = 0usize;
     let mut skipped_manual = 0usize;
+    let mut added_apps: Vec<AppSpec> = Vec::new();
     // Clear all per-app hooks before re-registering from scan results.
     state.hook_manager.clear_all_app_hooks();
     for app in &discovered.apps {
@@ -249,6 +256,7 @@ pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanStats> {
                         .hook_manager
                         .register_app_hooks(spec.id.0, hooks_config.clone());
                 }
+                added_apps.push(spec);
             }
             ScanUpsertResult::Updated => {
                 updated += 1;
@@ -274,17 +282,20 @@ pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanStats> {
         .collect();
     let parse_warnings = discovered.parse_warnings;
     let warning_count = conflict_domains.len() + parse_warnings.len();
-    Ok(ScanStats {
-        discovered: discovered.apps.len(),
-        inserted,
-        updated,
-        skipped_manual,
-        pruned,
-        conflicts: conflict_domains.len(),
-        conflict_domains,
-        parse_warnings,
-        warning_count,
-        has_issues: warning_count > 0,
+    Ok(ScanResult {
+        stats: ScanStats {
+            discovered: discovered.apps.len(),
+            inserted,
+            updated,
+            skipped_manual,
+            pruned,
+            conflicts: conflict_domains.len(),
+            conflict_domains,
+            parse_warnings,
+            warning_count,
+            has_issues: warning_count > 0,
+        },
+        added_apps,
     })
 }
 

@@ -111,14 +111,25 @@ pub fn app_set_enabled(
     }
 }
 
+/// Fire `app_add` hooks for newly discovered apps. Call after `reload_routes()`.
+pub fn fire_app_add_hooks(state: &SharedState, added_apps: &[crate::domain::AppSpec]) {
+    for app in added_apps {
+        let ctx = state.hook_factory().context_for_app(HookEvent::AppAdd, app);
+        let hm = state.hook_manager.clone();
+        tokio::spawn(async move { hm.fire(&ctx).await });
+    }
+}
+
 pub fn apps_scan(state: &SharedState) -> Result<ScanStats, ServiceError> {
-    let stats =
+    let result =
         scanner::sync_from_apps_root(state).map_err(|e| ServiceError::Internal(e.to_string()))?;
-    runtime::write_scan_warnings(&state.scan_warnings_path, &stats)
+    runtime::write_scan_warnings(&state.scan_warnings_path, &result.stats)
         .map_err(|e| ServiceError::Internal(e.to_string()))?;
     state
         .reload_routes()
         .map_err(|e| ServiceError::Internal(e.to_string()))?;
+
+    fire_app_add_hooks(state, &result.added_apps);
 
     let ctx = HookContext {
         event: HookEvent::ScanComplete,
@@ -133,7 +144,7 @@ pub fn apps_scan(state: &SharedState) -> Result<ScanStats, ServiceError> {
     let hm = state.hook_manager.clone();
     tokio::spawn(async move { hm.fire(&ctx).await });
 
-    Ok(stats)
+    Ok(result.stats)
 }
 
 pub fn apps_warnings(state: &SharedState) -> Result<Option<ScanWarningsFile>, ServiceError> {
