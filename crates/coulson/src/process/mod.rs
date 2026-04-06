@@ -1001,10 +1001,28 @@ async fn fetch_env_url(
     url: &str,
     headers: Option<&serde_json::Value>,
 ) -> anyhow::Result<HashMap<String, String>> {
+    let parsed = reqwest::Url::parse(url).context("invalid env_url")?;
+    let basic_auth = if !parsed.username().is_empty() || parsed.password().is_some() {
+        let user = parsed.username().to_string();
+        let pass = parsed.password().map(|p| p.to_string());
+        let mut clean = parsed.clone();
+        clean.set_username("").ok();
+        clean.set_password(None).ok();
+        Some((clean, user, pass))
+    } else {
+        None
+    };
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
-    let mut req = client.get(url);
+    let mut req = if let Some((ref clean_url, ref user, ref pass)) = basic_auth {
+        client
+            .get(clean_url.as_str())
+            .basic_auth(user, pass.as_deref())
+    } else {
+        client.get(url)
+    };
     if let Some(hdrs) = headers.and_then(|v| v.as_object()) {
         for (k, v) in hdrs {
             if let Some(val) = v.as_str() {
@@ -1027,6 +1045,28 @@ async fn fetch_env_url(
     parse_env_body(&body, &content_type)
 }
 
+/// Strip userinfo (user:pass@) from a URL for safe logging.
+fn redact_url(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                parsed.set_username("").ok();
+                parsed.set_password(None).ok();
+            }
+            parsed.to_string()
+        }
+        Err(_) => {
+            // Conservatively strip userinfo even from unparseable URLs
+            if let Some(at) = url.find('@') {
+                if let Some(scheme_end) = url.find("://") {
+                    return format!("{}{}", &url[..scheme_end + 3], &url[at + 1..]);
+                }
+            }
+            url.to_string()
+        }
+    }
+}
+
 /// Pre-fetch environment variables from `env_url` in `.coulson.toml`.
 /// Call this OUTSIDE the ProcessManager lock to avoid blocking other operations.
 /// Returns `Ok(None)` if no `env_url` is configured, `Ok(Some(...))` on success,
@@ -1040,10 +1080,11 @@ pub async fn prefetch_env_url(root: &Path) -> anyhow::Result<Option<HashMap<Stri
         Some(u) => u,
         None => return Ok(None),
     };
+    let safe_url = redact_url(url);
     let env = fetch_env_url(url, manifest.get("env_url_headers"))
         .await
-        .with_context(|| format!("failed to fetch env_url {url}"))?;
-    debug!(url, count = env.len(), "pre-fetched env from env_url");
+        .with_context(|| format!("failed to fetch env_url {safe_url}"))?;
+    debug!(url = %safe_url, count = env.len(), "pre-fetched env from env_url");
     Ok(Some(env))
 }
 
