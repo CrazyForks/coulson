@@ -243,8 +243,8 @@ impl ProcessManager {
         let (mut spec, sockets_dir, prov_name, companion_types, manifest) =
             self.resolve_spec(app_id, name, root, kind)?;
 
-        if let Some(remote_env) = env_url_env {
-            merge_remote_env(&mut spec, remote_env, &manifest);
+        if let Some(remote_env) = env_url_env.as_ref() {
+            merge_remote_env(&mut spec, remote_env.clone(), &manifest);
         }
 
         info!(
@@ -321,8 +321,16 @@ impl ProcessManager {
 
         self.fire_hook(HookEvent::AppReady, app_id, name, root, kind);
 
-        let companions =
-            self.spawn_companions(app_id, name, root, kind, &companion_types, &sockets_dir);
+        let companions = self.spawn_companions(
+            app_id,
+            name,
+            root,
+            kind,
+            &companion_types,
+            &sockets_dir,
+            &manifest,
+            env_url_env.as_ref(),
+        );
 
         let app_idle_timeout = manifest_idle_timeout(&manifest);
         let now = Instant::now();
@@ -441,8 +449,8 @@ impl ProcessManager {
         let (mut spec, sockets_dir, prov_name, companion_types, manifest) =
             self.resolve_spec(app_id, name, root, kind)?;
 
-        if let Some(remote_env) = env_url_env {
-            merge_remote_env(&mut spec, remote_env, &manifest);
+        if let Some(remote_env) = env_url_env.as_ref() {
+            merge_remote_env(&mut spec, remote_env.clone(), &manifest);
         }
 
         info!(
@@ -502,8 +510,16 @@ impl ProcessManager {
             self.spawn_process(name, &spec, &log_path, &sockets_dir)?
         };
 
-        let companions =
-            self.spawn_companions(app_id, name, root, kind, &companion_types, &sockets_dir);
+        let companions = self.spawn_companions(
+            app_id,
+            name,
+            root,
+            kind,
+            &companion_types,
+            &sockets_dir,
+            &manifest,
+            env_url_env.as_ref(),
+        );
 
         let app_idle_timeout = manifest_idle_timeout(&manifest);
         let now = Instant::now();
@@ -711,6 +727,13 @@ impl ProcessManager {
     }
 
     /// Spawn companion processes for a Procfile app.
+    ///
+    /// `manifest` and `remote_env` are passed through so companion specs receive
+    /// the same env treatment as the web process: `.coulson.toml [env]` and any
+    /// `env_url`-fetched values are merged on top of `.coulsonrc`, with local
+    /// manifest values winning over remote. Without this, workers/schedulers
+    /// would see only `.coulsonrc` and miss secrets like `DATABASE_URL`.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_companions(
         &self,
         app_id: i64,
@@ -719,6 +742,8 @@ impl ProcessManager {
         kind: &str,
         companion_types: &[String],
         sockets_dir: &Path,
+        manifest: &Option<serde_json::Value>,
+        remote_env: Option<&HashMap<String, String>>,
     ) -> Vec<CompanionProcess> {
         if companion_types.is_empty() || kind != "procfile" {
             return vec![];
@@ -729,7 +754,7 @@ impl ProcessManager {
             name: name.to_string(),
             root: root.to_path_buf(),
             kind: kind.to_string(),
-            manifest: None,
+            manifest: manifest.clone(),
             env_overrides,
             socket_dir: sockets_dir.to_path_buf(),
         };
@@ -740,7 +765,7 @@ impl ProcessManager {
         for ptype in companion_types {
             match provider.resolve_companion(&managed_app, ptype) {
                 Ok(cspec) => {
-                    let spec = ProcessSpec {
+                    let mut spec = ProcessSpec {
                         command: cspec.command,
                         args: cspec.args,
                         env: cspec.env,
@@ -750,6 +775,13 @@ impl ProcessManager {
                             port: 0,
                         },
                     };
+                    // Apply the same env precedence as the web process:
+                    // .coulsonrc (from resolve_companion) → env_url → manifest [env]
+                    if let Some(remote) = remote_env {
+                        merge_remote_env(&mut spec, remote.clone(), manifest);
+                    } else {
+                        apply_manifest_env(&mut spec, manifest);
+                    }
                     let log_path = sockets_dir.join(format!("{name}-{ptype}.log"));
                     match self.spawn_process(
                         &format!("{name}-{ptype}"),
@@ -809,11 +841,19 @@ impl ProcessManager {
 
         // All specs go through login shell for user env loading
         let full_cmd = build_full_command(spec);
-        let (command, args) = login_shell_args(&full_cmd);
+        let shell = user_shell();
+        let args = login_shell_args(&shell, &full_cmd, &spec.env);
 
-        let mut cmd = Command::new(&command);
+        let mut cmd = Command::new(&shell);
         cmd.args(&args);
         for (k, v) in &spec.env {
+            // `Command::env` panics on keys containing '=' or NUL. These keys
+            // are also skipped by the inner `env(1)` prefix (see
+            // `build_env_command_prefix`), so the final process env stays
+            // consistent across direct and tmux backends.
+            if !is_env_command_key(k) {
+                continue;
+            }
             cmd.env(k, v);
         }
         cmd.process_group(0);
@@ -825,7 +865,7 @@ impl ProcessManager {
             .stdout(stderr_file)
             .stderr(log_file)
             .spawn()
-            .with_context(|| format!("failed to spawn {} for {name}", command.display()))?;
+            .with_context(|| format!("failed to spawn {} for {name}", shell.display()))?;
 
         Ok(ProcessHandle::Direct { child })
     }
@@ -847,7 +887,7 @@ impl ProcessManager {
 
         // Generate wrapper script
         let script_path = managed_dir.join(format!("{name}.sh"));
-        let script_content = generate_wrapper_script(spec);
+        let script_content = generate_wrapper_script(&user_shell(), spec);
         std::fs::write(&script_path, &script_content)
             .with_context(|| format!("failed to write wrapper script {}", script_path.display()))?;
         #[cfg(unix)]
@@ -1130,20 +1170,59 @@ fn build_full_command(spec: &ProcessSpec) -> String {
     }
 }
 
-/// Generate a wrapper script for the process.
-fn generate_wrapper_script(spec: &ProcessSpec) -> String {
+/// Generate a wrapper script for the process. The user shell is taken as an
+/// explicit argument so tests can inject a deterministic value without mutating
+/// the global `$SHELL` environment variable.
+///
+/// Env vars are delivered twice: once as outer `export` lines for POSIX-valid
+/// keys (inherited by the inner login shell at startup) and once via an
+/// `env 'K=V' ...` prefix on the exec'd command. The `env(1)` prefix is what
+/// guarantees Coulson-managed values win over rc-file dotenv/mise/direnv
+/// overrides, and it works uniformly on fish/tcsh/… as well as bash/zsh. It
+/// also carries keys that aren't valid POSIX identifiers, keeping the tmux
+/// backend's env set identical to the direct backend (which uses
+/// `Command::env()`).
+///
+/// Note on what the inner shell does **not** preserve: shell functions,
+/// aliases, and `setopt`/`shopt` state defined in the user's rc file live in
+/// the outer shell process and are lost when we `exec` into a fresh
+/// `$SHELL -c '…'`. Only environment variables (set via `env(1)` and the rc
+/// file's `export`) and shell **syntax** survive into the final command.
+fn generate_wrapper_script(shell: &Path, spec: &ProcessSpec) -> String {
     let mut lines = vec!["#!/usr/bin/env sh".to_string()];
 
-    // Export env vars
+    // Outer-script exports for inheritance into the inner login shell. The
+    // outer script is `#!/usr/bin/env sh` (POSIX), so we must skip keys that
+    // aren't valid POSIX identifiers or sh would fail to parse the script.
+    // Non-POSIX keys are still delivered to the final process via the inner
+    // `env(1)` prefix below.
     for (k, v) in &spec.env {
+        if !is_valid_env_key(k) {
+            continue;
+        }
         let escaped = v.replace('\'', "'\\''");
         lines.push(format!("export {k}='{escaped}'"));
     }
 
-    let shell = user_shell();
+    let shell_arg = shell_escape_path(shell);
     let cmd = build_full_command(spec);
-    let escaped_cmd = cmd.replace('\'', "'\\''");
-    lines.push(format!("exec {} -li -c '{}'", shell.display(), escaped_cmd));
+    // Inner structure: outer login interactive shell sources rc files, then
+    // `env(1)` re-applies Coulson-managed env vars (overriding any rc clobbering),
+    // then **exec the same user shell again in `-c` mode** to run the actual
+    // command. Routing through the user shell (instead of `sh -c`) preserves
+    // bash/zsh/fish-specific *syntax* for Procfile commands (`[[ … ]]`, brace
+    // expansion, etc.).
+    //
+    // The inner shell is invoked with shell-specific "no startup file" flags
+    // (zsh `-f`, bash `--noprofile --norc`, etc.) so that startup files like
+    // `~/.zshenv` cannot reverse the env vars `env(1)` just injected. For
+    // bash specifically, `BASH_ENV` is stripped via `env -u BASH_ENV` because
+    // non-interactive bash sources it regardless of `--norc`. As a side
+    // effect, shell functions/aliases defined only in the rc file are **not**
+    // available inside the final command.
+    let inner = build_inner_command(shell, &cmd, &spec.env);
+    let escaped_inner = inner.replace('\'', "'\\''");
+    lines.push(format!("exec {shell_arg} -li -c '{escaped_inner}'"));
 
     lines.push(String::new()); // trailing newline
     lines.join("\n")
@@ -1173,17 +1252,177 @@ fn user_shell() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/bin/sh"))
 }
 
-/// Build login-shell arguments that source the interactive RC file before
-/// executing `cmd`. Used by Direct mode to load user env.
-fn login_shell_args(cmd: &str) -> (PathBuf, Vec<String>) {
-    let shell = user_shell();
-    let name = shell.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let full_cmd = match name {
-        "zsh" => format!(". ~/.zshrc 2>/dev/null; {cmd}"),
-        "bash" => format!(". ~/.bashrc 2>/dev/null; {cmd}"),
-        _ => cmd.to_string(),
+/// Is `key` a valid POSIX environment variable identifier
+/// (`[A-Za-z_][A-Za-z0-9_]*`)? Used only to gate outer-script `export` lines,
+/// which must follow POSIX shell syntax. Inner env injection uses `env(1)`
+/// directly and can carry keys with dashes, dots, etc.
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
     };
-    (shell, vec!["-l".to_string(), "-c".to_string(), full_cmd])
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Is `key` safe to pass to `env(1)` as part of a `KEY=VAL` argv element?
+///
+/// Rejected:
+/// - empty
+/// - contains `=` (would split name/value incorrectly)
+/// - contains NUL (invalid in argv)
+/// - starts with `-` — `env(1)` parses leading-dash operands as options. On
+///   macOS BSD env, `env '-BAD=1' …` errors with `illegal option -- B`. There
+///   is no portable end-of-options sentinel (`--` is not in POSIX env), so the
+///   only safe rule is to refuse keys that begin with a hyphen.
+fn is_env_command_key(key: &str) -> bool {
+    !key.is_empty() && !key.contains('=') && !key.contains('\0') && !key.starts_with('-')
+}
+
+/// Build an `env [-u BAD ...] 'K1=V1' 'K2=V2' ... ` prefix that sets (and
+/// optionally unsets) environment variables for the next exec'd command via
+/// the external `env(1)` program. This is the mechanism we use to re-apply
+/// Coulson-managed env vars **after** the user's login shell sources its rc
+/// files (dotenv, mise, direnv), ensuring our values win regardless of what
+/// the rc file did.
+///
+/// Why `env(1)` instead of POSIX `export KEY='val'`:
+/// 1. Works uniformly across shells (bash/zsh/fish/tcsh/…). Non-POSIX shells
+///    can't parse `export KEY='val';` but they can all invoke external `env`.
+/// 2. Accepts keys that aren't valid POSIX identifiers (e.g. `MY-KEY`), so the
+///    tmux wrapper path can transport env keys identically to the direct path,
+///    which uses Rust `Command::env()` (which also accepts non-POSIX keys).
+/// 3. Supports `-u NAME` to remove inherited variables (used to strip
+///    `BASH_ENV` before `bash -c`, since non-interactive bash sources it
+///    regardless of `--norc`).
+///
+/// Keys containing `=`, NUL, or a leading `-` are skipped (those would break
+/// `env`'s argv parsing). Returns an empty string when no usable keys remain
+/// AND no unset names were requested.
+fn build_env_command_prefix(env: &HashMap<String, String>, unset: &[&str]) -> String {
+    if env.is_empty() && unset.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("env");
+    let mut produced_anything = false;
+    for key in unset {
+        out.push_str(&format!(" -u {key}"));
+        produced_anything = true;
+    }
+    for (k, v) in env {
+        if !is_env_command_key(k) {
+            tracing::warn!(
+                key = %k,
+                "skipping env key (empty, contains '='/NUL, or leads with '-')"
+            );
+            continue;
+        }
+        let kv = format!("{k}={v}");
+        let escaped = kv.replace('\'', "'\\''");
+        out.push_str(&format!(" '{escaped}'"));
+        produced_anything = true;
+    }
+    if produced_anything {
+        out.push(' ');
+        out
+    } else {
+        String::new()
+    }
+}
+
+/// Returns the per-shell flags that follow the shell binary (before `-c`) to
+/// skip startup-file sourcing on the inner non-interactive invocation. The
+/// outer login shell already sourced rc files; the inner shell must NOT
+/// re-read them, otherwise startup files like `~/.zshenv` (zsh) or
+/// `$BASH_ENV` (bash) could re-clobber the env vars `env(1)` just injected.
+///
+/// - zsh: `-f` (NO_RCS) skips `/etc/zshenv`, `~/.zshenv`, `~/.zshrc`, etc.
+/// - bash: `--noprofile --norc` skips `/etc/profile`, `~/.bashrc`, etc.
+///   For non-interactive bash, `BASH_ENV` is sourced regardless of `--norc`,
+///   so it must additionally be removed via `env -u BASH_ENV` (see
+///   `inner_shell_unset_keys`).
+/// - csh/tcsh: `-f` skips `~/.cshrc`/`~/.tcshrc`.
+/// - sh/dash/ksh/fish/…: non-interactive `-c` mode does not source per-user
+///   files by default, so no flags are needed.
+fn inner_shell_no_startup_flags(shell: &Path) -> &'static [&'static str] {
+    let name = shell.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    match name {
+        "zsh" => &["-f"],
+        "bash" => &["--noprofile", "--norc"],
+        "csh" | "tcsh" => &["-f"],
+        _ => &[],
+    }
+}
+
+/// Returns the env var names that must be removed from the inherited
+/// environment before launching the inner shell, to prevent late-stage
+/// startup-file sourcing from clobbering Coulson-managed env vars.
+///
+/// Currently only `bash` needs this: non-interactive bash sources `$BASH_ENV`
+/// even when invoked with `--noprofile --norc`, so the variable must be
+/// stripped via `env -u BASH_ENV`.
+fn inner_shell_unset_keys(shell: &Path) -> &'static [&'static str] {
+    let name = shell.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    match name {
+        "bash" => &["BASH_ENV"],
+        _ => &[],
+    }
+}
+
+/// Build the `exec [env -u BAD ... 'K=V' ...] {shell} [--no-startup-flags] -c '{cmd}'`
+/// inner-command string used by both the wrapper-script (tmux) path and the
+/// direct-spawn (login_shell_args) path. The result is **the** point where
+/// Coulson-managed env vars are re-asserted and the inner shell is locked
+/// down so its own startup files cannot reverse the assertion.
+fn build_inner_command(shell: &Path, cmd: &str, env: &HashMap<String, String>) -> String {
+    let shell_arg = shell_escape_path(shell);
+    let escaped_cmd = cmd.replace('\'', "'\\''");
+    let unset = inner_shell_unset_keys(shell);
+    let env_prefix = build_env_command_prefix(env, unset);
+    let no_startup = inner_shell_no_startup_flags(shell);
+
+    let mut head = format!("exec {env_prefix}{shell_arg}");
+    for flag in no_startup {
+        head.push(' ');
+        head.push_str(flag);
+    }
+    format!("{head} -c '{escaped_cmd}'")
+}
+
+/// Build login-shell arguments that source the interactive RC file, then
+/// use `env(1)` to re-apply Coulson-managed env vars and execute `cmd` via
+/// the **same user shell** in non-interactive mode. Used by the Direct backend.
+/// The shell is taken as an explicit argument so tests can inject a value
+/// without mutating the global `$SHELL` env var.
+///
+/// Why two layers of the user shell:
+/// - Outer `$SHELL -l -c` is a login shell that sources the user's rc file
+///   (mise/direnv/dotenv), which is necessary for tooling that depends on
+///   PATH munging or venv activation.
+/// - The inner `$SHELL [--no-startup-flags] -c` runs the actual command with
+///   full user-shell *syntax* (bash/zsh/fish features like `[[ … ]]`, brace
+///   expansion). Routing the final command through `sh -c` would silently
+///   downgrade Procfile commands to POSIX-only semantics.
+/// - Between the two layers, `env(1)` re-asserts Coulson-managed env vars so
+///   they win against rc-file overrides. The inner shell is launched with
+///   shell-specific "no startup file" flags (e.g. `zsh -f`,
+///   `bash --noprofile --norc`) so that startup files such as `~/.zshenv`
+///   or `$BASH_ENV` cannot run a second time and reverse the env injection.
+///
+/// Caveat: shell functions and aliases defined only in the user's rc file
+/// live in the outer shell process and are **not** available inside the final
+/// command, since the inner `$SHELL -c` is a fresh shell process.
+fn login_shell_args(shell: &Path, cmd: &str, env: &HashMap<String, String>) -> Vec<String> {
+    let name = shell.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let inner = build_inner_command(shell, cmd, env);
+    let full_cmd = match name {
+        "zsh" => format!(". ~/.zshrc 2>/dev/null; {inner}"),
+        "bash" => format!(". ~/.bashrc 2>/dev/null; {inner}"),
+        _ => inner,
+    };
+    vec!["-l".to_string(), "-c".to_string(), full_cmd]
 }
 
 /// Extract pid, alive status, and backend name from a process handle.
@@ -1684,6 +1923,397 @@ mod tests {
     fn parse_env_body_dotenv_empty() {
         let env = parse_env_body("", "text/plain").unwrap();
         assert!(env.is_empty());
+    }
+
+    // -- env key validation and env(1) prefix safety --
+
+    #[test]
+    fn is_valid_env_key_accepts_posix_identifiers() {
+        assert!(is_valid_env_key("PATH"));
+        assert!(is_valid_env_key("DB_URL"));
+        assert!(is_valid_env_key("_PRIVATE"));
+        assert!(is_valid_env_key("A1_B2"));
+    }
+
+    #[test]
+    fn is_valid_env_key_rejects_bad_keys() {
+        assert!(!is_valid_env_key(""));
+        assert!(!is_valid_env_key("1LEADING_DIGIT"));
+        assert!(!is_valid_env_key("MY-KEY"));
+        assert!(!is_valid_env_key("MY.KEY"));
+        assert!(!is_valid_env_key("KEY WITH SPACE"));
+        assert!(!is_valid_env_key("K$(whoami)"));
+        assert!(!is_valid_env_key("K;rm -rf /"));
+    }
+
+    #[test]
+    fn is_env_command_key_accepts_non_posix_but_argv_safe() {
+        // Anything that `env(1)` and Rust `Command::env` will accept:
+        // no `=`, no NUL, no leading `-`, non-empty.
+        assert!(is_env_command_key("PATH"));
+        assert!(is_env_command_key("MY-KEY"));
+        assert!(is_env_command_key("MY.KEY"));
+        assert!(is_env_command_key("1STARTS_WITH_DIGIT"));
+        assert!(is_env_command_key("key with space"));
+    }
+
+    #[test]
+    fn is_env_command_key_rejects_unsafe() {
+        assert!(!is_env_command_key(""));
+        assert!(!is_env_command_key("BAD=KEY"));
+        assert!(!is_env_command_key("FOO\0BAR"));
+        // Leading `-` is parsed by `env(1)` as an option (BSD env on macOS:
+        // `illegal option -- B` for `-BAD=1`).
+        assert!(!is_env_command_key("-BAD"));
+        assert!(!is_env_command_key("-i"));
+        assert!(!is_env_command_key("--long"));
+    }
+
+    #[test]
+    fn build_env_command_prefix_carries_non_posix_keys() {
+        let mut env = HashMap::new();
+        env.insert("GOOD".to_string(), "value".to_string());
+        env.insert("MY-KEY".to_string(), "dash-ok".to_string());
+        let out = build_env_command_prefix(&env, &[]);
+        assert!(out.starts_with("env "));
+        assert!(out.contains("'GOOD=value'"));
+        assert!(out.contains("'MY-KEY=dash-ok'"));
+    }
+
+    #[test]
+    fn build_env_command_prefix_skips_unsafe_keys() {
+        let mut env = HashMap::new();
+        env.insert("GOOD".to_string(), "ok".to_string());
+        env.insert("BAD=KEY".to_string(), "evil".to_string());
+        env.insert("NUL\0KEY".to_string(), "evil".to_string());
+        env.insert("-DASH".to_string(), "evil".to_string());
+        let out = build_env_command_prefix(&env, &[]);
+        assert!(out.contains("'GOOD=ok'"));
+        assert!(!out.contains("BAD=KEY"));
+        assert!(!out.contains("NUL"));
+        // Leading-dash key would make `env(1)` exit with `illegal option`.
+        assert!(!out.contains("-DASH"));
+    }
+
+    #[test]
+    fn build_env_command_prefix_escapes_single_quotes_in_value() {
+        let mut env = HashMap::new();
+        env.insert("K".to_string(), "it's".to_string());
+        let out = build_env_command_prefix(&env, &[]);
+        // Single quote in value is escaped via '\'' (close, literal-quote, reopen).
+        assert_eq!(out, "env 'K=it'\\''s' ");
+    }
+
+    #[test]
+    fn build_env_command_prefix_empty_input() {
+        let env = HashMap::new();
+        assert_eq!(build_env_command_prefix(&env, &[]), "");
+    }
+
+    #[test]
+    fn build_env_command_prefix_all_keys_unsafe_returns_empty() {
+        let mut env = HashMap::new();
+        env.insert("BAD=KEY".to_string(), "x".to_string());
+        env.insert("-DASH".to_string(), "x".to_string());
+        assert_eq!(build_env_command_prefix(&env, &[]), "");
+    }
+
+    #[test]
+    fn build_env_command_prefix_emits_unset_only() {
+        // When no env vars are passed but unset names are, we still need to
+        // emit `env -u NAME ` so callers (e.g. bash path) can strip BASH_ENV.
+        let env = HashMap::new();
+        let out = build_env_command_prefix(&env, &["BASH_ENV"]);
+        assert_eq!(out, "env -u BASH_ENV ");
+    }
+
+    #[test]
+    fn build_env_command_prefix_combines_unset_and_set() {
+        let mut env = HashMap::new();
+        env.insert("PORT".to_string(), "5000".to_string());
+        let out = build_env_command_prefix(&env, &["BASH_ENV"]);
+        // `-u` flags must precede `KEY=VAL` operands so env(1) parses them
+        // as options before walking the operand list.
+        assert!(out.starts_with("env -u BASH_ENV "));
+        assert!(out.contains("'PORT=5000'"));
+        assert!(out.ends_with(' '));
+    }
+
+    // -- per-shell startup-file lockdown --
+
+    #[test]
+    fn inner_shell_no_startup_flags_zsh_uses_no_rcs() {
+        // `zsh -f` sets NO_RCS, which skips /etc/zshenv, ~/.zshenv, ~/.zshrc.
+        // This is the only way to prevent ~/.zshenv from re-clobbering env vars
+        // that env(1) just injected, since .zshenv is read on every zsh start.
+        assert_eq!(
+            inner_shell_no_startup_flags(&PathBuf::from("/bin/zsh")),
+            &["-f"]
+        );
+        assert_eq!(
+            inner_shell_unset_keys(&PathBuf::from("/bin/zsh")),
+            &[] as &[&str]
+        );
+    }
+
+    #[test]
+    fn inner_shell_no_startup_flags_bash_uses_norc_and_unsets_bash_env() {
+        // bash --noprofile --norc skips per-user rc files, but non-interactive
+        // bash *still* sources $BASH_ENV regardless of --norc. The only way to
+        // prevent that is to remove BASH_ENV from the environment via
+        // `env -u BASH_ENV` before invoking bash.
+        assert_eq!(
+            inner_shell_no_startup_flags(&PathBuf::from("/bin/bash")),
+            &["--noprofile", "--norc"]
+        );
+        assert_eq!(
+            inner_shell_unset_keys(&PathBuf::from("/bin/bash")),
+            &["BASH_ENV"]
+        );
+    }
+
+    #[test]
+    fn inner_shell_no_startup_flags_csh_family_uses_dash_f() {
+        assert_eq!(
+            inner_shell_no_startup_flags(&PathBuf::from("/bin/tcsh")),
+            &["-f"]
+        );
+        assert_eq!(
+            inner_shell_no_startup_flags(&PathBuf::from("/bin/csh")),
+            &["-f"]
+        );
+    }
+
+    #[test]
+    fn inner_shell_no_startup_flags_default_shells_get_no_flags() {
+        // sh/dash/ksh/fish in non-interactive `-c` mode do not source per-user
+        // startup files by default, so no extra flags are needed.
+        let no_flags: &[&str] = &[];
+        assert_eq!(
+            inner_shell_no_startup_flags(&PathBuf::from("/bin/sh")),
+            no_flags
+        );
+        assert_eq!(
+            inner_shell_no_startup_flags(&PathBuf::from("/usr/local/bin/fish")),
+            no_flags
+        );
+        assert_eq!(
+            inner_shell_no_startup_flags(&PathBuf::from("/bin/dash")),
+            no_flags
+        );
+    }
+
+    #[test]
+    fn build_inner_command_zsh_skips_zshenv() {
+        // zsh inner must use `-f` so .zshenv cannot re-export PORT=9999
+        // and clobber the env-injected PORT=5000.
+        let mut env = HashMap::new();
+        env.insert("PORT".to_string(), "5000".to_string());
+        let inner = build_inner_command(&PathBuf::from("/bin/zsh"), "echo $PORT", &env);
+        assert!(
+            inner.contains("/bin/zsh -f -c"),
+            "zsh inner must use -f flag, got: {inner}"
+        );
+        assert!(
+            inner.contains("'PORT=5000'"),
+            "Coulson env must still be re-applied via env(1), got: {inner}"
+        );
+        assert!(inner.starts_with("exec env "));
+    }
+
+    #[test]
+    fn build_inner_command_bash_unsets_bash_env_and_uses_norc() {
+        let mut env = HashMap::new();
+        env.insert("PORT".to_string(), "5000".to_string());
+        let inner = build_inner_command(&PathBuf::from("/bin/bash"), "echo $PORT", &env);
+        // env -u BASH_ENV must come BEFORE the KEY=VAL operands.
+        assert!(
+            inner.starts_with("exec env -u BASH_ENV "),
+            "bash inner must strip BASH_ENV first, got: {inner}"
+        );
+        assert!(
+            inner.contains("/bin/bash --noprofile --norc -c"),
+            "bash inner must use --noprofile --norc, got: {inner}"
+        );
+        assert!(inner.contains("'PORT=5000'"));
+    }
+
+    #[test]
+    fn build_inner_command_bash_strips_bash_env_even_without_coulson_env() {
+        // Even when there's no Coulson env to inject, we still need to
+        // remove BASH_ENV so the inner bash cannot source an attacker-pointed
+        // file. The env(1) call must remain.
+        let env = HashMap::new();
+        let inner = build_inner_command(&PathBuf::from("/bin/bash"), "echo hi", &env);
+        assert!(
+            inner.starts_with("exec env -u BASH_ENV /bin/bash --noprofile --norc -c"),
+            "bash with no env must still env -u BASH_ENV, got: {inner}"
+        );
+    }
+
+    #[test]
+    fn build_inner_command_sh_no_env_no_extra_invocation() {
+        // For sh / dash / unknown shells with no env, the inner reduces to
+        // a plain `exec {shell} -c '{cmd}'` — no env(1), no extra flags,
+        // and no spurious double spaces.
+        let env = HashMap::new();
+        let inner = build_inner_command(&PathBuf::from("/bin/sh"), "echo hi", &env);
+        assert_eq!(inner, "exec /bin/sh -c 'echo hi'");
+    }
+
+    #[test]
+    fn build_inner_command_fish_no_extra_flags() {
+        // fish in `-c` mode does not source config.fish, so it needs no
+        // lockdown flags. env(1) is still used to inject Coulson env.
+        let mut env = HashMap::new();
+        env.insert("PORT".to_string(), "5000".to_string());
+        let inner = build_inner_command(&PathBuf::from("/usr/local/bin/fish"), "echo $PORT", &env);
+        assert!(
+            inner.contains("/usr/local/bin/fish -c"),
+            "fish inner has no extra flags, got: {inner}"
+        );
+        assert!(!inner.contains("fish -f"));
+        assert!(!inner.contains("fish --norc"));
+        assert!(inner.contains("'PORT=5000'"));
+    }
+
+    // -- wrapper script: must run final command via user shell, not /bin/sh --
+
+    #[test]
+    fn wrapper_script_runs_final_command_via_user_shell() {
+        use crate::process::provider::ListenTarget;
+        // Inject the shell explicitly — no global env mutation, so the test
+        // is safe to run in parallel with anything that touches `$SHELL`.
+        let shell = PathBuf::from("/bin/zsh");
+        let mut env = HashMap::new();
+        env.insert("PORT".to_string(), "5000".to_string());
+        let spec = ProcessSpec {
+            command: PathBuf::new(), // Procfile-style: empty command
+            args: vec!["bundle exec rails server -p $PORT".to_string()],
+            env,
+            working_dir: PathBuf::from("/tmp"),
+            listen_target: ListenTarget::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 5000,
+            },
+        };
+        let script = generate_wrapper_script(&shell, &spec);
+
+        // The inner command must be exec'd through the user shell
+        // (`/bin/zsh -f -c '…'`), NOT through `sh -c '…'` — otherwise
+        // bash/zsh-only syntax in Procfile commands would silently break.
+        // The `-f` flag is required so .zshenv cannot reverse env injection.
+        assert!(
+            script.contains("/bin/zsh -f -c"),
+            "wrapper should exec via user shell with -f, got:\n{script}"
+        );
+        assert!(
+            !script.contains(" sh -c "),
+            "wrapper must not downgrade to sh -c, got:\n{script}"
+        );
+        // env(1) prefix must still be present so rc-file overrides lose.
+        assert!(
+            script.contains("env '"),
+            "wrapper should re-apply env via env(1), got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn wrapper_script_bash_strips_bash_env_and_skips_norc() {
+        use crate::process::provider::ListenTarget;
+        let shell = PathBuf::from("/bin/bash");
+        let mut env = HashMap::new();
+        env.insert("PORT".to_string(), "5000".to_string());
+        let spec = ProcessSpec {
+            command: PathBuf::new(),
+            args: vec!["bundle exec rails server -p $PORT".to_string()],
+            env,
+            working_dir: PathBuf::from("/tmp"),
+            listen_target: ListenTarget::Tcp {
+                host: "127.0.0.1".to_string(),
+                port: 5000,
+            },
+        };
+        let script = generate_wrapper_script(&shell, &spec);
+        // bash inner must run with --noprofile --norc AND have BASH_ENV
+        // stripped via env(1), so $BASH_ENV cannot source a clobbering script.
+        assert!(
+            script.contains("env -u BASH_ENV"),
+            "bash wrapper must env -u BASH_ENV, got:\n{script}"
+        );
+        assert!(
+            script.contains("/bin/bash --noprofile --norc -c"),
+            "bash wrapper must use --noprofile --norc, got:\n{script}"
+        );
+    }
+
+    #[test]
+    fn login_shell_args_zsh_sources_rc_then_env_then_user_shell() {
+        let shell = PathBuf::from("/bin/zsh");
+        let mut env = HashMap::new();
+        env.insert("PORT".to_string(), "5000".to_string());
+        let args = login_shell_args(&shell, "bundle exec rails server -p $PORT", &env);
+        assert_eq!(args[0], "-l");
+        assert_eq!(args[1], "-c");
+        let body = &args[2];
+        // Sources zsh rc, then exec env(1) prefix, then user shell -f -c '...'
+        assert!(
+            body.contains(". ~/.zshrc"),
+            "expected rc source, got: {body}"
+        );
+        assert!(
+            body.contains("exec env "),
+            "expected env(1) prefix, got: {body}"
+        );
+        // Inner zsh must run with `-f` so `.zshenv` cannot re-clobber the env
+        // we just injected via env(1).
+        assert!(
+            body.contains("/bin/zsh -f -c"),
+            "inner command must run via user shell with -f, got: {body}"
+        );
+        assert!(
+            !body.contains(" sh -c "),
+            "must not downgrade to sh -c, got: {body}"
+        );
+    }
+
+    #[test]
+    fn login_shell_args_bash_strips_bash_env_and_uses_norc() {
+        let shell = PathBuf::from("/bin/bash");
+        let mut env = HashMap::new();
+        env.insert("PORT".to_string(), "5000".to_string());
+        let args = login_shell_args(&shell, "bundle exec rails server -p $PORT", &env);
+        let body = &args[2];
+        // Outer manually sources ~/.bashrc, then env -u BASH_ENV strips the
+        // sneaky BASH_ENV pointer, then bash --noprofile --norc -c runs the
+        // command without re-sourcing any startup file.
+        assert!(
+            body.contains(". ~/.bashrc"),
+            "expected bash rc source, got: {body}"
+        );
+        assert!(
+            body.contains("env -u BASH_ENV"),
+            "expected env -u BASH_ENV, got: {body}"
+        );
+        assert!(
+            body.contains("/bin/bash --noprofile --norc -c"),
+            "inner bash must use --noprofile --norc, got: {body}"
+        );
+    }
+
+    #[test]
+    fn login_shell_args_unknown_shell_skips_rc_source() {
+        // For non-bash/zsh shells we don't manually `. ~/.foorc`; the outer
+        // `$SHELL -l` is responsible for sourcing the right login config.
+        let shell = PathBuf::from("/usr/local/bin/fish");
+        let env = HashMap::new();
+        let args = login_shell_args(&shell, "echo hi", &env);
+        let body = &args[2];
+        assert!(!body.contains(". ~/."), "no manual rc source, got: {body}");
+        assert!(
+            body.contains("/usr/local/bin/fish -c"),
+            "inner command runs via user shell, got: {body}"
+        );
     }
 
     // -- .coulson.toml [env] injection into ProcessSpec --
