@@ -1538,6 +1538,18 @@ fn daemon_http_port(cfg: &CoulsonConfig) -> u16 {
         .unwrap_or_else(|| cfg.listen_http.port())
 }
 
+/// Query the running daemon for its actual runtime directory, falling back to config.
+/// The daemon and CLI may resolve `XDG_RUNTIME_DIR` differently (e.g. systemd vs
+/// interactive shell), so client-side path computation can drift. Asking the daemon
+/// directly avoids that mismatch.
+fn daemon_runtime_dir(cfg: &CoulsonConfig) -> std::path::PathBuf {
+    RpcClient::new(&cfg.control_socket)
+        .call("health.ping", serde_json::json!({}))
+        .ok()
+        .and_then(|v| v.get("runtime_dir")?.as_str().map(std::path::PathBuf::from))
+        .unwrap_or_else(|| cfg.runtime_dir.clone())
+}
+
 /// Print reachable URLs for a domain.
 fn print_app_urls(domain: &str, suffix: &str, port: u16) {
     let ctx = domain::UrlContext {
@@ -2339,10 +2351,8 @@ fn run_logs(
         }
     };
 
-    let log_path = cfg
-        .runtime_dir
-        .join("managed")
-        .join(format!("{bare_name}.log"));
+    let runtime_dir = daemon_runtime_dir(&cfg);
+    let log_path = runtime_dir.join("managed").join(format!("{bare_name}.log"));
 
     if path {
         println!("{}", log_path.display());
