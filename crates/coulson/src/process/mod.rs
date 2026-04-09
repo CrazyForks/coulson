@@ -1383,7 +1383,8 @@ fn build_env_command_prefix(env: &HashMap<String, String>, unset: &[&str]) -> St
 ///   so it must additionally be removed via `env -u BASH_ENV` (see
 ///   `inner_shell_unset_keys`).
 /// - csh/tcsh: `-f` skips `~/.cshrc`/`~/.tcshrc`.
-/// - sh/dash/ksh/fish/…: non-interactive `-c` mode does not source per-user
+/// - fish: `--no-config` skips `config.fish` (fish -c still sources it).
+/// - sh/dash/ksh/…: non-interactive `-c` mode does not source per-user
 ///   files by default, so no flags are needed.
 fn inner_shell_no_startup_flags(shell: &Path) -> &'static [&'static str] {
     let name = shell.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1391,6 +1392,7 @@ fn inner_shell_no_startup_flags(shell: &Path) -> &'static [&'static str] {
         "zsh" => &["-f"],
         "bash" => &["--noprofile", "--norc"],
         "csh" | "tcsh" => &["-f"],
+        "fish" => &["--no-config"],
         _ => &[],
     }
 }
@@ -2125,7 +2127,7 @@ mod tests {
 
     #[test]
     fn inner_shell_no_startup_flags_default_shells_get_no_flags() {
-        // sh/dash/ksh/fish in non-interactive `-c` mode do not source per-user
+        // sh/dash/ksh in non-interactive `-c` mode do not source per-user
         // startup files by default, so no extra flags are needed.
         let no_flags: &[&str] = &[];
         assert_eq!(
@@ -2133,12 +2135,18 @@ mod tests {
             no_flags
         );
         assert_eq!(
-            inner_shell_no_startup_flags(&PathBuf::from("/usr/local/bin/fish")),
-            no_flags
-        );
-        assert_eq!(
             inner_shell_no_startup_flags(&PathBuf::from("/bin/dash")),
             no_flags
+        );
+    }
+
+    #[test]
+    fn inner_shell_no_startup_flags_fish_uses_no_config() {
+        // fish -c *does* source config.fish, so --no-config is needed to
+        // prevent user config from clobbering Coulson-injected env vars.
+        assert_eq!(
+            inner_shell_no_startup_flags(&PathBuf::from("/usr/local/bin/fish")),
+            &["--no-config"]
         );
     }
 
@@ -2201,18 +2209,16 @@ mod tests {
     }
 
     #[test]
-    fn build_inner_command_fish_no_extra_flags() {
-        // fish in `-c` mode does not source config.fish, so it needs no
-        // lockdown flags. env(1) is still used to inject Coulson env.
+    fn build_inner_command_fish_uses_no_config() {
+        // fish -c reads config.fish which can clobber env vars, so
+        // --no-config is required to lock down the inner shell.
         let mut env = HashMap::new();
         env.insert("PORT".to_string(), "5000".to_string());
         let inner = build_inner_command(&PathBuf::from("/usr/local/bin/fish"), "echo $PORT", &env);
         assert!(
-            inner.contains("/usr/local/bin/fish -c"),
-            "fish inner has no extra flags, got: {inner}"
+            inner.contains("/usr/local/bin/fish --no-config -c"),
+            "fish inner must use --no-config flag, got: {inner}"
         );
-        assert!(!inner.contains("fish -f"));
-        assert!(!inner.contains("fish --norc"));
         assert!(inner.contains("'PORT=5000'"));
     }
 
@@ -2344,13 +2350,13 @@ mod tests {
     fn login_shell_args_unknown_shell_skips_rc_source() {
         // For non-bash/zsh shells we don't manually `. ~/.foorc`; the outer
         // `$SHELL -l` is responsible for sourcing the right login config.
-        let shell = PathBuf::from("/usr/local/bin/fish");
+        let shell = PathBuf::from("/bin/ksh");
         let env = HashMap::new();
         let args = login_shell_args(&shell, "echo hi", &env);
         let body = &args[2];
         assert!(!body.contains(". ~/."), "no manual rc source, got: {body}");
         assert!(
-            body.contains("/usr/local/bin/fish -c"),
+            body.contains("/bin/ksh -c"),
             "inner command runs via user shell, got: {body}"
         );
     }
