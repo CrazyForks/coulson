@@ -247,6 +247,11 @@ impl ProcessManager {
             merge_remote_env(&mut spec, remote_env.clone(), &manifest);
         }
 
+        let log_path = resolve_log_path(&manifest, root, &sockets_dir, name);
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
         info!(
             app_id,
             kind,
@@ -292,7 +297,6 @@ impl ProcessManager {
                 );
             }
 
-            let log_path = sockets_dir.join(format!("{name}.log"));
             let log_follower =
                 spawn_compose_log_follower(root, &project_name, &compose_file, &log_path);
 
@@ -303,7 +307,6 @@ impl ProcessManager {
                 log_follower,
             }
         } else {
-            let log_path = sockets_dir.join(format!("{name}.log"));
             self.spawn_process(name, &spec, &log_path, &sockets_dir)?
         };
 
@@ -312,7 +315,6 @@ impl ProcessManager {
         if let Err(e) =
             wait_for_ready(&spec.listen_target, Duration::from_secs(ready_timeout_secs)).await
         {
-            let log_path = sockets_dir.join(format!("{name}.log"));
             log_tail(&log_path, name);
             // Clean up the started process/containers to avoid leaking resources
             kill_handle(handle).await;
@@ -330,6 +332,7 @@ impl ProcessManager {
             &sockets_dir,
             &manifest,
             env_url_env.as_ref(),
+            &log_path,
         );
 
         let app_idle_timeout = manifest_idle_timeout(&manifest);
@@ -426,8 +429,10 @@ impl ProcessManager {
                 for companion in removed.companions {
                     kill_handle(companion.handle).await;
                 }
-                let log_path = self.runtime_dir.join(format!("managed/{name}.log"));
-                log_tail(&log_path, name);
+                let manifest = load_coulson_toml_manifest(root);
+                let fallback_dir = self.runtime_dir.join("managed");
+                let timed_out_log = resolve_log_path(&manifest, root, &fallback_dir, name);
+                log_tail(&timed_out_log, name);
                 kill_handle(removed.primary.handle).await;
                 cleanup_listen_target(&removed.primary.listen_target);
                 anyhow::bail!(
@@ -451,6 +456,11 @@ impl ProcessManager {
 
         if let Some(remote_env) = env_url_env.as_ref() {
             merge_remote_env(&mut spec, remote_env.clone(), &manifest);
+        }
+
+        let log_path = resolve_log_path(&manifest, root, &sockets_dir, name);
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent).ok();
         }
 
         info!(
@@ -495,7 +505,6 @@ impl ProcessManager {
                 );
             }
 
-            let log_path = sockets_dir.join(format!("{name}.log"));
             let log_follower =
                 spawn_compose_log_follower(root, &project_name, &compose_file, &log_path);
 
@@ -506,7 +515,6 @@ impl ProcessManager {
                 log_follower,
             }
         } else {
-            let log_path = sockets_dir.join(format!("{name}.log"));
             self.spawn_process(name, &spec, &log_path, &sockets_dir)?
         };
 
@@ -519,6 +527,7 @@ impl ProcessManager {
             &sockets_dir,
             &manifest,
             env_url_env.as_ref(),
+            &log_path,
         );
 
         let app_idle_timeout = manifest_idle_timeout(&manifest);
@@ -744,6 +753,7 @@ impl ProcessManager {
         sockets_dir: &Path,
         manifest: &Option<serde_json::Value>,
         remote_env: Option<&HashMap<String, String>>,
+        primary_log_path: &Path,
     ) -> Vec<CompanionProcess> {
         if companion_types.is_empty() || kind != "procfile" {
             return vec![];
@@ -782,7 +792,10 @@ impl ProcessManager {
                     } else {
                         apply_manifest_env(&mut spec, manifest);
                     }
-                    let log_path = sockets_dir.join(format!("{name}-{ptype}.log"));
+                    let log_path = primary_log_path
+                        .parent()
+                        .unwrap_or(sockets_dir)
+                        .join(format!("{name}-{ptype}.log"));
                     match self.spawn_process(
                         &format!("{name}-{ptype}"),
                         &spec,
@@ -938,6 +951,32 @@ impl ProcessManager {
 }
 
 /// Extract `idle_timeout_secs` from a `.coulson.toml` manifest JSON value.
+/// Resolve the effective log file path for a managed app.
+///
+/// If the manifest specifies a `log_path`, resolve it (relative paths are
+/// joined to the app root). Otherwise fall back to `{sockets_dir}/{name}.log`.
+pub(crate) fn resolve_log_path(
+    manifest: &Option<serde_json::Value>,
+    root: &Path,
+    sockets_dir: &Path,
+    name: &str,
+) -> PathBuf {
+    if let Some(raw) = manifest
+        .as_ref()
+        .and_then(|m| m.get("log_path"))
+        .and_then(|v| v.as_str())
+    {
+        let p = Path::new(raw);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            root.join(p)
+        }
+    } else {
+        sockets_dir.join(format!("{name}.log"))
+    }
+}
+
 fn manifest_idle_timeout(manifest: &Option<serde_json::Value>) -> Option<Duration> {
     manifest
         .as_ref()?
@@ -948,7 +987,7 @@ fn manifest_idle_timeout(manifest: &Option<serde_json::Value>) -> Option<Duratio
 
 /// Load `.coulson.toml` from app root and convert to serde_json::Value for providers.
 /// Logs errors instead of silently ignoring them.
-fn load_coulson_toml_manifest(root: &Path) -> Option<serde_json::Value> {
+pub(crate) fn load_coulson_toml_manifest(root: &Path) -> Option<serde_json::Value> {
     let toml_path = root.join(".coulson.toml");
     let raw = match std::fs::read_to_string(&toml_path) {
         Ok(r) => r,
@@ -2357,6 +2396,52 @@ OVERRIDE = "toml_wins"
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- resolve_log_path --
+
+    #[test]
+    fn resolve_log_path_falls_back_to_default() {
+        let manifest: Option<serde_json::Value> = None;
+        let root = Path::new("/app");
+        let sockets = Path::new("/run/coulson/managed");
+        assert_eq!(
+            resolve_log_path(&manifest, root, sockets, "myapp"),
+            PathBuf::from("/run/coulson/managed/myapp.log")
+        );
+    }
+
+    #[test]
+    fn resolve_log_path_absolute() {
+        let manifest = Some(serde_json::json!({ "log_path": "/var/log/myapp.log" }));
+        let root = Path::new("/app");
+        let sockets = Path::new("/run/coulson/managed");
+        assert_eq!(
+            resolve_log_path(&manifest, root, sockets, "myapp"),
+            PathBuf::from("/var/log/myapp.log")
+        );
+    }
+
+    #[test]
+    fn resolve_log_path_relative_joins_root() {
+        let manifest = Some(serde_json::json!({ "log_path": "tmp/log/web.log" }));
+        let root = Path::new("/home/user/myapp");
+        let sockets = Path::new("/run/coulson/managed");
+        assert_eq!(
+            resolve_log_path(&manifest, root, sockets, "myapp"),
+            PathBuf::from("/home/user/myapp/tmp/log/web.log")
+        );
+    }
+
+    #[test]
+    fn resolve_log_path_empty_manifest_uses_default() {
+        let manifest = Some(serde_json::json!({}));
+        let root = Path::new("/app");
+        let sockets = Path::new("/run/coulson/managed");
+        assert_eq!(
+            resolve_log_path(&manifest, root, sockets, "myapp"),
+            PathBuf::from("/run/coulson/managed/myapp.log")
+        );
     }
 
     // -- prefetch_env_url returns None when no env_url configured --

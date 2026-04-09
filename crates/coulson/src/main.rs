@@ -2334,25 +2334,48 @@ fn run_logs(
     let client = RpcClient::new(&cfg.control_socket);
 
     // Try RPC first, fallback to local DB
-    let (bare_name, _app_id) = match resolve_app_id(&client, &cfg, name.clone()) {
-        Ok(v) => v,
+    let (bare_name, _app_id, app_root) = match resolve_app_id(&client, &cfg, name.clone()) {
+        Ok((n, id)) => {
+            let state = build_state(&cfg).ok();
+            let app = state
+                .as_ref()
+                .and_then(|s| s.store.list_all().ok())
+                .and_then(|apps| apps.into_iter().find(|a| a.id.0 == id));
+            let root = app.and_then(|a| match a.target {
+                crate::domain::BackendTarget::Managed { root, .. } => Some(root),
+                _ => None,
+            });
+            (n, id, root)
+        }
         Err(_) => {
             let bare_name = resolve_app_name(&cfg, name.as_deref())?;
             let domain_match = format!("{bare_name}.{}", cfg.domain_suffix);
             let state = build_state(&cfg)?;
             let apps = state.store.list_all()?;
             let app = apps
-                .iter()
+                .into_iter()
                 .find(|a| {
                     a.name == bare_name || a.domain.0 == domain_match || a.domain.0 == bare_name
                 })
                 .ok_or_else(|| anyhow::anyhow!("app not found: {bare_name}"))?;
-            (bare_name, app.id.0)
+            let id = app.id.0;
+            let root = match &app.target {
+                crate::domain::BackendTarget::Managed { root, .. } => Some(root.clone()),
+                _ => None,
+            };
+            (bare_name, id, root)
         }
     };
 
-    let runtime_dir = daemon_runtime_dir(&cfg);
-    let log_path = runtime_dir.join("managed").join(format!("{bare_name}.log"));
+    let sockets_dir = daemon_runtime_dir(&cfg).join("managed");
+    let log_path = match app_root {
+        Some(ref root) => {
+            let root = std::path::Path::new(root);
+            let manifest = crate::process::load_coulson_toml_manifest(root);
+            crate::process::resolve_log_path(&manifest, root, &sockets_dir, &bare_name)
+        }
+        None => sockets_dir.join(format!("{bare_name}.log")),
+    };
 
     if path {
         println!("{}", log_path.display());

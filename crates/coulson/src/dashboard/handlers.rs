@@ -534,11 +534,15 @@ pub async fn page_process_log(
         Ok(Some(app)) => app,
         _ => return html_response(StatusCode::NOT_FOUND, render_not_found(&state.shared)),
     };
-    let log_path = state
-        .shared
-        .runtime_dir
-        .join("managed")
-        .join(format!("{}.log", app.name));
+    let sockets_dir = state.shared.runtime_dir.join("managed");
+    let log_path = match &app.target {
+        crate::domain::BackendTarget::Managed { root, .. } => {
+            let root = std::path::Path::new(root);
+            let manifest = crate::process::load_coulson_toml_manifest(root);
+            crate::process::resolve_log_path(&manifest, root, &sockets_dir, &app.name)
+        }
+        _ => sockets_dir.join(format!("{}.log", app.name)),
+    };
     let log_content = std::fs::read_to_string(&log_path).ok().map(|content| {
         let lines: Vec<&str> = content.lines().collect();
         let start = lines.len().saturating_sub(200);
