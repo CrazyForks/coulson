@@ -397,33 +397,46 @@ fn unsupported_replay(msg: &str) -> ReplayOutcome {
 }
 
 pub async fn execute_replay(
-    store: &crate::store::AppRepository,
+    state: &SharedState,
     app_name: &str,
     request_id: &str,
 ) -> anyhow::Result<ReplayOutcome> {
-    let app = store
+    let app = state
+        .store
         .get_by_name(app_name)?
         .ok_or_else(|| anyhow::anyhow!("app not found"))?;
-    let captured = store
+    let captured = state
+        .store
         .get_request_log(request_id)?
         .ok_or_else(|| anyhow::anyhow!("request not found"))?;
     if captured.app_id != app.id.0 {
         anyhow::bail!("request does not belong to app");
     }
 
-    let base_url = match &app.target {
-        BackendTarget::Tcp { host, port } => format!("http://{host}:{port}"),
-        BackendTarget::UnixSocket { .. } => {
-            return Ok(unsupported_replay(
-                "Replay not supported for Unix socket targets",
-            ));
-        }
-        _ => {
-            return Ok(unsupported_replay(
-                "Replay not supported for this target type",
-            ));
-        }
+    // StaticDir targets have no upstream to replay against — the proxy serves
+    // them directly and there's nothing meaningful to compare.
+    if matches!(&app.target, BackendTarget::StaticDir { .. }) {
+        return Ok(unsupported_replay(
+            "Replay not supported for static directory targets",
+        ));
+    }
+
+    // Replay through the local proxy so that all target kinds (TCP, Unix
+    // socket, Managed) are handled by the existing resolution pipeline. The
+    // `x-coulson-replay` header pins the replay to the captured `app_id`
+    // and makes the proxy skip `mw_auth`/`mw_force_https` (trusted because
+    // the header is only honored for loopback clients). Inspector capture
+    // still runs — the replayed request shows up in the log just like any
+    // other, which is explicitly what we want so users can compare.
+    let port = state.listen_http.port();
+    let connect_authority = if state.listen_http.ip().is_unspecified() {
+        format!("127.0.0.1:{port}")
+    } else {
+        // Use SocketAddr's Display which brackets IPv6 addresses for URLs.
+        state.listen_http.to_string()
     };
+    let host_header = extract_host_header(&captured.request_headers)
+        .unwrap_or_else(|| derive_host_from_domain(app.domain.0.as_str()));
 
     let path = &captured.path;
     let query = captured
@@ -431,10 +444,11 @@ pub async fn execute_replay(
         .as_ref()
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
-    let url = format!("{base_url}{path}{query}");
+    let url = format!("http://{connect_authority}{path}{query}");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_default();
     let method: reqwest::Method = captured.method.parse().unwrap_or(reqwest::Method::GET);
@@ -449,6 +463,10 @@ pub async fn execute_replay(
         }
         req_builder = req_builder.header(k.as_str(), v.as_str());
     }
+    req_builder = req_builder.header("host", host_header);
+    // Pin replay to the captured app id so the proxy bypasses host routing
+    // and cannot be misrouted by default_app/CNAME/domain drift.
+    req_builder = req_builder.header(crate::proxy::REPLAY_HEADER, app.id.0.to_string());
     if let Some(ref body) = captured.request_body {
         req_builder = req_builder.body(body.clone());
     }
@@ -484,6 +502,25 @@ pub async fn execute_replay(
             body: None,
             error: Some(format!("Replay failed: {e}")),
         }),
+    }
+}
+
+/// Pull the original Host header out of the captured request headers JSON.
+fn extract_host_header(headers_json: &str) -> Option<String> {
+    let map: std::collections::HashMap<String, String> = serde_json::from_str(headers_json).ok()?;
+    map.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.clone())
+}
+
+/// Turn a stored domain (possibly a wildcard like `*.foo.coulson.local`) into
+/// a valid Host header. The captured request is preferred over this, but some
+/// older logs may not have recorded a Host header.
+fn derive_host_from_domain(domain: &str) -> String {
+    if let Some(rest) = domain.strip_prefix("*.") {
+        format!("wildcard.{rest}")
+    } else {
+        domain.to_string()
     }
 }
 

@@ -62,6 +62,10 @@ impl ProcessProvider for AsgiProvider {
         }
 
         let mut env = std::collections::HashMap::new();
+        // Force unbuffered stdio so uvicorn startup messages and per-request
+        // access logs hit the log file immediately instead of sitting in
+        // Python's block buffer (which kicks in when stdout is a file).
+        env.insert("PYTHONUNBUFFERED".into(), "1".into());
         env.extend(app.env_overrides.clone());
         env.remove("ASGI_RELOAD");
 

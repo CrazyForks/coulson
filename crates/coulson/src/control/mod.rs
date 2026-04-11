@@ -377,12 +377,8 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 Ok(_) => return render_err(req.request_id, ControlError::NotFound),
                 Err(e) => return internal_error(req.request_id, e.to_string()),
             }
-            match crate::dashboard::execute_replay(
-                &state.store,
-                &params.app_name,
-                &params.request_id,
-            )
-            .await
+            match crate::dashboard::execute_replay(state, &params.app_name, &params.request_id)
+                .await
             {
                 Ok(outcome) => {
                     if let Some(ref err) = outcome.error {

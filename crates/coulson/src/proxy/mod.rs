@@ -45,7 +45,7 @@ async fn mw_auth(session: &mut Session, route: &RouteRule) -> Result<Flow> {
     if via_tunnel {
         if let (Some(user), Some(pass)) = (&route.basic_auth_user, &route.basic_auth_pass) {
             if !check_basic_auth(session, user, pass) {
-                write_auth_required(session).await?;
+                write_auth_required(session, "coulson").await?;
                 return Ok(Flow::Done);
             }
         }
@@ -135,6 +135,235 @@ struct BridgeProxy {
     dashboard_router: axum::Router,
 }
 
+const INSPECTOR_PATH_PREFIX: &str = "/_coulson";
+const EMBEDDED_HEADER: &str = "x-coulson-embedded";
+/// Internal marker header injected by `execute_replay` so the proxy skips
+/// `mw_auth`, `mw_force_https` and inspector capture for replay requests.
+/// Stripped before forwarding to the backend.
+pub const REPLAY_HEADER: &str = "x-coulson-replay";
+
+fn is_inspector_path(path: &str) -> bool {
+    path.starts_with("/_coulson/") || path == "/_coulson"
+}
+
+impl BridgeProxy {
+    /// Handle `/_coulson/` embedded inspector requests.
+    /// Authenticates with independent basic auth, rewrites URI to dashboard paths,
+    /// and bridges to the existing dashboard router.
+    async fn handle_embedded_inspector(
+        &self,
+        session: &mut Session,
+        route: &RouteRule,
+        req_path: &str,
+    ) -> Result<bool> {
+        // Inspector auth: must be configured, otherwise pretend it doesn't exist
+        let (Some(ref user), Some(ref pass)) = (
+            &self.shared.inspector_username,
+            &self.shared.inspector_password,
+        ) else {
+            write_error_page(session, 404, "route_not_found").await?;
+            return Ok(true);
+        };
+
+        // Respect the app's force_https setting — redirect before auth challenge
+        // so credentials are never sent over plain HTTP.
+        if mw_force_https(
+            session,
+            route,
+            self.shared.listen_https.map(|a| a.port()),
+            self.shared.use_default_https_port(),
+        )
+        .await?
+            == Flow::Done
+        {
+            return Ok(true);
+        }
+
+        // Always require basic auth (local + tunnel)
+        if !check_basic_auth(session, user, pass) {
+            write_auth_required(session, "Coulson Inspector").await?;
+            return Ok(true);
+        }
+
+        // Resolve app name from route
+        let app_name = match route.app_id {
+            Some(id) => match self.shared.store.get_by_id(id) {
+                Ok(Some(app)) => app.name,
+                _ => {
+                    write_error_page(session, 404, "route_not_found").await?;
+                    return Ok(true);
+                }
+            },
+            None => {
+                write_error_page(session, 404, "route_not_found").await?;
+                return Ok(true);
+            }
+        };
+
+        // Rewrite URI: /_coulson/... → /apps/{name}/...
+        let sub_path = req_path.strip_prefix(INSPECTOR_PATH_PREFIX).unwrap_or("/");
+        let new_path = if sub_path.is_empty() || sub_path == "/" {
+            format!("/apps/{app_name}/requests")
+        } else {
+            format!("/apps/{app_name}{sub_path}")
+        };
+
+        if let Ok(uri) = new_path.parse::<http::Uri>() {
+            session.req_header_mut().set_uri(uri);
+        }
+
+        // Signal embedded mode to dashboard handlers
+        session
+            .req_header_mut()
+            .insert_header(EMBEDDED_HEADER, "1")?;
+
+        crate::dashboard::bridge(session, self.dashboard_router.clone()).await?;
+        Ok(true)
+    }
+
+    /// Handle a loopback-authenticated replay request pinned to a specific
+    /// app id. The caller already verified `is_loopback_client(session)` and
+    /// stripped `REPLAY_HEADER`. This bypasses host routing — the route is
+    /// looked up by `app_id` directly so `default_app`/CNAME/domain drift
+    /// since capture cannot cause the replay to hit a different app. It also
+    /// skips `mw_auth` and `mw_force_https`, which makes sense because the
+    /// dashboard already authenticated the user and the request is strictly
+    /// in-process over 127.0.0.1.
+    ///
+    /// The route is built directly from `store.get_by_id(app_id)` rather than
+    /// scanned from the live route table. That table only holds *enabled*
+    /// apps (`list_enabled()` in `reload_routes`), so going through it would
+    /// regress replay to 404 whenever a user temporarily disables an app but
+    /// still wants to diagnose an old request from the dashboard.
+    async fn handle_replay_request(
+        &self,
+        session: &mut Session,
+        ctx: &mut ProxyCtx,
+        app_id: i64,
+    ) -> Result<bool> {
+        let req_path = session.req_header().uri.path().to_string();
+
+        // Look up the app by id. Works for disabled apps as well, because the
+        // store does not filter on `enabled`. If the row is gone we genuinely
+        // have nothing to replay against.
+        let app = match self.shared.store.get_by_id(app_id) {
+            Ok(Some(app)) => app,
+            Ok(None) => {
+                write_error_page(session, 404, "route_not_found").await?;
+                return Ok(true);
+            }
+            Err(e) => {
+                tracing::warn!(app_id, error = %e, "replay: failed to load app from store");
+                write_error_page(session, 500, "internal_error").await?;
+                return Ok(true);
+            }
+        };
+
+        let route = RouteRule::from_app_spec(app);
+
+        // The captured request path must still fit the app's configured
+        // `path_prefix`; otherwise the replay would be meaningless (we'd be
+        // sending to an upstream the app was never responsible for).
+        let path_ok = match route.path_prefix.as_deref() {
+            None | Some("/") => true,
+            Some(prefix) => req_path == prefix || req_path.starts_with(&format!("{prefix}/")),
+        };
+        if !path_ok {
+            write_error_page(session, 404, "route_not_found").await?;
+            return Ok(true);
+        }
+
+        // CORS and static lookups still apply — they're not auth checks.
+        if mw_cors(session, &route).await? == Flow::Done {
+            return Ok(true);
+        }
+        if mw_static(session, &route, &req_path).await? == Flow::Done {
+            return Ok(true);
+        }
+
+        // Resolve the concrete upstream target.
+        if let BackendTarget::StaticDir { ref root } = route.target {
+            serve_static(session, root, &req_path, route.cors_enabled).await?;
+            return Ok(true);
+        }
+
+        let resolved_target = if let BackendTarget::Managed {
+            ref app_id,
+            ref root,
+            ref kind,
+            ref name,
+        } = route.target
+        {
+            let root_path = std::path::PathBuf::from(root);
+            let status = crate::process::prepare_and_ensure_started(
+                &self.process_manager,
+                *app_id,
+                name,
+                &root_path,
+                kind,
+            )
+            .await
+            .map_err(|e| Error::explain(ErrorType::ConnectError, format!("{e}")))?;
+            match status {
+                StartStatus::Ready(listen_target) => {
+                    pm_mark_active(&self.process_manager, *app_id).await;
+                    listen_target_to_backend(listen_target)
+                }
+                StartStatus::Starting => {
+                    match await_managed_ready(
+                        session,
+                        &self.process_manager,
+                        *app_id,
+                        name,
+                        &root_path,
+                        kind,
+                    )
+                    .await?
+                    {
+                        Some(target) => target,
+                        None => return Ok(true),
+                    }
+                }
+            }
+        } else {
+            route.target.clone()
+        };
+
+        if route.spa_rewrite && should_rewrite_for_spa(&req_path) {
+            session.req_header_mut().set_uri("/".try_into().unwrap());
+        }
+
+        // Inspector capture — replay is recorded just like any other request,
+        // so users can see what the replay actually sent/received.
+        if route.inspect_enabled {
+            ctx.inspect = true;
+            ctx.inspect_app_id = route.app_id;
+            ctx.inspect_store = Some(self.shared.store.clone());
+            ctx.inspect_max_requests = self.shared.inspect_max_requests;
+            ctx.inspect_tx = Some(self.shared.inspect_tx.clone());
+            ctx.inspect_start = Some(std::time::Instant::now());
+            ctx.inspect_method = Some(session.req_header().method.to_string());
+            let uri = &session.req_header().uri;
+            ctx.inspect_path = Some(uri.path().to_string());
+            ctx.inspect_query = uri.query().map(|q| q.to_string());
+            let headers: std::collections::HashMap<String, String> = session
+                .req_header()
+                .headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect();
+            ctx.inspect_req_headers = serde_json::to_string(&headers).ok();
+        }
+
+        ctx.target = Some(resolved_target);
+        ctx.timeout_ms = route.timeout_ms;
+        ctx.cors_enabled = route.cors_enabled;
+        ctx.spa_rewrite = route.spa_rewrite;
+        ctx.is_upgrade = session.req_header().headers.get("upgrade").is_some();
+        Ok(false)
+    }
+}
+
 const INSPECT_BODY_MAX: usize = 65536;
 
 #[derive(Default)]
@@ -173,6 +402,31 @@ impl ProxyHttp for BridgeProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // Replay marker handling. The header carries the captured app's id so
+        // replay is pinned to that specific app, NOT to whatever the current
+        // host routing would resolve to (default_app/CNAME/domain config may
+        // have drifted since capture). The marker is only honored when the
+        // client is a loopback address — otherwise it's a forgery attempt and
+        // we strip it so normal auth/force-https still apply.
+        if session.req_header().headers.contains_key(REPLAY_HEADER) {
+            let header_val = session
+                .req_header()
+                .headers
+                .get(REPLAY_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            // Always strip — the header is internal-only and must never reach
+            // upstream or be re-used by a second hop.
+            session.req_header_mut().remove_header(REPLAY_HEADER);
+            if is_loopback_client(session) {
+                if let Some(app_id) = header_val.as_deref().and_then(|s| s.parse::<i64>().ok()) {
+                    return self.handle_replay_request(session, ctx, app_id).await;
+                }
+            } else {
+                tracing::warn!("rejecting x-coulson-replay header from non-loopback client");
+            }
+        }
+
         // HTTP/2 uses :authority pseudo-header; HTTP/1.1 uses Host header
         let raw_host = session
             .req_header()
@@ -212,6 +466,18 @@ impl ProxyHttp for BridgeProxy {
             if let Some(ref app_domain) = effective_host {
                 // Proxy to default app — strict lookup (no default.{suffix} fallback)
                 let req_path = session.req_header().uri.path().to_string();
+                // Embedded inspector intercept: must run before path_prefix matching
+                if is_inspector_path(&req_path) {
+                    let route = {
+                        let routes = self.shared.routes.read();
+                        any_route(routes.get(app_domain.as_str()))
+                    };
+                    if let Some(route) = route {
+                        return self
+                            .handle_embedded_inspector(session, &route, &req_path)
+                            .await;
+                    }
+                }
                 let route = {
                     let routes = self.shared.routes.read();
                     select_route(routes.get(app_domain.as_str()), &req_path)
@@ -328,6 +594,22 @@ impl ProxyHttp for BridgeProxy {
         }
 
         let req_path = session.req_header().uri.path().to_string();
+
+        // Embedded inspector intercept: must run before route resolution
+        // because /_coulson/ paths won't match app path_prefix rules.
+        if is_inspector_path(&req_path) {
+            let route = {
+                let routes = self.shared.routes.read();
+                resolve_any_route(&routes, &host, &self.shared.domain_suffix)
+            };
+            if let Some(route) = route {
+                return self
+                    .handle_embedded_inspector(session, &route, &req_path)
+                    .await;
+            }
+            write_error_page(session, 404, "route_not_found").await?;
+            return Ok(true);
+        }
 
         let route = {
             let routes = self.shared.routes.read();
@@ -1183,12 +1465,12 @@ fn decode_basic_auth(encoded: &str) -> Option<(String, String)> {
     Some((user.to_string(), pass.to_string()))
 }
 
-async fn write_auth_required(session: &mut Session) -> Result<()> {
+async fn write_auth_required(session: &mut Session, realm: &str) -> Result<()> {
     let body = r#"{"error":"unauthorized"}"#;
     let mut resp = ResponseHeader::build(401, None)?;
     resp.insert_header("content-type", "application/json")?;
     resp.insert_header("content-length", body.len().to_string())?;
-    resp.insert_header("www-authenticate", r#"Basic realm="coulson""#)?;
+    resp.insert_header("www-authenticate", format!(r#"Basic realm="{realm}""#))?;
     resp.insert_header("connection", "close")?;
 
     session.write_response_header(Box::new(resp), false).await?;
@@ -1495,6 +1777,63 @@ fn resolve_target(
     None
 }
 
+/// Like `resolve_target` but ignores path_prefix matching — returns any route
+/// for the host. Used by embedded inspector to identify the app owning a domain
+/// even when no root ("/") route exists.
+fn resolve_any_route(
+    routes: &HashMap<String, Vec<RouteRule>>,
+    host: &str,
+    domain_suffix: &str,
+) -> Option<RouteRule> {
+    if let Some(hit) = any_route(routes.get(host)) {
+        return Some(hit);
+    }
+
+    // Wildcard host matching (e.g. *.example.com)
+    if let Some(hit) = any_wildcard_route(routes, host) {
+        return Some(hit);
+    }
+
+    let mut parts: Vec<&str> = host.split('.').collect();
+    while parts.len() > 2 {
+        parts.remove(0);
+        let candidate = parts.join(".");
+        if let Some(hit) = any_route(routes.get(&candidate)) {
+            return Some(hit);
+        }
+    }
+
+    let default_host = format!("default.{domain_suffix}");
+    if let Some(hit) = any_route(routes.get(&default_host)) {
+        return Some(hit);
+    }
+
+    if domain_suffix != LOCALHOST_SUFFIX && host.ends_with(&format!(".{LOCALHOST_SUFFIX}")) {
+        let default_localhost = format!("default.{LOCALHOST_SUFFIX}");
+        if let Some(hit) = any_route(routes.get(&default_localhost)) {
+            return Some(hit);
+        }
+    }
+
+    None
+}
+
+/// Like `select_wildcard_route` but ignores path_prefix matching.
+fn any_wildcard_route(routes: &HashMap<String, Vec<RouteRule>>, host: &str) -> Option<RouteRule> {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    for i in 1..(parts.len() - 1) {
+        let suffix = parts[i..].join(".");
+        let candidate = format!("*.{suffix}");
+        if let Some(hit) = any_route(routes.get(&candidate)) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
 fn select_wildcard_route(
     routes: &HashMap<String, Vec<RouteRule>>,
     host: &str,
@@ -1528,6 +1867,13 @@ fn select_route(candidates: Option<&Vec<RouteRule>>, path: &str) -> Option<Route
         }
     }
     None
+}
+
+/// Pick any route for a host, ignoring path_prefix matching.
+/// Used by the embedded inspector to identify which app owns a domain.
+/// Returns the shortest-prefix (most general) route as the "default" app.
+fn any_route(candidates: Option<&Vec<RouteRule>>) -> Option<RouteRule> {
+    candidates?.last().cloned()
 }
 
 // ---------------------------------------------------------------------------
