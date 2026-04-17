@@ -145,6 +145,10 @@ pub fn templates() -> &'static Tera {
                     "partials/lan_toggle.html",
                     include_str!("templates/partials/lan_toggle.html"),
                 ),
+                (
+                    "pages/log_tail.html",
+                    include_str!("templates/pages/log_tail.html"),
+                ),
             ])
             .expect("template parse error");
             tera.autoescape_on(vec![".html"]);

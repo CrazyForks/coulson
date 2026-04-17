@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tokio::process::{Child, Command};
+use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use std::process::Stdio;
@@ -26,6 +27,14 @@ use provider::{ManagedApp, ProcessSpec};
 /// Dedicated tmux socket name — isolates coulson sessions from user's own tmux.
 const TMUX_SOCKET: &str = "coulson";
 
+/// A single log line emitted by a managed process.
+#[derive(Clone, Debug)]
+pub struct LogLine {
+    pub app_id: i64,
+    pub process_type: String,
+    pub line: String,
+}
+
 pub type ProcessManagerHandle = Arc<tokio::sync::Mutex<ProcessManager>>;
 
 pub struct ProcessManagerConfig {
@@ -35,6 +44,7 @@ pub struct ProcessManagerConfig {
     pub backend: ProcessBackend,
     pub hook_manager: Arc<HookManager>,
     pub hook_factory: HookContextFactory,
+    pub log_tx: broadcast::Sender<LogLine>,
 }
 
 pub fn new_process_manager(cfg: ProcessManagerConfig) -> ProcessManagerHandle {
@@ -103,6 +113,7 @@ pub struct ProcessManager {
     use_tmux: bool,
     hook_manager: Arc<HookManager>,
     hook_factory: HookContextFactory,
+    log_tx: broadcast::Sender<LogLine>,
 }
 
 pub enum StartStatus {
@@ -154,6 +165,7 @@ impl ProcessManager {
             use_tmux,
             hook_manager: cfg.hook_manager,
             hook_factory: cfg.hook_factory,
+            log_tx: cfg.log_tx,
         }
     }
 
@@ -168,6 +180,24 @@ impl ProcessManager {
     /// Whether the tmux backend is active.
     pub fn uses_tmux(&self) -> bool {
         self.use_tmux
+    }
+
+    /// List process types for a managed app (e.g. `["web", "worker"]`).
+    pub fn process_types(&self, app_id: i64) -> Vec<String> {
+        let Some(group) = self.processes.get(&app_id) else {
+            return vec![];
+        };
+        let mut types = vec!["web".to_string()];
+        for c in &group.companions {
+            types.push(c.process_type.clone());
+        }
+        types
+    }
+
+    /// Whether log broadcast is available (direct/compose backends).
+    /// Tmux uses `pipe-pane` to file, so no broadcast channel.
+    pub fn has_log_broadcast(&self) -> bool {
+        !self.use_tmux
     }
 
     /// Quick check: is there a live process for this app_id (ready or starting)?
@@ -264,6 +294,8 @@ impl ProcessManager {
 
         cleanup_listen_target(&spec.listen_target);
 
+        let log_tx = &self.log_tx;
+
         let handle = if kind == "docker" {
             // Docker Compose: run `docker compose up -d --build` synchronously,
             // since it exits immediately after starting containers in the background.
@@ -297,8 +329,14 @@ impl ProcessManager {
                 );
             }
 
-            let log_follower =
-                spawn_compose_log_follower(root, &project_name, &compose_file, &log_path);
+            let log_follower = spawn_compose_log_follower(
+                root,
+                &project_name,
+                &compose_file,
+                &log_path,
+                log_tx,
+                app_id,
+            );
 
             ProcessHandle::Compose {
                 project_dir: root.to_path_buf(),
@@ -307,7 +345,7 @@ impl ProcessManager {
                 log_follower,
             }
         } else {
-            self.spawn_process(name, &spec, &log_path, &sockets_dir)?
+            self.spawn_process(name, &spec, &log_path, &sockets_dir, log_tx, app_id, "web")?
         };
 
         // Docker builds can be slow — use a longer readiness timeout.
@@ -333,6 +371,7 @@ impl ProcessManager {
             &manifest,
             env_url_env.as_ref(),
             &log_path,
+            log_tx,
         );
 
         let app_idle_timeout = manifest_idle_timeout(&manifest);
@@ -475,6 +514,8 @@ impl ProcessManager {
 
         cleanup_listen_target(&spec.listen_target);
 
+        let log_tx = &self.log_tx;
+
         let handle = if kind == "docker" {
             let project_name = name.to_string();
             let compose_file = spec.args.get(2).cloned().unwrap_or_default();
@@ -505,8 +546,14 @@ impl ProcessManager {
                 );
             }
 
-            let log_follower =
-                spawn_compose_log_follower(root, &project_name, &compose_file, &log_path);
+            let log_follower = spawn_compose_log_follower(
+                root,
+                &project_name,
+                &compose_file,
+                &log_path,
+                log_tx,
+                app_id,
+            );
 
             ProcessHandle::Compose {
                 project_dir: root.to_path_buf(),
@@ -515,7 +562,7 @@ impl ProcessManager {
                 log_follower,
             }
         } else {
-            self.spawn_process(name, &spec, &log_path, &sockets_dir)?
+            self.spawn_process(name, &spec, &log_path, &sockets_dir, log_tx, app_id, "web")?
         };
 
         let companions = self.spawn_companions(
@@ -528,6 +575,7 @@ impl ProcessManager {
             &manifest,
             env_url_env.as_ref(),
             &log_path,
+            log_tx,
         );
 
         let app_idle_timeout = manifest_idle_timeout(&manifest);
@@ -721,17 +769,21 @@ impl ProcessManager {
     }
 
     /// Spawn a process using the current backend (direct or tmux).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_process(
         &self,
         name: &str,
         spec: &ProcessSpec,
         log_path: &Path,
         managed_dir: &Path,
+        log_tx: &broadcast::Sender<LogLine>,
+        app_id: i64,
+        process_type: &str,
     ) -> anyhow::Result<ProcessHandle> {
         if self.use_tmux {
             self.spawn_tmux(name, spec, log_path, managed_dir)
         } else {
-            Self::spawn_direct(name, spec, log_path)
+            Self::spawn_direct(name, spec, log_path, log_tx, app_id, process_type)
         }
     }
 
@@ -754,6 +806,7 @@ impl ProcessManager {
         manifest: &Option<serde_json::Value>,
         remote_env: Option<&HashMap<String, String>>,
         primary_log_path: &Path,
+        log_tx: &broadcast::Sender<LogLine>,
     ) -> Vec<CompanionProcess> {
         if companion_types.is_empty() || kind != "procfile" {
             return vec![];
@@ -801,6 +854,9 @@ impl ProcessManager {
                         &spec,
                         &log_path,
                         sockets_dir,
+                        log_tx,
+                        app_id,
+                        ptype,
                     ) {
                         Ok(handle) => {
                             info!(
@@ -837,20 +893,23 @@ impl ProcessManager {
         companions
     }
 
-    /// Spawn via direct child process (original behavior).
+    /// Spawn via direct child process.
+    ///
+    /// stdout/stderr are piped through a tee task that writes to the log file
+    /// and broadcasts each line to `log_tx` for live SSE streaming.
     fn spawn_direct(
         name: &str,
         spec: &ProcessSpec,
         log_path: &Path,
+        log_tx: &broadcast::Sender<LogLine>,
+        app_id: i64,
+        process_type: &str,
     ) -> anyhow::Result<ProcessHandle> {
         let log_file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(log_path)
             .with_context(|| format!("failed to open log file {}", log_path.display()))?;
-        let stderr_file = log_file
-            .try_clone()
-            .with_context(|| "failed to clone log file handle")?;
 
         // All specs go through login shell for user env loading
         let full_cmd = build_full_command(spec);
@@ -871,14 +930,26 @@ impl ProcessManager {
         }
         cmd.process_group(0);
 
-        let child = cmd
+        let mut child = cmd
             .current_dir(&spec.working_dir)
             .kill_on_drop(true)
             .stdin(Stdio::null())
-            .stdout(stderr_file)
-            .stderr(log_file)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to spawn {} for {name}", shell.display()))?;
+
+        // Tee stdout + stderr → log file + broadcast channel
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        spawn_tee_task(
+            stdout,
+            stderr,
+            log_file,
+            log_tx.clone(),
+            app_id,
+            process_type,
+        );
 
         Ok(ProcessHandle::Direct { child })
     }
@@ -947,6 +1018,111 @@ impl ProcessManager {
         debug!(session = %session_name, "spawned tmux session");
 
         Ok(ProcessHandle::Tmux { session_name })
+    }
+}
+
+/// Spawn a background task that reads from stdout + stderr pipes, writes each
+/// line to a log file, and broadcasts it through `log_tx`.
+///
+/// Bytes are split on `\n` manually and decoded with lossy UTF-8 so non-UTF-8
+/// output (terminal escapes, panic traces with binary bytes) does not
+/// terminate the tee. Any trailing bytes not followed by a newline are
+/// flushed on EOF so a crash without a final newline does not swallow the
+/// last message.
+fn spawn_tee_task(
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    log_file: std::fs::File,
+    log_tx: broadcast::Sender<LogLine>,
+    app_id: i64,
+    process_type: &str,
+) {
+    use std::io::Write;
+    use tokio::io::{AsyncRead, AsyncReadExt};
+
+    fn tee_reader<R: AsyncRead + Unpin + Send + 'static>(
+        mut reader: R,
+        log_file: Arc<std::sync::Mutex<std::fs::File>>,
+        log_tx: broadcast::Sender<LogLine>,
+        app_id: i64,
+        process_type: String,
+    ) {
+        tokio::spawn(async move {
+            // Cap how much un-newline-terminated output we will buffer before
+            // forcibly flushing as a synthetic line. Without this a process
+            // that emits a very long single line, a `\r`-driven progress bar,
+            // or a streaming binary blob would grow `pending` unboundedly and
+            // expose Coulson to OOM on noisy child output.
+            const PENDING_CAP: usize = 1024 * 1024;
+
+            let mut buf = [0u8; 4096];
+            let mut pending: Vec<u8> = Vec::with_capacity(512);
+            let emit = |bytes: &[u8],
+                        log_file: &Arc<std::sync::Mutex<std::fs::File>>,
+                        log_tx: &broadcast::Sender<LogLine>,
+                        process_type: &str| {
+                let line = String::from_utf8_lossy(bytes).into_owned();
+                if let Ok(mut f) = log_file.lock() {
+                    let _ = writeln!(f, "{line}");
+                }
+                let _ = log_tx.send(LogLine {
+                    app_id,
+                    process_type: process_type.to_string(),
+                    line,
+                });
+            };
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut start = 0;
+                        for (i, b) in buf[..n].iter().enumerate() {
+                            if *b == b'\n' {
+                                let mut chunk = std::mem::take(&mut pending);
+                                chunk.extend_from_slice(&buf[start..i]);
+                                // Strip trailing CR so CRLF output is clean.
+                                if chunk.last() == Some(&b'\r') {
+                                    chunk.pop();
+                                }
+                                emit(&chunk, &log_file, &log_tx, &process_type);
+                                start = i + 1;
+                            }
+                        }
+                        if start < n {
+                            pending.extend_from_slice(&buf[start..n]);
+                        }
+                        // If the buffered fragment is already past the cap,
+                        // flush it now to bound memory. The synthetic line
+                        // may split a "real" line in two, but that is
+                        // strictly better than unbounded growth.
+                        while pending.len() >= PENDING_CAP {
+                            let rest = pending.split_off(PENDING_CAP);
+                            emit(&pending, &log_file, &log_tx, &process_type);
+                            pending = rest;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Flush any trailing partial line (no terminating newline) so
+            // crash tails are preserved.
+            if !pending.is_empty() {
+                if pending.last() == Some(&b'\r') {
+                    pending.pop();
+                }
+                emit(&pending, &log_file, &log_tx, &process_type);
+            }
+        });
+    }
+
+    let file = Arc::new(std::sync::Mutex::new(log_file));
+    let ptype = process_type.to_string();
+
+    if let Some(stdout) = stdout {
+        tee_reader(stdout, file.clone(), log_tx.clone(), app_id, ptype.clone());
+    }
+    if let Some(stderr) = stderr {
+        tee_reader(stderr, file, log_tx, app_id, ptype);
     }
 }
 
@@ -1575,12 +1751,15 @@ fn compose_is_running(project_dir: &Path, project_name: &str, compose_file: &str
     }
 }
 
-/// Spawn a `docker compose logs -f` process that continuously writes to a log file.
+/// Spawn a `docker compose logs -f` process that tees output to a log file
+/// and broadcasts lines through `log_tx`.
 fn spawn_compose_log_follower(
     project_dir: &Path,
     project_name: &str,
     compose_file: &str,
     log_path: &Path,
+    log_tx: &broadcast::Sender<LogLine>,
+    app_id: i64,
 ) -> Option<Child> {
     let log_file = match std::fs::OpenOptions::new()
         .create(true)
@@ -1593,13 +1772,6 @@ fn spawn_compose_log_follower(
             return None;
         }
     };
-    let stderr_file = match log_file.try_clone() {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(error = %e, "failed to clone compose log file handle");
-            return None;
-        }
-    };
 
     let mut args = compose_base_args(project_name, compose_file);
     args.extend(["logs", "-f", "--no-color"]);
@@ -1607,13 +1779,16 @@ fn spawn_compose_log_follower(
         .args(&args)
         .current_dir(project_dir)
         .stdin(Stdio::null())
-        .stdout(stderr_file)
-        .stderr(log_file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
     {
-        Ok(child) => {
+        Ok(mut child) => {
             debug!(project = project_name, "spawned compose log follower");
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            spawn_tee_task(stdout, stderr, log_file, log_tx.clone(), app_id, "web");
             Some(child)
         }
         Err(e) => {
@@ -1812,13 +1987,38 @@ async fn quick_ready_check(target: &ListenTarget) -> bool {
 }
 
 /// Human-readable display of a listen target.
+/// Whether `s` is a safe process_type token.
+///
+/// process_type flows into several sensitive contexts: the log file path
+/// (`{name}-{ptype}.log`), the Procfile lookup key, and URL path segments in
+/// the log streaming endpoints. Restricting it to `[A-Za-z0-9_-]+` (the
+/// de-facto Procfile convention) closes off path-traversal, URL-reserved
+/// characters, and shell metacharacter surprises in one pass.
+pub(crate) fn is_valid_process_type(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Parse `COULSON_MANAGED_SERVICES` value into companion process types (excluding "web").
 fn parse_managed_services(value: Option<&str>) -> Vec<String> {
     value
         .map(|s| {
             s.split(',')
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty() && t != "web")
+                .filter_map(|t| {
+                    let t = t.trim();
+                    if t.is_empty() || t == "web" {
+                        return None;
+                    }
+                    if !is_valid_process_type(t) {
+                        tracing::warn!(
+                            process_type = %t,
+                            "COULSON_MANAGED_SERVICES token rejected: must match [A-Za-z0-9_-]+"
+                        );
+                        return None;
+                    }
+                    Some(t.to_string())
+                })
                 .collect()
         })
         .unwrap_or_default()

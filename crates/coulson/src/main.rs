@@ -134,6 +134,7 @@ pub struct SharedState {
     pub share_signer: Arc<ShareSigner>,
     pub inspect_max_requests: usize,
     pub inspect_tx: broadcast::Sender<InspectEvent>,
+    pub log_tx: broadcast::Sender<crate::process::LogLine>,
     pub network_change_tx: broadcast::Sender<()>,
     pub certs_dir: std::path::PathBuf,
     pub runtime_dir: std::path::PathBuf,
@@ -471,6 +472,7 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
 
     let share_signer = Arc::new(ShareSigner::load_or_generate(&store)?);
     let (inspect_tx, _) = broadcast::channel(256);
+    let (log_tx, _) = broadcast::channel::<crate::process::LogLine>(512);
     let (network_change_tx, _) = broadcast::channel(4);
     let idle_timeout = Duration::from_secs(cfg.idle_timeout_secs);
     let registry = Arc::new(process::default_registry());
@@ -503,6 +505,7 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
         backend: cfg.process_backend,
         hook_manager: Arc::clone(&hook_manager),
         hook_factory: pm_hook_factory,
+        log_tx: log_tx.clone(),
     });
 
     Ok(SharedState {
@@ -526,6 +529,7 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
         share_signer,
         inspect_max_requests: cfg.inspect_max_requests,
         inspect_tx,
+        log_tx: log_tx.clone(),
         network_change_tx,
         certs_dir: cfg.certs_dir.clone(),
         runtime_dir: cfg.runtime_dir.clone(),
