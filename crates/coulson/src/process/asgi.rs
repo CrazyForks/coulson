@@ -47,27 +47,23 @@ impl ProcessProvider for AsgiProvider {
         let binary = find_uvicorn(&app.root, app.manifest.as_ref())?;
         let socket_path = app.socket_path();
 
-        let reload = matches!(
-            app.env_overrides.get("ASGI_RELOAD").map(|v| v.as_str()),
-            Some("1" | "true")
-        );
-
-        let mut args = vec![
+        let args = vec![
             module,
             "--uds".into(),
             socket_path.to_string_lossy().to_string(),
         ];
-        if reload {
-            args.push("--reload".into());
-        }
 
         let mut env = std::collections::HashMap::new();
         // Force unbuffered stdio so uvicorn startup messages and per-request
         // access logs hit the log file immediately instead of sitting in
         // Python's block buffer (which kicks in when stdout is a file).
         env.insert("PYTHONUNBUFFERED".into(), "1".into());
+        // uvicorn's Click CLI enables `auto_envvar_prefix="UVICORN"`, so any
+        // flag can be toggled via `UVICORN_<FLAG>` env vars the user sets in
+        // `.coulson.toml` / env_overrides (e.g. `UVICORN_RELOAD=true`,
+        // `UVICORN_LOG_LEVEL=debug`). No need to special-case individual
+        // flags here.
         env.extend(app.env_overrides.clone());
-        env.remove("ASGI_RELOAD");
 
         Ok(ProcessSpec {
             command: binary,
@@ -337,24 +333,26 @@ mod tests {
     }
 
     #[test]
-    fn reload_enabled() {
-        let root = temp_app_dir("reload-uvicorn");
+    fn uvicorn_env_overrides_are_preserved() {
+        // uvicorn supports `UVICORN_*` env vars natively via Click's
+        // `auto_envvar_prefix`. Make sure the provider just passes them
+        // through without stripping or translating.
+        let root = temp_app_dir("uvicorn-env-passthrough");
         fs::write(root.join("app.py"), "").unwrap();
         place_venv_binary(&root, "uvicorn");
-        let app = make_managed_app(&root, vec![("ASGI_RELOAD", "1")]);
+        let app = make_managed_app(
+            &root,
+            vec![("UVICORN_RELOAD", "true"), ("UVICORN_LOG_LEVEL", "debug")],
+        );
         let spec = AsgiProvider.resolve(&app).unwrap();
-        assert!(spec.args.contains(&"--reload".to_string()));
-        assert!(!spec.env.contains_key("ASGI_RELOAD"));
-        fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn reload_disabled_by_default() {
-        let root = temp_app_dir("reload-default");
-        fs::write(root.join("app.py"), "").unwrap();
-        place_venv_binary(&root, "uvicorn");
-        let app = make_managed_app(&root, vec![]);
-        let spec = AsgiProvider.resolve(&app).unwrap();
+        assert_eq!(
+            spec.env.get("UVICORN_RELOAD").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            spec.env.get("UVICORN_LOG_LEVEL").map(String::as_str),
+            Some("debug")
+        );
         assert!(!spec.args.contains(&"--reload".to_string()));
         fs::remove_dir_all(&root).ok();
     }
