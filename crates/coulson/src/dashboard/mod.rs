@@ -57,6 +57,12 @@ pub fn router(state: DashboardState) -> Router {
         .route("/apps/{id}", get(handlers::page_app_detail))
         .route("/apps/{id}/requests", get(handlers::page_requests))
         .route("/apps/{id}/requests/stream", get(handlers::sse_requests))
+        .route("/apps/{id}/logs", get(handlers::page_logs))
+        .route("/apps/{id}/logs/stream", get(handlers::sse_logs_default))
+        .route(
+            "/apps/{id}/logs/stream/{process_type}",
+            get(handlers::sse_logs),
+        )
         .route(
             "/apps/{id}/requests/{req_id}",
             get(handlers::page_request_detail),
@@ -194,11 +200,9 @@ pub async fn bridge(session: &mut Session, dashboard_router: Router) -> Result<(
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
-    let is_sse = headers
-        .iter()
-        .any(|(k, v)| k == "content-type" && v.contains("text/event-stream"));
+    let is_streaming = !headers.iter().any(|(k, _)| k == "content-length");
 
-    if is_sse {
+    if is_streaming {
         let mut resp = ResponseHeader::build(status_code, None)?;
         copy_headers(&mut resp, &headers, true)?;
         session.write_response_header(Box::new(resp), false).await?;

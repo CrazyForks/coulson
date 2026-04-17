@@ -28,6 +28,121 @@ fn embedded_base(headers: &HeaderMap, app_name: &str) -> (bool, String) {
     }
 }
 
+/// Return the last `max_lines` lines of `log_path`.
+///
+/// Only reads up to ~1 MiB from the tail, so arbitrarily large log files do
+/// not cause full-file reads. Uses lossy UTF-8 decoding so non-UTF-8 bytes
+/// (ANSI escapes, binary panic traces) are preserved as replacement
+/// characters instead of causing the history to silently disappear.
+fn read_log_tail_lines(log_path: &std::path::Path, max_lines: usize) -> Option<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_CAP: u64 = 1 << 20; // 1 MiB
+
+    let mut file = std::fs::File::open(log_path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let start_offset = len.saturating_sub(TAIL_CAP);
+    file.seek(SeekFrom::Start(start_offset)).ok()?;
+    let mut buf = Vec::with_capacity((len - start_offset) as usize);
+    file.read_to_end(&mut buf).ok()?;
+    // If we truncated the head, drop any partial leading line so we never
+    // emit half of a log entry as if it were whole.
+    let slice: &[u8] = if start_offset > 0 {
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(idx) => &buf[idx + 1..],
+            None => &[],
+        }
+    } else {
+        &buf
+    };
+    let text = String::from_utf8_lossy(slice);
+    let lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let start = lines.len().saturating_sub(max_lines);
+    Some(lines[start..].to_vec())
+}
+
+/// Lexically normalize a path: collapse `.` / `..` / redundant separators
+/// WITHOUT touching the filesystem.
+///
+/// Needed because companion-log collision detection must work even when the
+/// log files do not yet exist (e.g. the companion process has never been
+/// spawned). `std::fs::canonicalize` requires the target to exist, so it is
+/// unsuitable here. Lexical normalization is also deliberately unaware of
+/// symlinks — two different symlinks to the same inode will compare unequal,
+/// which is the safer default for config-level collision detection.
+fn lexical_normalize(p: &std::path::Path) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => out.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                // Collapse against the preceding real segment.
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // On an absolute path `/..` equals `/` — drop the extra
+                // ParentDir entirely instead of keeping it as `/../…`,
+                // otherwise two spellings of the same real file would
+                // normalize to different `PathBuf`s and escape
+                // `companion_log_collides`.
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                // Relative path with no preceding `Normal` (either empty
+                // or already a `..` chain): preserve the `..` so the
+                // meaning of the relative path is kept.
+                _ => {
+                    out.push("..");
+                }
+            },
+            Component::Normal(s) => out.push(s),
+        }
+    }
+    out
+}
+
+/// Collect lexically-normalized web log paths for every managed app OTHER
+/// than `self_name`.
+///
+/// Used to detect file-path level collisions between a would-be companion
+/// log (`{self}-{ptype}.log`) and some unrelated app's web log. Iterating
+/// the full managed-app set is required because any app — regardless of
+/// name — can point its manifest `log_path` at the same file. Returns
+/// Err on store failure; callers should fail closed.
+fn other_managed_web_log_paths(
+    shared: &SharedState,
+    self_name: &str,
+) -> anyhow::Result<std::collections::HashSet<std::path::PathBuf>> {
+    let sockets_dir = shared.runtime_dir.join("managed");
+    let mut out = std::collections::HashSet::new();
+    for app in shared.store.list_all()? {
+        if app.name == self_name {
+            continue;
+        }
+        let crate::domain::BackendTarget::Managed { root, .. } = &app.target else {
+            continue;
+        };
+        let root_path = std::path::PathBuf::from(root);
+        let manifest = crate::process::load_coulson_toml_manifest(&root_path);
+        let web_log =
+            crate::process::resolve_log_path(&manifest, &root_path, &sockets_dir, &app.name);
+        out.insert(lexical_normalize(&web_log));
+    }
+    Ok(out)
+}
+
+/// Whether `companion_path` would read some other managed app's web log
+/// file. Pure set-membership on normalized paths — compute the set via
+/// [`other_managed_web_log_paths`] once per request and reuse it.
+fn companion_log_collides(
+    other_paths: &std::collections::HashSet<std::path::PathBuf>,
+    companion_path: &std::path::Path,
+) -> bool {
+    other_paths.contains(&lexical_normalize(companion_path))
+}
+
 pub async fn favicon() -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -564,11 +679,7 @@ pub async fn page_process_log(
         }
         _ => sockets_dir.join(format!("{}.log", app.name)),
     };
-    let log_content = std::fs::read_to_string(&log_path).ok().map(|content| {
-        let lines: Vec<&str> = content.lines().collect();
-        let start = lines.len().saturating_sub(200);
-        lines[start..].join("\n")
-    });
+    let log_content = read_log_tail_lines(&log_path, 200).map(|lines| lines.join("\n"));
     let page = render_page("pages/process_log.html", &state.shared, |ctx| {
         ctx.insert("title", &format!("{} — Log", app.name));
         ctx.insert("active_nav", "processes");
@@ -1004,6 +1115,441 @@ pub async fn action_set_tunnel_mode(
     StatusCode::NO_CONTENT.into_response()
 }
 
+pub async fn page_logs(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let app = match state.shared.store.get_by_name(&id) {
+        Ok(Some(app)) => app,
+        _ => return html_response(StatusCode::NOT_FOUND, render_not_found(&state.shared)),
+    };
+
+    let port = state.shared.listen_http.port();
+    let app_view = AppView::from_spec(&app, port, state.shared.use_default_http_port());
+    let (embedded, base_path) = embedded_base(&headers, &app.name);
+
+    // Only managed apps have logs
+    let root = match &app.target {
+        crate::domain::BackendTarget::Managed { root, .. } => std::path::PathBuf::from(root),
+        _ => {
+            let page = render_page("pages/log_tail.html", &state.shared, |ctx| {
+                ctx.insert("title", &format!("{} — Logs", app.name));
+                ctx.insert("app", &app_view);
+                ctx.insert("unsupported", &true);
+                ctx.insert("embedded", &embedded);
+                ctx.insert("base_path", &base_path);
+                ctx.insert("full_width", &true);
+            });
+            return Html(page).into_response();
+        }
+    };
+
+    let sockets_dir = state.shared.runtime_dir.join("managed");
+    let manifest = crate::process::load_coulson_toml_manifest(&root);
+    let log_path = crate::process::resolve_log_path(&manifest, &root, &sockets_dir, &app.name);
+
+    let runtime_types = {
+        let pm = state.shared.process_manager.lock().await;
+        pm.process_types(app.id.0)
+    };
+
+    // Determine whether a companion log candidate would actually share a
+    // file path with some OTHER app's resolved web log. Scan every managed
+    // app (not just `{name}-{ptype}`) because any app, regardless of name,
+    // can point its manifest `log_path` at the same file. Fail closed on
+    // store error so a transient DB hiccup never exposes another app's log.
+    let log_dir = log_path.parent().unwrap_or(&sockets_dir);
+    let other_paths = match other_managed_web_log_paths(&state.shared, &app.name) {
+        Ok(set) => Some(set),
+        Err(e) => {
+            tracing::warn!(error = %e, app = %app.name, "store lookup failed; hiding all companion log tabs");
+            None
+        }
+    };
+    let collides = |ptype: &str| -> bool {
+        if ptype == "web" {
+            return false;
+        }
+        let stem = format!("{}-{}", app.name, ptype);
+        let companion_path = log_dir.join(format!("{stem}.log"));
+        match &other_paths {
+            Some(set) => companion_log_collides(set, &companion_path),
+            None => true,
+        }
+    };
+
+    // Filter runtime types so the page and the SSE endpoint agree on
+    // which companions are reachable. Without this, a genuinely-colliding
+    // companion would appear as a tab here but 404 when clicked.
+    let runtime_types: Vec<String> = runtime_types.into_iter().filter(|t| !collides(t)).collect();
+
+    // Scan the log directory for any companion log files
+    // (`{name}.log`, `{name}-{ptype}.log`) so we can offer switchers for
+    // worker/scheduler/etc. even if the process is not currently running.
+    // Skip any candidate whose file path would actually overlap with
+    // another registered app's web log — `foo-worker.log` (the web log of
+    // `foo-worker`) would otherwise be misread as `foo`'s `worker`
+    // companion when both apps share `{sockets_dir}` as their log dir.
+    let mut disk_types: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            let fname_os = entry.file_name();
+            let Some(fname) = fname_os.to_str() else {
+                continue;
+            };
+            if fname == format!("{}.log", app.name) {
+                disk_types.push("web".to_string());
+            } else if let Some(rest) = fname.strip_prefix(&format!("{}-", app.name)) {
+                if let Some(ptype) = rest.strip_suffix(".log") {
+                    // Skip files whose inferred `ptype` does not match the
+                    // process_type charset. Without this a legit log like
+                    // `foo-bar.baz.log` (left by some unrelated tool or
+                    // historical data) would surface as a `bar.baz` tab that
+                    // `sse_logs` would then reject anyway — an avoidable
+                    // "tab shown then 404" inconsistency.
+                    if !crate::process::is_valid_process_type(ptype) {
+                        continue;
+                    }
+                    if collides(ptype) {
+                        continue;
+                    }
+                    disk_types.push(ptype.to_string());
+                }
+            }
+        }
+    }
+
+    // Merge runtime + disk types, keeping order; dedupe; force "web" first.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut process_types: Vec<String> = Vec::new();
+    for t in runtime_types.iter().chain(disk_types.iter()) {
+        if seen.insert(t.clone()) {
+            process_types.push(t.clone());
+        }
+    }
+    if process_types.is_empty() {
+        process_types.push("web".to_string());
+    } else if let Some(pos) = process_types.iter().position(|x| x == "web") {
+        if pos != 0 {
+            process_types.swap(0, pos);
+        }
+    }
+
+    // Map each process_type to its on-disk log path so the UI can update
+    // the displayed filename when the user switches tabs — the primary
+    // `log_path` only describes the `web` log, while companions live at
+    // `{log_dir}/{name}-{ptype}.log` (matching `spawn_tee_task`'s target).
+    let mut process_log_paths: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for pt in &process_types {
+        let p = if pt == "web" {
+            log_path.clone()
+        } else {
+            log_dir.join(format!("{}-{}.log", app.name, pt))
+        };
+        process_log_paths.insert(pt.clone(), p.to_string_lossy().into_owned());
+    }
+    let initial_process = process_types
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "web".to_string());
+    let initial_log_path = process_log_paths
+        .get(&initial_process)
+        .cloned()
+        .unwrap_or_else(|| log_path.to_string_lossy().into_owned());
+
+    let page = render_page("pages/log_tail.html", &state.shared, |ctx| {
+        ctx.insert("title", &format!("{} — Logs", app.name));
+        ctx.insert("app", &app_view);
+        ctx.insert("log_path", &initial_log_path);
+        ctx.insert("initial_process", &initial_process);
+        ctx.insert("process_log_paths", &process_log_paths);
+        ctx.insert("process_types", &process_types);
+        ctx.insert("embedded", &embedded);
+        ctx.insert("base_path", &base_path);
+        ctx.insert("full_width", &true);
+    });
+    Html(page).into_response()
+}
+
+pub async fn sse_logs_default(
+    state: State<DashboardState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    sse_logs(state, headers, Path((id, "web".to_string()))).await
+}
+
+pub async fn sse_logs(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path((id, process_type)): Path<(String, String)>,
+) -> Response {
+    let app = match state.shared.store.get_by_name(&id) {
+        Ok(Some(app)) => app,
+        _ => return html_response(StatusCode::NOT_FOUND, "Not found".to_string()),
+    };
+
+    // Reject process_types that would escape the `{name}-{ptype}.log`
+    // filename into a nested path or non-ASCII filesystem segment. "web"
+    // is the only companion-less case that bypasses the log-name format,
+    // so it is always admitted even though it also matches the charset.
+    if process_type != "web" && !crate::process::is_valid_process_type(&process_type) {
+        return html_response(StatusCode::NOT_FOUND, "Not found".to_string());
+    }
+
+    // EventSource sends Accept: text/event-stream; plain curl does not.
+    let want_sse = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"));
+
+    // Resolve the log file path for this process_type. The web log follows
+    // the manifest's log_path; companion logs live in the same directory as
+    // `{name}-{ptype}.log`.
+    let root = match &app.target {
+        crate::domain::BackendTarget::Managed { root, .. } => std::path::PathBuf::from(root),
+        _ => {
+            if want_sse {
+                return Sse::new(futures::stream::pending::<Result<Event, Infallible>>())
+                    .keep_alive(KeepAlive::default())
+                    .into_response();
+            }
+            return plain_text_stream(futures::stream::pending::<String>());
+        }
+    };
+    let sockets_dir = state.shared.runtime_dir.join("managed");
+    let manifest = crate::process::load_coulson_toml_manifest(&root);
+    let web_log = crate::process::resolve_log_path(&manifest, &root, &sockets_dir, &app.name);
+    // Refuse companion process_types whose resolved log path would actually
+    // overlap another registered app's web log. Compare resolved paths (not
+    // just names) so a `foo-worker` app with a manifest `log_path` pointing
+    // elsewhere does not block `foo`'s legitimate `worker` companion. Fail
+    // closed on store error: we would rather 404 than leak another app's
+    // log during a transient DB hiccup.
+    let log_path = if process_type == "web" {
+        web_log.clone()
+    } else {
+        web_log
+            .parent()
+            .unwrap_or(&sockets_dir)
+            .join(format!("{}-{}.log", app.name, process_type))
+    };
+    if process_type != "web" {
+        let collides = match other_managed_web_log_paths(&state.shared, &app.name) {
+            Ok(set) => companion_log_collides(&set, &log_path),
+            Err(e) => {
+                tracing::warn!(error = %e, app = %app.name, "store lookup failed; refusing companion log stream");
+                true
+            }
+        };
+        if collides {
+            return html_response(StatusCode::NOT_FOUND, "Not found".to_string());
+        }
+    }
+
+    let has_broadcast = {
+        let pm = state.shared.process_manager.lock().await;
+        pm.has_log_broadcast()
+    };
+
+    let app_id = app.id.0;
+    let ptype_for_filter = process_type.clone();
+
+    // Subscribe / capture live cursor BEFORE reading history so no lines are
+    // lost in the window between the file read and the live stream
+    // starting. Any overlap is tolerable — duplicated lines look
+    // harmless — but a missed line is invisible and confusing.
+    if has_broadcast {
+        let rx = state.shared.log_tx.subscribe();
+        let history = read_log_tail_lines(&log_path, 200).unwrap_or_default();
+        let history_stream = futures::stream::iter(history);
+        let live_stream = BroadcastStream::new(rx).filter_map(move |result| match result {
+            Ok(log_line)
+                if log_line.app_id == app_id && log_line.process_type == ptype_for_filter =>
+            {
+                Some(log_line.line)
+            }
+            _ => None,
+        });
+        if want_sse {
+            // Tag history events so the client can skip the fade-in animation
+            // for replayed lines (only real-time lines should animate).
+            let history_events = history_stream
+                .map(|line| Ok::<_, Infallible>(Event::default().event("history").data(line)));
+            let live_events =
+                live_stream.map(|line| Ok::<_, Infallible>(Event::default().data(line)));
+            let stream = history_events.chain(live_events);
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        } else {
+            plain_text_stream(history_stream.chain(live_stream))
+        }
+    } else {
+        // Tmux fallback: poll the companion log file for new lines.
+        //
+        // Capture the live cursor (current file length) BEFORE reading
+        // history. Any lines written between the two reads end up in
+        // history AND in the next poll — duplicates are tolerable, gaps
+        // are not.
+        let initial_offset = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+        let history = read_log_tail_lines(&log_path, 200).unwrap_or_default();
+        let history_stream = futures::stream::iter(history);
+
+        struct TailState {
+            path: std::path::PathBuf,
+            offset: u64,
+            pending: std::collections::VecDeque<String>,
+            // When we read a chunk with no newline and below the
+            // `POLL_CAP`, remember the file length we saw. If the next
+            // poll still sees the exact same length, the writer has
+            // gone quiet (e.g. the process exited leaving a trailing
+            // line without `\n`) and we flush the buffered tail as a
+            // synthetic line instead of hiding it forever.
+            stale_len: Option<u64>,
+        }
+
+        let tail = TailState {
+            path: log_path,
+            offset: initial_offset,
+            pending: std::collections::VecDeque::new(),
+            stale_len: None,
+        };
+
+        let live_stream = futures::stream::unfold(tail, |mut st| async move {
+            // Cap a single poll so a large append spike cannot balloon
+            // into an unbounded allocation.
+            const POLL_CAP: u64 = 1 << 20; // 1 MiB
+
+            loop {
+                if let Some(line) = st.pending.pop_front() {
+                    return Some((line, st));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let Ok(mut file) = std::fs::File::open(&st.path) else {
+                    continue;
+                };
+                let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                if len <= st.offset {
+                    // File shrank or has no new bytes — reset quiescence
+                    // tracking; there is nothing buffered to flush.
+                    st.stale_len = None;
+                    continue;
+                }
+                use std::io::{Read, Seek, SeekFrom};
+                if file.seek(SeekFrom::Start(st.offset)).is_err() {
+                    continue;
+                }
+                let to_read = std::cmp::min(len - st.offset, POLL_CAP) as usize;
+                let mut chunk = vec![0u8; to_read];
+                let n = file.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                chunk.truncate(n);
+                // Mirror `spawn_tee_task`: split on `\n`, decode each
+                // line with `from_utf8_lossy` so non-UTF-8 bytes survive
+                // instead of aborting the tail. Prefer tail -f semantics
+                // (only advance past complete newlines), but guard
+                // against two failure modes: a `POLL_CAP`-sized chunk
+                // with no newline would otherwise stall the stream, and
+                // a trailing unterminated fragment after the writer has
+                // exited would otherwise be hidden forever.
+                match chunk.iter().rposition(|&b| b == b'\n') {
+                    Some(last_nl) => {
+                        let consumable = &chunk[..=last_nl];
+                        let mut line_start = 0;
+                        for (i, b) in consumable.iter().enumerate() {
+                            if *b == b'\n' {
+                                let slice = &consumable[line_start..i];
+                                let slice = if slice.last() == Some(&b'\r') {
+                                    &slice[..slice.len() - 1]
+                                } else {
+                                    slice
+                                };
+                                st.pending
+                                    .push_back(String::from_utf8_lossy(slice).into_owned());
+                                line_start = i + 1;
+                            }
+                        }
+                        st.offset += (last_nl + 1) as u64;
+                        st.stale_len = None;
+                    }
+                    None if n as u64 == POLL_CAP => {
+                        // Chunk completely fills the cap with no newline:
+                        // emit it as a synthetic line and advance past
+                        // it so the tail keeps moving. Any partial
+                        // fragment still buffered upstream will be
+                        // flushed on the next write.
+                        st.pending
+                            .push_back(String::from_utf8_lossy(&chunk).into_owned());
+                        st.offset += n as u64;
+                        st.stale_len = None;
+                    }
+                    None if st.stale_len == Some(len) => {
+                        // Second poll observing the same file length with
+                        // no newline — the writer has gone quiet. Flush
+                        // the buffered tail as a synthetic line so a
+                        // process that exited mid-line (crash, prompt,
+                        // tool output without trailing `\n`) still shows
+                        // up in the live view.
+                        st.pending
+                            .push_back(String::from_utf8_lossy(&chunk).into_owned());
+                        st.offset += n as u64;
+                        st.stale_len = None;
+                    }
+                    None => {
+                        // First time we see this partial tail. Remember
+                        // the file length and wait one more poll —
+                        // active writers virtually always continue
+                        // within 1 s, so this only triggers once output
+                        // has actually stopped.
+                        st.stale_len = Some(len);
+                        continue;
+                    }
+                }
+            }
+        });
+
+        if want_sse {
+            let history_events = history_stream
+                .map(|line| Ok::<_, Infallible>(Event::default().event("history").data(line)));
+            let live_events =
+                live_stream.map(|line| Ok::<_, Infallible>(Event::default().data(line)));
+            let stream = history_events.chain(live_events);
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        } else {
+            plain_text_stream(history_stream.chain(live_stream))
+        }
+    }
+}
+
+/// Wrap a `Stream<Item = String>` into a chunked `text/plain` response (one line per chunk).
+fn plain_text_stream<S>(stream: S) -> Response
+where
+    S: futures::Stream<Item = String> + Send + 'static,
+{
+    use axum::body::Body;
+
+    let body_stream = stream.map(|line| Ok::<_, Infallible>(format!("{line}\n")));
+    let body = Body::from_stream(body_stream);
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 pub async fn not_found(
     State(state): State<DashboardState>,
     request: axum::extract::Request,
@@ -1015,4 +1561,51 @@ pub async fn not_found(
         );
     }
     html_response(StatusCode::NOT_FOUND, render_not_found(&state.shared))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lexical_normalize;
+    use std::path::{Path, PathBuf};
+
+    fn norm(p: &str) -> PathBuf {
+        lexical_normalize(Path::new(p))
+    }
+
+    #[test]
+    fn normalizes_curdir_and_simple_parent() {
+        assert_eq!(norm("./logs/../foo.log"), PathBuf::from("foo.log"));
+        assert_eq!(norm("a/b/../c"), PathBuf::from("a/c"));
+    }
+
+    #[test]
+    fn preserves_relative_parent_chain() {
+        assert_eq!(norm("../foo"), PathBuf::from("../foo"));
+        assert_eq!(norm("../../foo/bar"), PathBuf::from("../../foo/bar"));
+    }
+
+    #[test]
+    fn collapses_extra_parents_above_root() {
+        // `/..` is `/` on Unix — extra ParentDir above RootDir must not
+        // survive into the normalized path, otherwise two spellings of
+        // the same real file compare unequal.
+        assert_eq!(
+            norm("/tmp/../../tmp/foo.log"),
+            PathBuf::from("/tmp/foo.log")
+        );
+        assert_eq!(norm("/.."), PathBuf::from("/"));
+        assert_eq!(norm("/../.."), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn strips_trailing_separator() {
+        assert_eq!(norm("a/b/"), PathBuf::from("a/b"));
+        assert_eq!(norm("/tmp/"), PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn absolute_and_root_edge_cases() {
+        assert_eq!(norm("/"), PathBuf::from("/"));
+        assert_eq!(norm("/tmp/foo.log"), PathBuf::from("/tmp/foo.log"));
+    }
 }

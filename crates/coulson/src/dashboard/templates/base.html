@@ -78,7 +78,7 @@ Stimulus.register("modal", class extends Controller {
   </div>
 </header>
 {% endif %}
-<main class="flex-1 mx-auto max-w-6xl w-full px-6 py-8">
+<main class="flex-1 mx-auto w-full px-6 {% if embedded %}py-3{% else %}py-8{% endif %} {% if full_width %}max-w-none{% else %}max-w-6xl{% endif %}">
 {% block content %}{% endblock content %}
 </main>
 {% if not embedded %}<footer class="border-t border-zinc-200 dark:border-zinc-800 mt-auto">
