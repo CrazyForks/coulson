@@ -246,6 +246,16 @@ pub fn app_create(state: &SharedState, params: &CreateAppParams) -> Result<AppSp
             "name cannot be empty".to_string(),
         ));
     }
+    if !params
+        .name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(ServiceError::InvalidParams(
+            "name must contain only alphanumeric characters, hyphens, underscores, or dots"
+                .to_string(),
+        ));
+    }
     if params.target_value.is_empty() {
         return Err(ServiceError::InvalidParams(
             "target_value cannot be empty".to_string(),

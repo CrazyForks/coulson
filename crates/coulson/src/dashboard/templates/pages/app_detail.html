@@ -35,10 +35,13 @@
     {% include "partials/settings_modal.html" %}
   </dialog>
 </div>
+<div id="detail-stream-config" class="hidden" data-stream-url="/apps/{{ app.name }}/stream"></div>
 <script>
 (function() {
-  var appName = '{{ app.name }}';
-  var evtSource = new EventSource('/apps/' + appName + '/stream');
+  var cfg = document.getElementById('detail-stream-config');
+  var streamUrl = cfg ? cfg.dataset.streamUrl : null;
+  if (!streamUrl) return;
+  var evtSource = new EventSource(streamUrl);
   evtSource.onmessage = function(event) {
     var ids = event.data.split(',');
     ids.forEach(function(id) {

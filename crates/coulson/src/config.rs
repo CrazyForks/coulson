@@ -82,6 +82,8 @@ pub struct CoulsonConfig {
     pub runtime_dir: PathBuf,
     pub process_backend: ProcessBackend,
     pub hook_timeout_secs: u64,
+    pub inspector_username: Option<String>,
+    pub inspector_password: Option<String>,
 }
 
 impl Default for CoulsonConfig {
@@ -120,6 +122,8 @@ impl Default for CoulsonConfig {
             runtime_dir,
             process_backend: ProcessBackend::Auto,
             hook_timeout_secs: 60,
+            inspector_username: None,
+            inspector_password: None,
         }
     }
 }
@@ -173,6 +177,14 @@ impl CoulsonConfig {
         }
         if let Some(v) = file.hook_timeout_secs {
             cfg.hook_timeout_secs = v;
+        }
+        if let Some(ref insp) = file.inspector {
+            if let Some(ref v) = insp.username {
+                cfg.inspector_username = Some(v.clone());
+            }
+            if let Some(ref v) = insp.password {
+                cfg.inspector_password = Some(v.clone());
+            }
         }
 
         // Layer 3: Environment variables (highest priority)
@@ -229,6 +241,12 @@ impl CoulsonConfig {
             cfg.hook_timeout_secs = raw
                 .parse()
                 .with_context(|| format!("invalid COULSON_HOOK_TIMEOUT_SECS: {raw}"))?;
+        }
+        if let Ok(v) = env::var("COULSON_INSPECTOR_USERNAME") {
+            cfg.inspector_username = Some(v);
+        }
+        if let Ok(v) = env::var("COULSON_INSPECTOR_PASSWORD") {
+            cfg.inspector_password = Some(v);
         }
         if let Ok(raw) = env::var("COULSON_PROCESS_BACKEND") {
             cfg.process_backend = parse_process_backend(&raw)
@@ -331,6 +349,13 @@ struct ConfigFile {
     runtime_dir: Option<String>,
     process_backend: Option<String>,
     hook_timeout_secs: Option<u64>,
+    inspector: Option<InspectorConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InspectorConfig {
+    username: Option<String>,
+    password: Option<String>,
 }
 
 impl ConfigFile {
@@ -386,7 +411,8 @@ impl ConfigFile {
             certs_dir,
             runtime_dir,
             process_backend,
-            hook_timeout_secs
+            hook_timeout_secs,
+            inspector
         );
     }
 }

@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 
 use axum::extract::{Form, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use serde::Deserialize;
@@ -14,6 +14,19 @@ use super::DashboardState;
 use crate::domain::TunnelMode;
 use crate::service;
 use crate::SharedState;
+
+const EMBEDDED_HEADER: &str = "x-coulson-embedded";
+const EMBEDDED_BASE: &str = "/_coulson";
+
+/// Detect embedded inspector mode from the `x-coulson-embedded` header.
+/// Returns `(is_embedded, base_path)` for URL generation in templates.
+fn embedded_base(headers: &HeaderMap, app_name: &str) -> (bool, String) {
+    if headers.contains_key(EMBEDDED_HEADER) {
+        (true, EMBEDDED_BASE.to_string())
+    } else {
+        (false, format!("/apps/{app_name}"))
+    }
+}
 
 pub async fn favicon() -> impl IntoResponse {
     (
@@ -94,12 +107,14 @@ pub async fn page_app_detail(
 
 pub async fn page_requests(
     State(state): State<DashboardState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
     let app = match state.shared.store.get_by_name(&id) {
         Ok(Some(app)) => app,
         _ => return html_response(StatusCode::NOT_FOUND, render_not_found(&state.shared)),
     };
+    let (embedded, base_path) = embedded_base(&headers, &id);
     let port = state.shared.listen_http.port();
     let app_view = AppView::from_spec(&app, port, state.shared.use_default_http_port());
     let requests = state
@@ -115,12 +130,15 @@ pub async fn page_requests(
         ctx.insert("app", &app_view);
         ctx.insert("requests", &request_views);
         ctx.insert("request_count", &request_count);
+        ctx.insert("embedded", &embedded);
+        ctx.insert("base_path", &base_path);
     });
     Html(page).into_response()
 }
 
 pub async fn page_request_detail(
     State(state): State<DashboardState>,
+    headers: HeaderMap,
     Path((app_id, req_id)): Path<(String, String)>,
 ) -> Response {
     let app = match state.shared.store.get_by_name(&app_id) {
@@ -131,6 +149,7 @@ pub async fn page_request_detail(
         Ok(Some(r)) if r.app_id == app.id.0 => r,
         _ => return html_response(StatusCode::NOT_FOUND, render_not_found(&state.shared)),
     };
+    let (embedded, base_path) = embedded_base(&headers, &app_id);
     let port = state.shared.listen_http.port();
     let app_view = AppView::from_spec(&app, port, state.shared.use_default_http_port());
     let req_view = RequestView::from_captured(&captured);
@@ -142,6 +161,8 @@ pub async fn page_request_detail(
         );
         ctx.insert("app", &app_view);
         ctx.insert("req", &req_view);
+        ctx.insert("embedded", &embedded);
+        ctx.insert("base_path", &base_path);
     });
     Html(page).into_response()
 }
@@ -562,6 +583,7 @@ pub async fn page_process_log(
 
 pub async fn action_toggle_inspect(
     State(state): State<DashboardState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Redirect {
     if let Ok(Some(app)) = state.shared.store.get_by_name(&id) {
@@ -571,21 +593,25 @@ pub async fn action_toggle_inspect(
             .set_inspect_enabled(app.id.0, !app.inspect_enabled);
         let _ = state.shared.reload_routes();
     }
-    Redirect::to(&format!("/apps/{id}/requests"))
+    let (_, base) = embedded_base(&headers, &id);
+    Redirect::to(&format!("{base}/requests"))
 }
 
 pub async fn action_clear_requests(
     State(state): State<DashboardState>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Redirect {
     if let Ok(Some(app)) = state.shared.store.get_by_name(&id) {
         let _ = state.shared.store.delete_request_logs_for_app(app.id.0);
     }
-    Redirect::to(&format!("/apps/{id}/requests"))
+    let (_, base) = embedded_base(&headers, &id);
+    Redirect::to(&format!("{base}/requests"))
 }
 
 pub async fn action_replay(
     State(state): State<DashboardState>,
+    headers: HeaderMap,
     Path((app_id, req_id)): Path<(String, String)>,
 ) -> Response {
     let app = match state.shared.store.get_by_name(&app_id) {
@@ -597,9 +623,7 @@ pub async fn action_replay(
         _ => return html_response(StatusCode::NOT_FOUND, render_not_found(&state.shared)),
     };
 
-    let outcome = execute_replay(&state.shared.store, &app_id, &req_id)
-        .await
-        .ok();
+    let outcome = execute_replay(&state.shared, &app_id, &req_id).await.ok();
 
     let port = state.shared.listen_http.port();
     let app_view = AppView::from_spec(&app, port, state.shared.use_default_http_port());
@@ -626,6 +650,7 @@ pub async fn action_replay(
         },
     };
 
+    let (embedded, base_path) = embedded_base(&headers, &app_id);
     let page = render_page("pages/request_detail.html", &state.shared, |ctx| {
         ctx.insert(
             "title",
@@ -634,6 +659,8 @@ pub async fn action_replay(
         ctx.insert("app", &app_view);
         ctx.insert("req", &req_view);
         ctx.insert("replay", &replay_view);
+        ctx.insert("embedded", &embedded);
+        ctx.insert("base_path", &base_path);
     });
     Html(page).into_response()
 }

@@ -37,7 +37,7 @@ use tracing::{debug, error, info};
 use tabled::Tabled;
 
 use crate::config::{CoulsonConfig, LOCALHOST_SUFFIX};
-use crate::domain::{BackendTarget, TunnelMode};
+use crate::domain::{AppSpec, BackendTarget, TunnelMode};
 use crate::hooks::{HookContextFactory, HookManager};
 use crate::process::{ProcessManagerHandle, ProviderRegistry};
 use crate::rpc_client::RpcClient;
@@ -78,6 +78,40 @@ pub struct RouteRule {
     pub lan_access: bool,
 }
 
+impl RouteRule {
+    /// Build a `RouteRule` from an `AppSpec`. Used by `reload_routes` (hot
+    /// route table) and by the replay pipeline (which must work even when the
+    /// app is disabled and therefore absent from the route table).
+    pub fn from_app_spec(app: AppSpec) -> Self {
+        let static_root = match &app.target {
+            BackendTarget::Managed { root, .. } => {
+                let public = format!("{root}/public");
+                if std::path::Path::new(&public).is_dir() {
+                    Some(public)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        RouteRule {
+            app_id: Some(app.id.0),
+            inspect_enabled: app.inspect_enabled,
+            lan_access: app.lan_access,
+            target: app.target,
+            path_prefix: app.path_prefix,
+            timeout_ms: app.timeout_ms,
+            cors_enabled: app.cors_enabled,
+            force_https: app.force_https,
+            basic_auth_user: app.basic_auth_user,
+            basic_auth_pass: app.basic_auth_pass,
+            spa_rewrite: app.spa_rewrite,
+            listen_port: app.listen_port,
+            static_root,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SharedState {
     pub store: Arc<AppRepository>,
@@ -104,6 +138,8 @@ pub struct SharedState {
     pub certs_dir: std::path::PathBuf,
     pub runtime_dir: std::path::PathBuf,
     pub hook_manager: Arc<HookManager>,
+    pub inspector_username: Option<String>,
+    pub inspector_password: Option<String>,
     /// Cached privileged-port status with TTL to avoid per-request disk I/O.
     forward_cache: Arc<Mutex<(bool, std::time::Instant)>>,
 }
@@ -164,36 +200,12 @@ impl SharedState {
         let mut table: HashMap<String, Vec<RouteRule>> = HashMap::new();
         let mut port_domains: HashMap<u16, String> = HashMap::new();
         for app in enabled_apps {
-            let static_root = match &app.target {
-                BackendTarget::Managed { root, .. } => {
-                    let public = format!("{root}/public");
-                    if std::path::Path::new(&public).is_dir() {
-                        Some(public)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
             if let Some(port) = app.listen_port {
                 port_domains.insert(port, app.domain.0.clone());
             }
-            let rule = RouteRule {
-                app_id: Some(app.id.0),
-                inspect_enabled: app.inspect_enabled,
-                lan_access: app.lan_access,
-                target: app.target,
-                path_prefix: app.path_prefix,
-                timeout_ms: app.timeout_ms,
-                cors_enabled: app.cors_enabled,
-                force_https: app.force_https,
-                basic_auth_user: app.basic_auth_user,
-                basic_auth_pass: app.basic_auth_pass,
-                spa_rewrite: app.spa_rewrite,
-                listen_port: app.listen_port,
-                static_root,
-            };
-            let domain = app.domain.0;
+            let domain = app.domain.0.clone();
+            let cname = app.cname.clone();
+            let rule = RouteRule::from_app_spec(app);
             // Register .localhost alias so apps are reachable via myapp.localhost
             if self.domain_suffix != LOCALHOST_SUFFIX {
                 if let Some(prefix) = domain.strip_suffix(&format!(".{}", self.domain_suffix)) {
@@ -205,7 +217,7 @@ impl SharedState {
                 }
             }
             // Register cname alias so apps are reachable via custom domain
-            if let Some(ref cname) = app.cname {
+            if let Some(ref cname) = cname {
                 table.entry(cname.clone()).or_default().push(rule.clone());
             }
             table.entry(domain).or_default().push(rule);
@@ -518,6 +530,8 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
         certs_dir: cfg.certs_dir.clone(),
         runtime_dir: cfg.runtime_dir.clone(),
         hook_manager,
+        inspector_username: cfg.inspector_username.clone(),
+        inspector_password: cfg.inspector_password.clone(),
         forward_cache: Arc::new(Mutex::new((
             is_forward_configured_for_port(cfg.listen_http.port()) || is_pf_configured(cfg),
             std::time::Instant::now(),
