@@ -253,7 +253,7 @@ impl SharedState {
 }
 
 #[derive(Parser)]
-#[command(name = "coulson", about = "Local development gateway")]
+#[command(name = "coulson", about = "Local development gateway", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
