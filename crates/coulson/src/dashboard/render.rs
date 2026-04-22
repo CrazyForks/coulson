@@ -612,9 +612,18 @@ pub fn render_page(
     ctx.insert("title", "Coulson");
     ctx.insert("active_nav", "");
     customize(&mut ctx);
-    templates()
-        .render(template, &ctx)
-        .unwrap_or_else(|e| format!("<html><body><pre>Template error: {e}</pre></body></html>"))
+    templates().render(template, &ctx).unwrap_or_else(|e| {
+        let mut chain = format!("{e}");
+        let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
+        while let Some(cause) = src {
+            chain.push_str(&format!("\nCaused by: {cause}"));
+            src = cause.source();
+        }
+        tracing::error!(template = template, error = %chain, "template render failed");
+        format!(
+            "<html><body><pre>Template error rendering {template}:\n{chain}</pre></body></html>"
+        )
+    })
 }
 
 pub fn render_not_found(state: &SharedState) -> String {
