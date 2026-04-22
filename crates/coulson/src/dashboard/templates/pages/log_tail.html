@@ -186,10 +186,10 @@
   }
 
   // Event-delegated tab switching. Using data-process + addEventListener
-  // (rather than inline onclick="switchProcess('{{ pt }}', ...)") keeps
-  // the process_type value out of any JS string context, so a malformed
-  // name like `worker');alert(1);//` cannot break out of an onclick
-  // attribute. Active/inactive class strings are captured from whatever
+  // (rather than inline onclick attributes with the process_type
+  // interpolated into a JS string) keeps the value out of any JS string
+  // context, so a malformed name like `worker');alert(1);//` cannot
+  // break out of an onclick attribute. Active/inactive class strings are captured from whatever
   // the template rendered, so the same handler works in both the
   // embedded (text-xs) and standalone (text-sm) modes without hardcoding
   // a size-specific class list.
