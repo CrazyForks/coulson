@@ -726,11 +726,12 @@ impl ProcessManager {
 
         let env_overrides = crate::process::provider::load_coulsonrc(root);
 
-        let companion_types = parse_managed_services(
-            env_overrides
-                .get("COULSON_MANAGED_SERVICES")
-                .map(|s| s.as_str()),
-        );
+        // Load .coulson.toml manifest if present (needed so its [env] block can
+        // also supply COULSON_MANAGED_SERVICES, not only .coulsonrc).
+        let manifest = load_coulson_toml_manifest(root);
+
+        let managed_services_value = lookup_managed_services(&env_overrides, manifest.as_ref());
+        let companion_types = parse_managed_services(managed_services_value.as_deref());
 
         if !companion_types.is_empty() && kind != "procfile" {
             warn!(
@@ -738,9 +739,6 @@ impl ProcessManager {
                 kind, "COULSON_MANAGED_SERVICES is only supported for procfile apps, ignoring"
             );
         }
-
-        // Load .coulson.toml manifest if present
-        let manifest = load_coulson_toml_manifest(root);
 
         let managed_app = ManagedApp {
             name: name.to_string(),
@@ -752,11 +750,14 @@ impl ProcessManager {
         };
 
         let mut spec = prov.resolve(&managed_app)?;
-        // Do not pass COULSON_MANAGED_SERVICES to child processes
-        spec.env.remove("COULSON_MANAGED_SERVICES");
 
         // Inject [env] from .coulson.toml (overrides provider defaults and .coulsonrc)
         apply_manifest_env(&mut spec, &managed_app.manifest);
+
+        // Strip COULSON_MANAGED_SERVICES from child env. Must happen AFTER the
+        // manifest [env] merge so it covers values supplied either from .coulsonrc
+        // (already loaded into provider's env) or from .coulson.toml [env].
+        spec.env.remove("COULSON_MANAGED_SERVICES");
 
         let _ = app_id; // used in caller for logging
         Ok((
@@ -845,6 +846,8 @@ impl ProcessManager {
                     } else {
                         apply_manifest_env(&mut spec, manifest);
                     }
+                    // Strip the meta-variable in case it slipped in via manifest [env].
+                    spec.env.remove("COULSON_MANAGED_SERVICES");
                     let log_path = primary_log_path
                         .parent()
                         .unwrap_or(sockets_dir)
@@ -2000,6 +2003,22 @@ pub(crate) fn is_valid_process_type(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Look up `COULSON_MANAGED_SERVICES` from either `.coulson.toml [env]` (highest
+/// precedence env source, per `apply_manifest_env`) or `.coulsonrc`. Without this,
+/// the variable only takes effect when written in `.coulsonrc` even though
+/// `.coulson.toml [env]` is documented as the higher-precedence env source.
+fn lookup_managed_services(
+    env_overrides: &HashMap<String, String>,
+    manifest: Option<&serde_json::Value>,
+) -> Option<String> {
+    manifest
+        .and_then(|m| m.get("env"))
+        .and_then(|env| env.get("COULSON_MANAGED_SERVICES"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| env_overrides.get("COULSON_MANAGED_SERVICES").cloned())
+}
+
 /// Parse `COULSON_MANAGED_SERVICES` value into companion process types (excluding "web").
 fn parse_managed_services(value: Option<&str>) -> Vec<String> {
     value
@@ -2096,6 +2115,42 @@ mod tests {
     fn parse_managed_services_no_web() {
         let result = parse_managed_services(Some("worker,scheduler"));
         assert_eq!(result, vec!["worker", "scheduler"]);
+    }
+
+    // -- lookup_managed_services (env source resolution) --
+
+    #[test]
+    fn lookup_managed_services_toml_wins_over_dotenv() {
+        let mut dotenv = HashMap::new();
+        dotenv.insert("COULSON_MANAGED_SERVICES".to_string(), "worker".to_string());
+        let manifest = serde_json::json!({
+            "env": { "COULSON_MANAGED_SERVICES": "worker,scheduler" }
+        });
+        let got = lookup_managed_services(&dotenv, Some(&manifest));
+        assert_eq!(got.as_deref(), Some("worker,scheduler"));
+    }
+
+    #[test]
+    fn lookup_managed_services_falls_back_to_dotenv_when_toml_absent() {
+        let mut dotenv = HashMap::new();
+        dotenv.insert("COULSON_MANAGED_SERVICES".to_string(), "worker".to_string());
+        let manifest = serde_json::json!({ "kind": "procfile" });
+        let got = lookup_managed_services(&dotenv, Some(&manifest));
+        assert_eq!(got.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn lookup_managed_services_reads_toml_only() {
+        let manifest = serde_json::json!({
+            "env": { "COULSON_MANAGED_SERVICES": "worker" }
+        });
+        let got = lookup_managed_services(&HashMap::new(), Some(&manifest));
+        assert_eq!(got.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn lookup_managed_services_none_when_unset() {
+        assert!(lookup_managed_services(&HashMap::new(), None).is_none());
     }
 
     // -- env body parsing --
