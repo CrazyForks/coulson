@@ -2385,15 +2385,16 @@ fn run_logs(
         }
     };
 
-    let sockets_dir = daemon_runtime_dir(&cfg).join("managed");
-    let log_path = match app_root {
+    let app_dir = daemon_runtime_dir(&cfg).join("managed").join(&bare_name);
+    let log_dir = match app_root {
         Some(ref root) => {
             let root = std::path::Path::new(root);
             let manifest = crate::process::load_coulson_toml_manifest(root);
-            crate::process::resolve_log_path(&manifest, root, &sockets_dir, &bare_name)
+            crate::process::resolve_log_dir(&manifest, root, &app_dir)
         }
-        None => sockets_dir.join(format!("{bare_name}.log")),
+        None => app_dir,
     };
+    let log_path = crate::process::process_log_path(&log_dir, "web");
 
     if path {
         println!("{}", log_path.display());

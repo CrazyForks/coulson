@@ -270,17 +270,16 @@ impl ProcessManager {
             cleanup_listen_target(&removed.primary.listen_target);
         }
 
-        let (mut spec, sockets_dir, prov_name, companion_types, manifest) =
+        let (mut spec, app_dir, prov_name, companion_types, manifest) =
             self.resolve_spec(app_id, name, root, kind)?;
 
         if let Some(remote_env) = env_url_env.as_ref() {
             merge_remote_env(&mut spec, remote_env.clone(), &manifest);
         }
 
-        let log_path = resolve_log_path(&manifest, root, &sockets_dir, name);
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
+        let log_dir = resolve_log_dir(&manifest, root, &app_dir);
+        std::fs::create_dir_all(&log_dir).ok();
+        let log_path = process_log_path(&log_dir, "web");
 
         info!(
             app_id,
@@ -345,7 +344,7 @@ impl ProcessManager {
                 log_follower,
             }
         } else {
-            self.spawn_process(name, &spec, &log_path, &sockets_dir, log_tx, app_id, "web")?
+            self.spawn_process(name, &spec, &log_path, &app_dir, log_tx, app_id, "web")?
         };
 
         // Docker builds can be slow — use a longer readiness timeout.
@@ -367,10 +366,10 @@ impl ProcessManager {
             root,
             kind,
             &companion_types,
-            &sockets_dir,
+            &app_dir,
             &manifest,
             env_url_env.as_ref(),
-            &log_path,
+            &log_dir,
             log_tx,
         );
 
@@ -469,8 +468,9 @@ impl ProcessManager {
                     kill_handle(companion.handle).await;
                 }
                 let manifest = load_coulson_toml_manifest(root);
-                let fallback_dir = self.runtime_dir.join("managed");
-                let timed_out_log = resolve_log_path(&manifest, root, &fallback_dir, name);
+                let app_dir = self.runtime_dir.join("managed").join(name);
+                let log_dir = resolve_log_dir(&manifest, root, &app_dir);
+                let timed_out_log = process_log_path(&log_dir, "web");
                 log_tail(&timed_out_log, name);
                 kill_handle(removed.primary.handle).await;
                 cleanup_listen_target(&removed.primary.listen_target);
@@ -490,17 +490,16 @@ impl ProcessManager {
             None => {} // No existing process, proceed to spawn
         }
 
-        let (mut spec, sockets_dir, prov_name, companion_types, manifest) =
+        let (mut spec, app_dir, prov_name, companion_types, manifest) =
             self.resolve_spec(app_id, name, root, kind)?;
 
         if let Some(remote_env) = env_url_env.as_ref() {
             merge_remote_env(&mut spec, remote_env.clone(), &manifest);
         }
 
-        let log_path = resolve_log_path(&manifest, root, &sockets_dir, name);
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
+        let log_dir = resolve_log_dir(&manifest, root, &app_dir);
+        std::fs::create_dir_all(&log_dir).ok();
+        let log_path = process_log_path(&log_dir, "web");
 
         info!(
             app_id,
@@ -562,7 +561,7 @@ impl ProcessManager {
                 log_follower,
             }
         } else {
-            self.spawn_process(name, &spec, &log_path, &sockets_dir, log_tx, app_id, "web")?
+            self.spawn_process(name, &spec, &log_path, &app_dir, log_tx, app_id, "web")?
         };
 
         let companions = self.spawn_companions(
@@ -571,10 +570,10 @@ impl ProcessManager {
             root,
             kind,
             &companion_types,
-            &sockets_dir,
+            &app_dir,
             &manifest,
             env_url_env.as_ref(),
-            &log_path,
+            &log_dir,
             log_tx,
         );
 
@@ -698,8 +697,9 @@ impl ProcessManager {
     }
 
     /// Resolve a ProcessSpec from the provider registry.
-    /// Returns the spec, sockets directory, provider name, companion types,
-    /// and the loaded `.coulson.toml` manifest (if any) for env re-application.
+    /// Returns the spec, the per-app runtime directory (`$RUNTIME/managed/{name}/`),
+    /// provider name, companion types, and the loaded `.coulson.toml` manifest
+    /// (if any) for env re-application.
     #[allow(clippy::type_complexity)]
     fn resolve_spec(
         &self,
@@ -719,10 +719,15 @@ impl ProcessManager {
             .get(kind)
             .ok_or_else(|| anyhow::anyhow!("no process provider for kind: {kind}"))?;
 
-        let managed_dir = self.runtime_dir.join("managed");
-        std::fs::create_dir_all(&managed_dir)
-            .with_context(|| format!("failed to create {}", managed_dir.display()))?;
-        let sockets_dir = std::fs::canonicalize(&managed_dir).unwrap_or(managed_dir);
+        // Each app gets its own runtime directory `$RUNTIME/managed/{name}/`.
+        // The app name lives in the directory, so socket/log files inside are
+        // named purely by process type (`web.sock`, `web.log`, `worker.log`),
+        // which also makes cross-app filename collisions structurally
+        // impossible.
+        let app_dir = self.runtime_dir.join("managed").join(name);
+        std::fs::create_dir_all(&app_dir)
+            .with_context(|| format!("failed to create {}", app_dir.display()))?;
+        let app_dir = std::fs::canonicalize(&app_dir).unwrap_or(app_dir);
 
         let env_overrides = crate::process::provider::load_coulsonrc(root);
 
@@ -748,7 +753,7 @@ impl ProcessManager {
             kind: kind.to_string(),
             manifest,
             env_overrides,
-            socket_dir: sockets_dir.clone(),
+            socket_dir: app_dir.clone(),
         };
 
         let mut spec = prov.resolve(&managed_app)?;
@@ -761,7 +766,7 @@ impl ProcessManager {
         let _ = app_id; // used in caller for logging
         Ok((
             spec,
-            sockets_dir,
+            app_dir,
             prov.display_name().to_string(),
             companion_types,
             managed_app.manifest,
@@ -781,7 +786,7 @@ impl ProcessManager {
         process_type: &str,
     ) -> anyhow::Result<ProcessHandle> {
         if self.use_tmux {
-            self.spawn_tmux(name, spec, log_path, managed_dir)
+            self.spawn_tmux(name, spec, log_path, managed_dir, process_type)
         } else {
             Self::spawn_direct(name, spec, log_path, log_tx, app_id, process_type)
         }
@@ -802,10 +807,10 @@ impl ProcessManager {
         root: &Path,
         kind: &str,
         companion_types: &[String],
-        sockets_dir: &Path,
+        app_dir: &Path,
         manifest: &Option<serde_json::Value>,
         remote_env: Option<&HashMap<String, String>>,
-        primary_log_path: &Path,
+        log_dir: &Path,
         log_tx: &broadcast::Sender<LogLine>,
     ) -> Vec<CompanionProcess> {
         if companion_types.is_empty() || kind != "procfile" {
@@ -819,7 +824,7 @@ impl ProcessManager {
             kind: kind.to_string(),
             manifest: manifest.clone(),
             env_overrides,
-            socket_dir: sockets_dir.to_path_buf(),
+            socket_dir: app_dir.to_path_buf(),
         };
 
         let provider = procfile::ProcfileProvider;
@@ -845,15 +850,12 @@ impl ProcessManager {
                     } else {
                         apply_manifest_env(&mut spec, manifest);
                     }
-                    let log_path = primary_log_path
-                        .parent()
-                        .unwrap_or(sockets_dir)
-                        .join(format!("{name}-{ptype}.log"));
+                    let log_path = process_log_path(log_dir, ptype);
                     match self.spawn_process(
                         &format!("{name}-{ptype}"),
                         &spec,
                         &log_path,
-                        sockets_dir,
+                        app_dir,
                         log_tx,
                         app_id,
                         ptype,
@@ -960,7 +962,8 @@ impl ProcessManager {
         name: &str,
         spec: &ProcessSpec,
         log_path: &Path,
-        managed_dir: &Path,
+        app_dir: &Path,
+        process_type: &str,
     ) -> anyhow::Result<ProcessHandle> {
         let session_name = name.to_string();
 
@@ -969,8 +972,9 @@ impl ProcessManager {
             tmux_kill_session(&session_name);
         }
 
-        // Generate wrapper script
-        let script_path = managed_dir.join(format!("{name}.sh"));
+        // Generate wrapper script — named by process type within the per-app
+        // directory (the app name is already in `app_dir`).
+        let script_path = app_dir.join(format!("{process_type}.sh"));
         let script_content = generate_wrapper_script(&user_shell(), spec);
         std::fs::write(&script_path, &script_content)
             .with_context(|| format!("failed to write wrapper script {}", script_path.display()))?;
@@ -1127,30 +1131,60 @@ fn spawn_tee_task(
 }
 
 /// Extract `idle_timeout_secs` from a `.coulson.toml` manifest JSON value.
-/// Resolve the effective log file path for a managed app.
+/// Resolve the directory where a managed app's process logs live.
 ///
-/// If the manifest specifies a `log_path`, resolve it (relative paths are
-/// joined to the app root). Otherwise fall back to `{sockets_dir}/{name}.log`.
-pub(crate) fn resolve_log_path(
+/// Each process writes to `{log_dir}/{process_type}.log` (see
+/// [`process_log_path`]). The directory namespaces an app's logs, so the file
+/// names carry only the process type — never the app name.
+///
+/// Priority:
+/// 1. manifest `log_dir` — explicit directory (relative paths join the app root)
+/// 2. manifest `log_path` — **deprecated**; the parent directory of the given
+///    file path is used (a warning is emitted)
+/// 3. default `{app_runtime_dir}` (`$RUNTIME/managed/{name}/`)
+pub(crate) fn resolve_log_dir(
     manifest: &Option<serde_json::Value>,
     root: &Path,
-    sockets_dir: &Path,
-    name: &str,
+    app_runtime_dir: &Path,
 ) -> PathBuf {
-    if let Some(raw) = manifest
-        .as_ref()
-        .and_then(|m| m.get("log_path"))
-        .and_then(|v| v.as_str())
-    {
+    let manifest = manifest.as_ref();
+    let resolve_relative = |raw: &str| -> PathBuf {
         let p = Path::new(raw);
         if p.is_absolute() {
             p.to_path_buf()
         } else {
             root.join(p)
         }
-    } else {
-        sockets_dir.join(format!("{name}.log"))
+    };
+
+    if let Some(raw) = manifest
+        .and_then(|m| m.get("log_dir"))
+        .and_then(|v| v.as_str())
+    {
+        return resolve_relative(raw);
     }
+
+    if let Some(raw) = manifest
+        .and_then(|m| m.get("log_path"))
+        .and_then(|v| v.as_str())
+    {
+        warn!(
+            log_path = raw,
+            "`log_path` in .coulson.toml is deprecated; use `log_dir` (a directory). \
+             Treating the parent directory as the log directory."
+        );
+        let p = resolve_relative(raw);
+        return p.parent().map(Path::to_path_buf).unwrap_or(p);
+    }
+
+    app_runtime_dir.to_path_buf()
+}
+
+/// Build the log file path for a single process within an app's log directory.
+/// The app name lives in `log_dir`, so the file is named purely by process type
+/// (`web.log`, `worker.log`, …).
+pub(crate) fn process_log_path(log_dir: &Path, process_type: &str) -> PathBuf {
+    log_dir.join(format!("{process_type}.log"))
 }
 
 fn manifest_idle_timeout(manifest: &Option<serde_json::Value>) -> Option<Duration> {
@@ -1990,7 +2024,7 @@ async fn quick_ready_check(target: &ListenTarget) -> bool {
 /// Whether `s` is a safe process_type token.
 ///
 /// process_type flows into several sensitive contexts: the log file path
-/// (`{name}-{ptype}.log`), the Procfile lookup key, and URL path segments in
+/// (`{ptype}.log`), the Procfile lookup key, and URL path segments in
 /// the log streaming endpoints. Restricting it to `[A-Za-z0-9_-]+` (the
 /// de-facto Procfile convention) closes off path-traversal, URL-reserved
 /// characters, and shell metacharacter surprises in one pass.
@@ -2604,49 +2638,86 @@ OVERRIDE = "toml_wins"
         fs::remove_dir_all(&dir).ok();
     }
 
-    // -- resolve_log_path --
+    // -- resolve_log_dir / process_log_path --
 
     #[test]
-    fn resolve_log_path_falls_back_to_default() {
+    fn resolve_log_dir_falls_back_to_app_runtime_dir() {
         let manifest: Option<serde_json::Value> = None;
         let root = Path::new("/app");
-        let sockets = Path::new("/run/coulson/managed");
+        let app_dir = Path::new("/run/coulson/managed/myapp");
         assert_eq!(
-            resolve_log_path(&manifest, root, sockets, "myapp"),
-            PathBuf::from("/run/coulson/managed/myapp.log")
+            resolve_log_dir(&manifest, root, app_dir),
+            PathBuf::from("/run/coulson/managed/myapp")
         );
     }
 
     #[test]
-    fn resolve_log_path_absolute() {
-        let manifest = Some(serde_json::json!({ "log_path": "/var/log/myapp.log" }));
-        let root = Path::new("/app");
-        let sockets = Path::new("/run/coulson/managed");
-        assert_eq!(
-            resolve_log_path(&manifest, root, sockets, "myapp"),
-            PathBuf::from("/var/log/myapp.log")
-        );
-    }
-
-    #[test]
-    fn resolve_log_path_relative_joins_root() {
-        let manifest = Some(serde_json::json!({ "log_path": "tmp/log/web.log" }));
-        let root = Path::new("/home/user/myapp");
-        let sockets = Path::new("/run/coulson/managed");
-        assert_eq!(
-            resolve_log_path(&manifest, root, sockets, "myapp"),
-            PathBuf::from("/home/user/myapp/tmp/log/web.log")
-        );
-    }
-
-    #[test]
-    fn resolve_log_path_empty_manifest_uses_default() {
+    fn resolve_log_dir_empty_manifest_uses_default() {
         let manifest = Some(serde_json::json!({}));
         let root = Path::new("/app");
-        let sockets = Path::new("/run/coulson/managed");
+        let app_dir = Path::new("/run/coulson/managed/myapp");
         assert_eq!(
-            resolve_log_path(&manifest, root, sockets, "myapp"),
-            PathBuf::from("/run/coulson/managed/myapp.log")
+            resolve_log_dir(&manifest, root, app_dir),
+            PathBuf::from("/run/coulson/managed/myapp")
+        );
+    }
+
+    #[test]
+    fn resolve_log_dir_explicit_absolute() {
+        let manifest = Some(serde_json::json!({ "log_dir": "/var/log/myapp" }));
+        let root = Path::new("/app");
+        let app_dir = Path::new("/run/coulson/managed/myapp");
+        assert_eq!(
+            resolve_log_dir(&manifest, root, app_dir),
+            PathBuf::from("/var/log/myapp")
+        );
+    }
+
+    #[test]
+    fn resolve_log_dir_explicit_relative_joins_root() {
+        let manifest = Some(serde_json::json!({ "log_dir": "logs" }));
+        let root = Path::new("/home/user/myapp");
+        let app_dir = Path::new("/run/coulson/managed/myapp");
+        assert_eq!(
+            resolve_log_dir(&manifest, root, app_dir),
+            PathBuf::from("/home/user/myapp/logs")
+        );
+    }
+
+    #[test]
+    fn resolve_log_dir_deprecated_log_path_uses_parent() {
+        let manifest = Some(serde_json::json!({ "log_path": "logs/web.log" }));
+        let root = Path::new("/home/user/myapp");
+        let app_dir = Path::new("/run/coulson/managed/myapp");
+        // The deprecated single-file `log_path` collapses to its parent dir, so
+        // companions land next to the web log instead of using app-prefixed names.
+        assert_eq!(
+            resolve_log_dir(&manifest, root, app_dir),
+            PathBuf::from("/home/user/myapp/logs")
+        );
+    }
+
+    #[test]
+    fn resolve_log_dir_prefers_log_dir_over_deprecated_log_path() {
+        let manifest = Some(serde_json::json!({ "log_dir": "logs", "log_path": "old/web.log" }));
+        let root = Path::new("/home/user/myapp");
+        let app_dir = Path::new("/run/coulson/managed/myapp");
+        assert_eq!(
+            resolve_log_dir(&manifest, root, app_dir),
+            PathBuf::from("/home/user/myapp/logs")
+        );
+    }
+
+    #[test]
+    fn process_log_path_names_by_process_type() {
+        let log_dir = Path::new("/run/coulson/managed/myapp");
+        assert_eq!(
+            process_log_path(log_dir, "web"),
+            PathBuf::from("/run/coulson/managed/myapp/web.log")
+        );
+        assert_eq!(
+            process_log_path(log_dir, "worker"),
+            PathBuf::from("/run/coulson/managed/myapp/worker.log")
         );
     }
 
