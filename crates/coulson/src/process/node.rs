@@ -69,7 +69,6 @@ impl ProcessProvider for NodeProvider {
                 let port = resolve_port(&app.env_overrides)?;
                 let mut env = std::collections::HashMap::new();
                 env.insert("PORT".to_string(), port.to_string());
-                env.extend(app.env_overrides.clone());
                 return Ok(ProcessSpec {
                     command: PathBuf::from(cmd),
                     args: vec![],
@@ -100,7 +99,6 @@ impl ProcessProvider for NodeProvider {
 
         let mut env = std::collections::HashMap::new();
         env.insert("PORT".to_string(), port.to_string());
-        env.extend(app.env_overrides.clone());
 
         let listen_target = ListenTarget::Tcp {
             host: "127.0.0.1".to_string(),

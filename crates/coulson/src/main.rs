@@ -338,6 +338,23 @@ enum Commands {
         #[arg(long)]
         path: bool,
     },
+    /// Show the resolved environment a managed app's web process would receive
+    Env {
+        /// App name or domain (omit to match CWD)
+        name: Option<String>,
+        /// Print as plain KEY=value lines (no source column)
+        #[arg(long)]
+        bare: bool,
+        /// Print as JSON (array of {key, value, source})
+        #[arg(long)]
+        json: bool,
+        /// Show the would-be env (re-resolved now) instead of the running process
+        #[arg(long)]
+        preview: bool,
+        /// With --preview, do not fetch env_url (offline)
+        #[arg(long)]
+        no_remote: bool,
+    },
     /// Show running managed processes
     Ps,
     /// Start a managed process
@@ -1472,6 +1489,13 @@ async fn main() -> anyhow::Result<()> {
             lines,
             path,
         } => run_logs(cfg, name, follow, lines, path),
+        Commands::Env {
+            name,
+            bare,
+            json,
+            preview,
+            no_remote,
+        } => run_env(cfg, name, bare, json, preview, no_remote).await,
         Commands::Ps => run_ps(cfg),
         Commands::Start { name } => run_process_action(cfg, name, "process.start"),
         Commands::Stop { name } => run_process_action(cfg, name, "process.stop"),
@@ -2106,6 +2130,157 @@ fn resolve_app_id(
         .ok_or_else(|| anyhow::anyhow!("app not found: {bare_name}"))?;
 
     Ok((bare_name, app_id))
+}
+
+async fn run_env(
+    cfg: CoulsonConfig,
+    name: Option<String>,
+    bare: bool,
+    json: bool,
+    preview: bool,
+    no_remote: bool,
+) -> anyhow::Result<()> {
+    // Each row is (key, value, source_kind, source_label).
+    let rows: Vec<(String, String, String, String)> = if preview {
+        // Re-resolve locally: what the app *would* get if started now.
+        let bare_name = resolve_app_name(&cfg, name.as_deref())?;
+        let domain_match = format!("{bare_name}.{}", cfg.domain_suffix);
+        let state = build_state(&cfg)?;
+        let app = state
+            .store
+            .list_all()?
+            .into_iter()
+            .find(|a| a.name == bare_name || a.domain.0 == domain_match || a.domain.0 == bare_name)
+            .ok_or_else(|| anyhow::anyhow!("app not found: {bare_name}"))?;
+        let (app_id, root, kind, mname) = match &app.target {
+            crate::domain::BackendTarget::Managed {
+                app_id,
+                root,
+                kind,
+                name,
+            } => (*app_id, root.clone(), kind.clone(), name.clone()),
+            _ => bail!(
+                "`coulson env` is only available for managed apps; {bare_name} is a static/proxy app"
+            ),
+        };
+        let entries = {
+            let pm = state.process_manager.lock().await;
+            pm.inspect_env(
+                app_id,
+                &mname,
+                std::path::Path::new(&root),
+                &kind,
+                !no_remote,
+            )
+            .await?
+        };
+        eprintln!(
+            "{}",
+            "(preview — computed now, not the running process; PORT is a preview allocation)"
+                .dimmed()
+        );
+        entries
+            .into_iter()
+            .map(|e| {
+                let kind = e.source.kind().to_string();
+                let label = e.source.label();
+                (e.key, e.value, kind, label)
+            })
+            .collect()
+    } else {
+        // Live: the env the running process was actually started with.
+        let client = RpcClient::new(&cfg.control_socket);
+        let (_bare_name, app_id) = resolve_app_id(&client, &cfg, name)?;
+        let result = client.call("process.env", serde_json::json!({ "app_id": app_id }))?;
+        result
+            .get("env")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| {
+                        let key = e.get("key")?.as_str()?.to_string();
+                        let value = e.get("value")?.as_str()?.to_string();
+                        let source = e.get("source")?;
+                        let kind = source.get("kind")?.as_str()?.to_string();
+                        let label = source.get("label")?.as_str()?.to_string();
+                        Some((key, value, kind, label))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    if json {
+        let arr: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(k, v, kind, label)| {
+                serde_json::json!({
+                    "key": k,
+                    "value": v,
+                    "source": { "kind": kind, "label": label },
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(());
+    }
+    if bare {
+        for (k, v, _, _) in &rows {
+            println!("{k}={v}");
+        }
+        return Ok(());
+    }
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    // Aligned KEY + SOURCE columns (bounded widths); VALUE last. Long values
+    // are truncated to the terminal width so rows stay one line and aligned.
+    // When output is not a TTY (piped), values are shown in full.
+    let key_w = rows
+        .iter()
+        .map(|(k, ..)| k.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("KEY".len());
+    let src_w = rows
+        .iter()
+        .map(|(_, _, _, label)| label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("SOURCE".len());
+
+    const SEP: usize = 2; // spaces between columns
+    let value_budget = terminal_size::terminal_size().map(|(w, _)| {
+        (w.0 as usize)
+            .saturating_sub(key_w + src_w + SEP * 2)
+            .max(8)
+    });
+
+    println!(
+        "{}  {}  {}",
+        format!("{:<key_w$}", "KEY").dimmed(),
+        format!("{:<src_w$}", "SOURCE").dimmed(),
+        "VALUE".dimmed()
+    );
+    for (k, v, kind, label) in &rows {
+        let src_cell = format!("{label:<src_w$}");
+        let src_cell = match kind.as_str() {
+            "dotenv" => src_cell.green(),
+            "env_url" => src_cell.cyan(),
+            "toml" => src_cell.yellow(),
+            _ => src_cell.dimmed(),
+        };
+        let value = match value_budget {
+            Some(budget) if v.chars().count() > budget => {
+                let head: String = v.chars().take(budget.saturating_sub(1)).collect();
+                format!("{head}…")
+            }
+            _ => v.clone(),
+        };
+        println!("{}  {}  {}", format!("{k:<key_w$}").bold(), src_cell, value);
+    }
+    Ok(())
 }
 
 fn run_ps(cfg: CoulsonConfig) -> anyhow::Result<()> {

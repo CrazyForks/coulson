@@ -80,15 +80,13 @@ impl ProcfileProvider {
             format!("{} {}", entry.command, entry.options.join(" "))
         };
 
-        // Companion gets env_overrides but no PORT, no COULSON_MANAGED_SERVICES
-        let mut env = app.env_overrides.clone();
-        env.remove("COULSON_MANAGED_SERVICES");
-
+        // Companion has no framework defaults (no PORT). User env is layered on
+        // top by the orchestrator, which also strips COULSON_MANAGED_SERVICES.
         Ok(CompanionSpec {
             process_type: process_type.to_string(),
             command: PathBuf::new(),
             args: vec![full_command],
-            env,
+            env: HashMap::new(),
             working_dir: root.clone(),
         })
     }
@@ -138,7 +136,6 @@ impl ProcessProvider for ProcfileProvider {
                 let port = resolve_port(&app.env_overrides)?;
                 let mut env = HashMap::new();
                 env.insert("PORT".to_string(), port.to_string());
-                env.extend(app.env_overrides.clone());
                 return Ok(ProcessSpec {
                     command: PathBuf::new(),
                     args: vec![cmd.to_string()],
@@ -174,7 +171,6 @@ impl ProcessProvider for ProcfileProvider {
         let port = resolve_port(&app.env_overrides)?;
         let mut env = HashMap::new();
         env.insert("PORT".to_string(), port.to_string());
-        env.extend(app.env_overrides.clone());
 
         debug!(
             root = %root.display(),
