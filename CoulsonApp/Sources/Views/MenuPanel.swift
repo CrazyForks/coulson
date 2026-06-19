@@ -217,7 +217,7 @@ enum MenuBuilder {
         sub.addItem(lan)
 
         // Logs (only when log file exists)
-        let logPath = (vm.runtimeDir as NSString).appendingPathComponent("managed/\(app.name).log")
+        let logPath = (vm.runtimeDir as NSString).appendingPathComponent("managed/\(app.name)/web.log")
         if FileManager.default.fileExists(atPath: logPath) {
             sub.addItem(.separator())
 

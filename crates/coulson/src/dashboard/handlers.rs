@@ -63,86 +63,6 @@ fn read_log_tail_lines(log_path: &std::path::Path, max_lines: usize) -> Option<V
     Some(lines[start..].to_vec())
 }
 
-/// Lexically normalize a path: collapse `.` / `..` / redundant separators
-/// WITHOUT touching the filesystem.
-///
-/// Needed because companion-log collision detection must work even when the
-/// log files do not yet exist (e.g. the companion process has never been
-/// spawned). `std::fs::canonicalize` requires the target to exist, so it is
-/// unsuitable here. Lexical normalization is also deliberately unaware of
-/// symlinks — two different symlinks to the same inode will compare unequal,
-/// which is the safer default for config-level collision detection.
-fn lexical_normalize(p: &std::path::Path) -> std::path::PathBuf {
-    use std::path::{Component, PathBuf};
-    let mut out = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            Component::Prefix(_) | Component::RootDir => out.push(comp.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => match out.components().next_back() {
-                // Collapse against the preceding real segment.
-                Some(Component::Normal(_)) => {
-                    out.pop();
-                }
-                // On an absolute path `/..` equals `/` — drop the extra
-                // ParentDir entirely instead of keeping it as `/../…`,
-                // otherwise two spellings of the same real file would
-                // normalize to different `PathBuf`s and escape
-                // `companion_log_collides`.
-                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
-                // Relative path with no preceding `Normal` (either empty
-                // or already a `..` chain): preserve the `..` so the
-                // meaning of the relative path is kept.
-                _ => {
-                    out.push("..");
-                }
-            },
-            Component::Normal(s) => out.push(s),
-        }
-    }
-    out
-}
-
-/// Collect lexically-normalized web log paths for every managed app OTHER
-/// than `self_name`.
-///
-/// Used to detect file-path level collisions between a would-be companion
-/// log (`{self}-{ptype}.log`) and some unrelated app's web log. Iterating
-/// the full managed-app set is required because any app — regardless of
-/// name — can point its manifest `log_path` at the same file. Returns
-/// Err on store failure; callers should fail closed.
-fn other_managed_web_log_paths(
-    shared: &SharedState,
-    self_name: &str,
-) -> anyhow::Result<std::collections::HashSet<std::path::PathBuf>> {
-    let sockets_dir = shared.runtime_dir.join("managed");
-    let mut out = std::collections::HashSet::new();
-    for app in shared.store.list_all()? {
-        if app.name == self_name {
-            continue;
-        }
-        let crate::domain::BackendTarget::Managed { root, .. } = &app.target else {
-            continue;
-        };
-        let root_path = std::path::PathBuf::from(root);
-        let manifest = crate::process::load_coulson_toml_manifest(&root_path);
-        let web_log =
-            crate::process::resolve_log_path(&manifest, &root_path, &sockets_dir, &app.name);
-        out.insert(lexical_normalize(&web_log));
-    }
-    Ok(out)
-}
-
-/// Whether `companion_path` would read some other managed app's web log
-/// file. Pure set-membership on normalized paths — compute the set via
-/// [`other_managed_web_log_paths`] once per request and reuse it.
-fn companion_log_collides(
-    other_paths: &std::collections::HashSet<std::path::PathBuf>,
-    companion_path: &std::path::Path,
-) -> bool {
-    other_paths.contains(&lexical_normalize(companion_path))
-}
-
 pub async fn favicon() -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -670,15 +590,16 @@ pub async fn page_process_log(
         Ok(Some(app)) => app,
         _ => return html_response(StatusCode::NOT_FOUND, render_not_found(&state.shared)),
     };
-    let sockets_dir = state.shared.runtime_dir.join("managed");
-    let log_path = match &app.target {
+    let app_dir = state.shared.runtime_dir.join("managed").join(&app.name);
+    let log_dir = match &app.target {
         crate::domain::BackendTarget::Managed { root, .. } => {
             let root = std::path::Path::new(root);
             let manifest = crate::process::load_coulson_toml_manifest(root);
-            crate::process::resolve_log_path(&manifest, root, &sockets_dir, &app.name)
+            crate::process::resolve_log_dir(&manifest, root, &app_dir)
         }
-        _ => sockets_dir.join(format!("{}.log", app.name)),
+        _ => app_dir,
     };
+    let log_path = crate::process::process_log_path(&log_dir, "web");
     let log_content = read_log_tail_lines(&log_path, 200).map(|lines| lines.join("\n"));
     let page = render_page("pages/process_log.html", &state.shared, |ctx| {
         ctx.insert("title", &format!("{} — Log", app.name));
@@ -1145,75 +1066,29 @@ pub async fn page_logs(
         }
     };
 
-    let sockets_dir = state.shared.runtime_dir.join("managed");
     let manifest = crate::process::load_coulson_toml_manifest(&root);
-    let log_path = crate::process::resolve_log_path(&manifest, &root, &sockets_dir, &app.name);
+    let app_dir = state.shared.runtime_dir.join("managed").join(&app.name);
+    let log_dir = crate::process::resolve_log_dir(&manifest, &root, &app_dir);
 
     let runtime_types = {
         let pm = state.shared.process_manager.lock().await;
         pm.process_types(app.id.0)
     };
 
-    // Determine whether a companion log candidate would actually share a
-    // file path with some OTHER app's resolved web log. Scan every managed
-    // app (not just `{name}-{ptype}`) because any app, regardless of name,
-    // can point its manifest `log_path` at the same file. Fail closed on
-    // store error so a transient DB hiccup never exposes another app's log.
-    let log_dir = log_path.parent().unwrap_or(&sockets_dir);
-    let other_paths = match other_managed_web_log_paths(&state.shared, &app.name) {
-        Ok(set) => Some(set),
-        Err(e) => {
-            tracing::warn!(error = %e, app = %app.name, "store lookup failed; hiding all companion log tabs");
-            None
-        }
-    };
-    let collides = |ptype: &str| -> bool {
-        if ptype == "web" {
-            return false;
-        }
-        let stem = format!("{}-{}", app.name, ptype);
-        let companion_path = log_dir.join(format!("{stem}.log"));
-        match &other_paths {
-            Some(set) => companion_log_collides(set, &companion_path),
-            None => true,
-        }
-    };
-
-    // Filter runtime types so the page and the SSE endpoint agree on
-    // which companions are reachable. Without this, a genuinely-colliding
-    // companion would appear as a tab here but 404 when clicked.
-    let runtime_types: Vec<String> = runtime_types.into_iter().filter(|t| !collides(t)).collect();
-
-    // Scan the log directory for any companion log files
-    // (`{name}.log`, `{name}-{ptype}.log`) so we can offer switchers for
-    // worker/scheduler/etc. even if the process is not currently running.
-    // Skip any candidate whose file path would actually overlap with
-    // another registered app's web log — `foo-worker.log` (the web log of
-    // `foo-worker`) would otherwise be misread as `foo`'s `worker`
-    // companion when both apps share `{sockets_dir}` as their log dir.
+    // Scan the app's log directory for `{ptype}.log` files so we can offer
+    // switchers for worker/scheduler/etc. even when the process is not
+    // currently running. Each app owns its log directory, so a `*.log` stem
+    // is directly the process type — no app-name prefix to strip and no way
+    // to read an unrelated app's log.
     let mut disk_types: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(log_dir) {
+    if let Ok(entries) = std::fs::read_dir(&log_dir) {
         for entry in entries.flatten() {
             let fname_os = entry.file_name();
             let Some(fname) = fname_os.to_str() else {
                 continue;
             };
-            if fname == format!("{}.log", app.name) {
-                disk_types.push("web".to_string());
-            } else if let Some(rest) = fname.strip_prefix(&format!("{}-", app.name)) {
-                if let Some(ptype) = rest.strip_suffix(".log") {
-                    // Skip files whose inferred `ptype` does not match the
-                    // process_type charset. Without this a legit log like
-                    // `foo-bar.baz.log` (left by some unrelated tool or
-                    // historical data) would surface as a `bar.baz` tab that
-                    // `sse_logs` would then reject anyway — an avoidable
-                    // "tab shown then 404" inconsistency.
-                    if !crate::process::is_valid_process_type(ptype) {
-                        continue;
-                    }
-                    if collides(ptype) {
-                        continue;
-                    }
+            if let Some(ptype) = fname.strip_suffix(".log") {
+                if crate::process::is_valid_process_type(ptype) {
                     disk_types.push(ptype.to_string());
                 }
             }
@@ -1236,18 +1111,12 @@ pub async fn page_logs(
         }
     }
 
-    // Map each process_type to its on-disk log path so the UI can update
-    // the displayed filename when the user switches tabs — the primary
-    // `log_path` only describes the `web` log, while companions live at
-    // `{log_dir}/{name}-{ptype}.log` (matching `spawn_tee_task`'s target).
+    // Map each process_type to its on-disk log path (`{log_dir}/{ptype}.log`)
+    // so the UI can show the filename when the user switches tabs.
     let mut process_log_paths: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for pt in &process_types {
-        let p = if pt == "web" {
-            log_path.clone()
-        } else {
-            log_dir.join(format!("{}-{}.log", app.name, pt))
-        };
+        let p = crate::process::process_log_path(&log_dir, pt);
         process_log_paths.insert(pt.clone(), p.to_string_lossy().into_owned());
     }
     let initial_process = process_types
@@ -1257,7 +1126,11 @@ pub async fn page_logs(
     let initial_log_path = process_log_paths
         .get(&initial_process)
         .cloned()
-        .unwrap_or_else(|| log_path.to_string_lossy().into_owned());
+        .unwrap_or_else(|| {
+            crate::process::process_log_path(&log_dir, "web")
+                .to_string_lossy()
+                .into_owned()
+        });
 
     let page = render_page("pages/log_tail.html", &state.shared, |ctx| {
         ctx.insert("title", &format!("{} — Logs", app.name));
@@ -1291,10 +1164,10 @@ pub async fn sse_logs(
         _ => return html_response(StatusCode::NOT_FOUND, "Not found".to_string()),
     };
 
-    // Reject process_types that would escape the `{name}-{ptype}.log`
-    // filename into a nested path or non-ASCII filesystem segment. "web"
-    // is the only companion-less case that bypasses the log-name format,
-    // so it is always admitted even though it also matches the charset.
+    // Reject process_types that would escape the `{ptype}.log` filename into a
+    // nested path or non-ASCII filesystem segment. "web" is the only
+    // companion-less case that bypasses the format, so it is always admitted
+    // even though it also matches the charset.
     if process_type != "web" && !crate::process::is_valid_process_type(&process_type) {
         return html_response(StatusCode::NOT_FOUND, "Not found".to_string());
     }
@@ -1305,9 +1178,9 @@ pub async fn sse_logs(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.contains("text/event-stream"));
 
-    // Resolve the log file path for this process_type. The web log follows
-    // the manifest's log_path; companion logs live in the same directory as
-    // `{name}-{ptype}.log`.
+    // Resolve the log file for this process_type: `{log_dir}/{ptype}.log`.
+    // The app owns its log directory, so there is no way to read another
+    // app's log here.
     let root = match &app.target {
         crate::domain::BackendTarget::Managed { root, .. } => std::path::PathBuf::from(root),
         _ => {
@@ -1319,35 +1192,10 @@ pub async fn sse_logs(
             return plain_text_stream(futures::stream::pending::<String>());
         }
     };
-    let sockets_dir = state.shared.runtime_dir.join("managed");
     let manifest = crate::process::load_coulson_toml_manifest(&root);
-    let web_log = crate::process::resolve_log_path(&manifest, &root, &sockets_dir, &app.name);
-    // Refuse companion process_types whose resolved log path would actually
-    // overlap another registered app's web log. Compare resolved paths (not
-    // just names) so a `foo-worker` app with a manifest `log_path` pointing
-    // elsewhere does not block `foo`'s legitimate `worker` companion. Fail
-    // closed on store error: we would rather 404 than leak another app's
-    // log during a transient DB hiccup.
-    let log_path = if process_type == "web" {
-        web_log.clone()
-    } else {
-        web_log
-            .parent()
-            .unwrap_or(&sockets_dir)
-            .join(format!("{}-{}.log", app.name, process_type))
-    };
-    if process_type != "web" {
-        let collides = match other_managed_web_log_paths(&state.shared, &app.name) {
-            Ok(set) => companion_log_collides(&set, &log_path),
-            Err(e) => {
-                tracing::warn!(error = %e, app = %app.name, "store lookup failed; refusing companion log stream");
-                true
-            }
-        };
-        if collides {
-            return html_response(StatusCode::NOT_FOUND, "Not found".to_string());
-        }
-    }
+    let app_dir = state.shared.runtime_dir.join("managed").join(&app.name);
+    let log_dir = crate::process::resolve_log_dir(&manifest, &root, &app_dir);
+    let log_path = crate::process::process_log_path(&log_dir, &process_type);
 
     let has_broadcast = {
         let pm = state.shared.process_manager.lock().await;
@@ -1561,51 +1409,4 @@ pub async fn not_found(
         );
     }
     html_response(StatusCode::NOT_FOUND, render_not_found(&state.shared))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::lexical_normalize;
-    use std::path::{Path, PathBuf};
-
-    fn norm(p: &str) -> PathBuf {
-        lexical_normalize(Path::new(p))
-    }
-
-    #[test]
-    fn normalizes_curdir_and_simple_parent() {
-        assert_eq!(norm("./logs/../foo.log"), PathBuf::from("foo.log"));
-        assert_eq!(norm("a/b/../c"), PathBuf::from("a/c"));
-    }
-
-    #[test]
-    fn preserves_relative_parent_chain() {
-        assert_eq!(norm("../foo"), PathBuf::from("../foo"));
-        assert_eq!(norm("../../foo/bar"), PathBuf::from("../../foo/bar"));
-    }
-
-    #[test]
-    fn collapses_extra_parents_above_root() {
-        // `/..` is `/` on Unix — extra ParentDir above RootDir must not
-        // survive into the normalized path, otherwise two spellings of
-        // the same real file compare unequal.
-        assert_eq!(
-            norm("/tmp/../../tmp/foo.log"),
-            PathBuf::from("/tmp/foo.log")
-        );
-        assert_eq!(norm("/.."), PathBuf::from("/"));
-        assert_eq!(norm("/../.."), PathBuf::from("/"));
-    }
-
-    #[test]
-    fn strips_trailing_separator() {
-        assert_eq!(norm("a/b/"), PathBuf::from("a/b"));
-        assert_eq!(norm("/tmp/"), PathBuf::from("/tmp"));
-    }
-
-    #[test]
-    fn absolute_and_root_edge_cases() {
-        assert_eq!(norm("/"), PathBuf::from("/"));
-        assert_eq!(norm("/tmp/foo.log"), PathBuf::from("/tmp/foo.log"));
-    }
 }

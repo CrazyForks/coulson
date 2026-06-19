@@ -326,12 +326,13 @@ extension AppDelegate {
         guard let box = sender.representedObject as? AppRecordBox else { return }
         Task { @MainActor in
             guard let vm = self.vm else { return }
-            let dir = (vm.runtimeDir as NSString).appendingPathComponent("managed")
-            let logPath = (dir as NSString).appendingPathComponent("\(box.app.name).log")
+            let managedDir = (vm.runtimeDir as NSString).appendingPathComponent("managed")
+            let appDir = (managedDir as NSString).appendingPathComponent(box.app.name)
+            let logPath = (appDir as NSString).appendingPathComponent("web.log")
             if FileManager.default.fileExists(atPath: logPath) {
-                NSWorkspace.shared.selectFile(logPath, inFileViewerRootedAtPath: dir)
-            } else if FileManager.default.fileExists(atPath: dir) {
-                NSWorkspace.shared.open(URL(fileURLWithPath: dir))
+                NSWorkspace.shared.selectFile(logPath, inFileViewerRootedAtPath: appDir)
+            } else if FileManager.default.fileExists(atPath: appDir) {
+                NSWorkspace.shared.open(URL(fileURLWithPath: appDir))
             }
         }
     }

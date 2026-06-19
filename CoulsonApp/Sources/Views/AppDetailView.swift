@@ -180,7 +180,7 @@ struct AppDetailView: View {
                 }
                 if app.target.type == "managed" {
                     Divider().padding(.leading, 12)
-                    pathRow("Log", (vm.runtimeDir as NSString).appendingPathComponent("managed/\(app.name).log"))
+                    pathRow("Log", (vm.runtimeDir as NSString).appendingPathComponent("managed/\(app.name)/web.log"))
                 }
             }
             .background(.quaternary.opacity(0.3))
