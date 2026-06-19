@@ -55,6 +55,7 @@ procfile.workspace = true
 libc.workspace = true
 keyring.workspace = true
 dotenvy.workspace = true
+terminal_size.workspace = true
 
 [features]
 builtin-quick-tunnel = []

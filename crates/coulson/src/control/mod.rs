@@ -513,6 +513,24 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
             let infos = pm.list_status();
             Ok(json!({ "processes": infos }))
         }
+        "process.env" => {
+            let params: AppIdParams = parse_params!(req);
+            let app = find_app!(state, req, params.app_id);
+            if !matches!(app.target, crate::domain::BackendTarget::Managed { .. }) {
+                return render_err(
+                    req.request_id,
+                    ControlError::InvalidParams("app is not a managed process".to_string()),
+                );
+            }
+            let mut pm = state.process_manager.lock().await;
+            match pm.process_env(params.app_id) {
+                Some(entries) => Ok(json!({ "env": entries })),
+                None => Err(ControlError::InvalidParams(format!(
+                    "{} is not running; start it (open it or `coulson start`), or use `coulson env --preview`",
+                    app.name
+                ))),
+            }
+        }
         "process.start" | "process.stop" | "process.restart" => {
             let params: AppIdParams = parse_params!(req);
             let app = find_app!(state, req, params.app_id);
