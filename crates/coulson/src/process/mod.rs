@@ -86,6 +86,9 @@ struct ManagedProcess {
     last_active: Instant,
     kind: String,
     ready: bool,
+    /// The environment this process was started with (merged, with provenance),
+    /// captured at spawn so `coulson env` can show the live values.
+    resolved_env: Vec<EnvEntry>,
 }
 
 #[allow(dead_code)]
@@ -134,6 +137,124 @@ pub struct ProcessInfo {
     pub idle_secs: u64,
     pub alive: bool,
     pub backend: String,
+}
+
+/// Which layer a resolved env var's winning value came from. Mirrors the
+/// precedence in [`LayeredEnv`]. `Dotenv` carries the file path because there
+/// can be more than one dotenv file (today `.coulsonrc`; future `.env`, etc.),
+/// each its own layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvSource {
+    Provider,
+    TomlEnv,
+    EnvUrl,
+    Dotenv(PathBuf),
+}
+
+impl EnvSource {
+    /// Stable machine label for the source kind (used for grouping/coloring).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            EnvSource::Provider => "provider",
+            EnvSource::TomlEnv => "toml",
+            EnvSource::EnvUrl => "env_url",
+            EnvSource::Dotenv(_) => "dotenv",
+        }
+    }
+
+    /// Human-readable label: the concrete file for dotenv, else the kind.
+    pub fn label(&self) -> String {
+        match self {
+            EnvSource::Provider => "provider".to_string(),
+            EnvSource::TomlEnv => ".coulson.toml".to_string(),
+            EnvSource::EnvUrl => "env_url".to_string(),
+            EnvSource::Dotenv(path) => path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+        }
+    }
+
+    /// Precedence rank (low → high). Used to order resolved entries so the
+    /// highest-priority overrides sort last.
+    fn rank(&self) -> u8 {
+        match self {
+            EnvSource::Provider => 0,
+            EnvSource::TomlEnv => 1,
+            EnvSource::EnvUrl => 2,
+            EnvSource::Dotenv(_) => 3,
+        }
+    }
+}
+
+impl serde::Serialize for EnvSource {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("EnvSource", 2)?;
+        st.serialize_field("kind", self.kind())?;
+        st.serialize_field("label", &self.label())?;
+        st.end()
+    }
+}
+
+/// One resolved environment variable with the source that won it. Produced by
+/// [`LayeredEnv::resolve`] and surfaced by the `coulson env` command.
+#[derive(Clone, serde::Serialize)]
+pub struct EnvEntry {
+    pub key: String,
+    pub value: String,
+    pub source: EnvSource,
+}
+
+/// An ordered stack of named environment layers, lowest precedence first. Both
+/// the merged environment and the per-variable provenance derive from the same
+/// fold, so they cannot disagree — no double application, no reverse lookup.
+///
+/// Precedence (low → high): `Provider < TomlEnv < EnvUrl < Dotenv(.coulsonrc)`.
+#[derive(Default)]
+pub(crate) struct LayeredEnv {
+    layers: Vec<(EnvSource, HashMap<String, String>)>,
+}
+
+impl LayeredEnv {
+    /// Add a layer. Empty layers are dropped (they cannot affect the result).
+    fn push(&mut self, source: EnvSource, vars: HashMap<String, String>) {
+        if !vars.is_empty() {
+            self.layers.push((source, vars));
+        }
+    }
+
+    /// The final merged environment; higher layers win.
+    fn merge(&self) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for (_src, vars) in &self.layers {
+            for (k, v) in vars {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        out
+    }
+
+    /// Every key with its winning value and the layer that set it, ordered by
+    /// source precedence (low → high) then key — so the highest-priority
+    /// overrides (`.coulsonrc`) sort last.
+    fn resolve(&self) -> Vec<EnvEntry> {
+        let mut map: std::collections::BTreeMap<String, (String, EnvSource)> =
+            std::collections::BTreeMap::new();
+        for (src, vars) in &self.layers {
+            for (k, v) in vars {
+                map.insert(k.clone(), (v.clone(), src.clone()));
+            }
+        }
+        // BTreeMap gives key order; stable-sort by rank preserves key order
+        // within each precedence tier.
+        let mut entries: Vec<EnvEntry> = map
+            .into_iter()
+            .map(|(key, (value, source))| EnvEntry { key, value, source })
+            .collect();
+        entries.sort_by_key(|e| e.source.rank());
+        entries
+    }
 }
 
 impl ProcessManager {
@@ -192,6 +313,18 @@ impl ProcessManager {
             types.push(c.process_type.clone());
         }
         types
+    }
+
+    /// The resolved environment (with provenance) the running web process was
+    /// started with. `None` if no process is tracked for this app, or the
+    /// tracked process has already exited (so callers report "not running"
+    /// instead of stale env for a dead handle).
+    pub fn process_env(&mut self, app_id: i64) -> Option<&[EnvEntry]> {
+        let group = self.processes.get_mut(&app_id)?;
+        if !is_alive(&mut group.primary.handle) {
+            return None;
+        }
+        Some(group.primary.resolved_env.as_slice())
     }
 
     /// Whether log broadcast is available (direct/compose backends).
@@ -270,12 +403,11 @@ impl ProcessManager {
             cleanup_listen_target(&removed.primary.listen_target);
         }
 
-        let (mut spec, sockets_dir, prov_name, companion_types, manifest) =
+        let (mut spec, sockets_dir, prov_name, companion_types, manifest, coulsonrc) =
             self.resolve_spec(app_id, name, root, kind)?;
 
-        if let Some(remote_env) = env_url_env.as_ref() {
-            merge_remote_env(&mut spec, remote_env.clone(), &manifest);
-        }
+        let resolved_env =
+            apply_and_capture_env(&mut spec, &manifest, env_url_env.as_ref(), &coulsonrc, root);
 
         let log_path = resolve_log_path(&manifest, root, &sockets_dir, name);
         if let Some(parent) = log_path.parent() {
@@ -372,6 +504,7 @@ impl ProcessManager {
             env_url_env.as_ref(),
             &log_path,
             log_tx,
+            &coulsonrc,
         );
 
         let app_idle_timeout = manifest_idle_timeout(&manifest);
@@ -386,6 +519,7 @@ impl ProcessManager {
                     last_active: now,
                     kind: kind.to_string(),
                     ready: true,
+                    resolved_env,
                 },
                 companions,
                 name: name.to_string(),
@@ -490,12 +624,11 @@ impl ProcessManager {
             None => {} // No existing process, proceed to spawn
         }
 
-        let (mut spec, sockets_dir, prov_name, companion_types, manifest) =
+        let (mut spec, sockets_dir, prov_name, companion_types, manifest, coulsonrc) =
             self.resolve_spec(app_id, name, root, kind)?;
 
-        if let Some(remote_env) = env_url_env.as_ref() {
-            merge_remote_env(&mut spec, remote_env.clone(), &manifest);
-        }
+        let resolved_env =
+            apply_and_capture_env(&mut spec, &manifest, env_url_env.as_ref(), &coulsonrc, root);
 
         let log_path = resolve_log_path(&manifest, root, &sockets_dir, name);
         if let Some(parent) = log_path.parent() {
@@ -576,6 +709,7 @@ impl ProcessManager {
             env_url_env.as_ref(),
             &log_path,
             log_tx,
+            &coulsonrc,
         );
 
         let app_idle_timeout = manifest_idle_timeout(&manifest);
@@ -590,6 +724,7 @@ impl ProcessManager {
                     last_active: now,
                     kind: kind.to_string(),
                     ready: false,
+                    resolved_env,
                 },
                 companions,
                 name: name.to_string(),
@@ -699,7 +834,9 @@ impl ProcessManager {
 
     /// Resolve a ProcessSpec from the provider registry.
     /// Returns the spec, sockets directory, provider name, companion types,
-    /// and the loaded `.coulson.toml` manifest (if any) for env re-application.
+    /// the loaded `.coulson.toml` manifest (if any) for env re-application, and
+    /// the parsed `.coulsonrc` snapshot so the caller can finalize the env from
+    /// the same single read (no re-parse, no TOCTOU).
     #[allow(clippy::type_complexity)]
     fn resolve_spec(
         &self,
@@ -713,6 +850,7 @@ impl ProcessManager {
         String,
         Vec<String>,
         Option<serde_json::Value>,
+        HashMap<String, String>,
     )> {
         let prov = self
             .registry
@@ -747,16 +885,16 @@ impl ProcessManager {
             root: root.to_path_buf(),
             kind: kind.to_string(),
             manifest,
-            env_overrides,
+            env_overrides: env_overrides.clone(),
             socket_dir: sockets_dir.clone(),
         };
 
-        let mut spec = prov.resolve(&managed_app)?;
-        // Do not pass COULSON_MANAGED_SERVICES to child processes
-        spec.env.remove("COULSON_MANAGED_SERVICES");
-
-        // Inject [env] from .coulson.toml (overrides provider defaults and .coulsonrc)
-        apply_manifest_env(&mut spec, &managed_app.manifest);
+        // Provider seeds `spec.env` with its defaults plus an early (low
+        // precedence) copy of `.coulsonrc`. The authoritative env layering
+        // (toml `[env]` < env_url < `.coulsonrc`) and the managed-services
+        // strip are applied later by `finalize_managed_env`, once env_url has
+        // been fetched.
+        let spec = prov.resolve(&managed_app)?;
 
         let _ = app_id; // used in caller for logging
         Ok((
@@ -765,7 +903,41 @@ impl ProcessManager {
             prov.display_name().to_string(),
             companion_types,
             managed_app.manifest,
+            env_overrides,
         ))
+    }
+
+    /// Resolve the environment a managed app's **web** process would receive,
+    /// annotating each variable with the source that won it — WITHOUT spawning.
+    ///
+    /// Reuses the real spawn path (`resolve_spec` + `finalize_managed_env`) so
+    /// the result matches what the child would actually get. Resolving the
+    /// provider spec has the same side effects as a real start (binary
+    /// detection, and a transient free-port probe for TCP providers). When
+    /// `fetch_remote` is true, `env_url` is fetched. Used by `coulson env`.
+    pub async fn inspect_env(
+        &self,
+        app_id: i64,
+        name: &str,
+        root: &Path,
+        kind: &str,
+        fetch_remote: bool,
+    ) -> anyhow::Result<Vec<EnvEntry>> {
+        let (spec, _sockets_dir, _prov_name, _companion_types, manifest, coulsonrc) =
+            self.resolve_spec(app_id, name, root, kind)?;
+
+        let env_url_env = if fetch_remote {
+            prefetch_env_url(root).await?
+        } else {
+            None
+        };
+
+        // Provenance falls straight out of the layered fold — no reverse lookup.
+        let layered =
+            build_layered_env(spec.env, &manifest, env_url_env.as_ref(), &coulsonrc, root);
+        let mut entries = layered.resolve();
+        entries.retain(|e| e.key != "COULSON_MANAGED_SERVICES");
+        Ok(entries)
     }
 
     /// Spawn a process using the current backend (direct or tmux).
@@ -790,10 +962,9 @@ impl ProcessManager {
     /// Spawn companion processes for a Procfile app.
     ///
     /// `manifest` and `remote_env` are passed through so companion specs receive
-    /// the same env treatment as the web process: `.coulson.toml [env]` and any
-    /// `env_url`-fetched values are merged on top of `.coulsonrc`, with local
-    /// manifest values winning over remote. Without this, workers/schedulers
-    /// would see only `.coulsonrc` and miss secrets like `DATABASE_URL`.
+    /// the same layered env as the web process (provider defaults < `.coulson.toml
+    /// [env]` < `env_url` < `.coulsonrc`). Without this, workers/schedulers would
+    /// see only `.coulsonrc` and miss secrets like `DATABASE_URL`.
     #[allow(clippy::too_many_arguments)]
     fn spawn_companions(
         &self,
@@ -807,18 +978,18 @@ impl ProcessManager {
         remote_env: Option<&HashMap<String, String>>,
         primary_log_path: &Path,
         log_tx: &broadcast::Sender<LogLine>,
+        coulsonrc: &HashMap<String, String>,
     ) -> Vec<CompanionProcess> {
         if companion_types.is_empty() || kind != "procfile" {
             return vec![];
         }
 
-        let env_overrides = crate::process::provider::load_coulsonrc(root);
         let managed_app = ManagedApp {
             name: name.to_string(),
             root: root.to_path_buf(),
             kind: kind.to_string(),
             manifest: manifest.clone(),
-            env_overrides,
+            env_overrides: coulsonrc.clone(),
             socket_dir: sockets_dir.to_path_buf(),
         };
 
@@ -838,13 +1009,9 @@ impl ProcessManager {
                             port: 0,
                         },
                     };
-                    // Apply the same env precedence as the web process:
-                    // .coulsonrc (from resolve_companion) → env_url → manifest [env]
-                    if let Some(remote) = remote_env {
-                        merge_remote_env(&mut spec, remote.clone(), manifest);
-                    } else {
-                        apply_manifest_env(&mut spec, manifest);
-                    }
+                    // Same env precedence as the web process (companion env is
+                    // applied but not stored for inspection this pass).
+                    let _ = apply_and_capture_env(&mut spec, manifest, remote_env, coulsonrc, root);
                     let log_path = primary_log_path
                         .parent()
                         .unwrap_or(sockets_dir)
@@ -1189,28 +1356,94 @@ pub(crate) fn load_coulson_toml_manifest(root: &Path) -> Option<serde_json::Valu
     }
 }
 
-/// Merge pre-fetched remote env vars into a spec, then re-apply `[env]` from
-/// the manifest so local config wins over remote values.
-fn merge_remote_env(
-    spec: &mut ProcessSpec,
-    remote_env: HashMap<String, String>,
-    manifest: &Option<serde_json::Value>,
-) {
-    spec.env.extend(remote_env);
-    apply_manifest_env(spec, manifest);
-}
-
-/// Apply `[env]` section from a `.coulson.toml` manifest into a ProcessSpec.
-fn apply_manifest_env(spec: &mut ProcessSpec, manifest: &Option<serde_json::Value>) {
-    if let Some(m) = manifest {
-        if let Some(env_obj) = m.get("env").and_then(|v| v.as_object()) {
-            for (k, v) in env_obj {
-                if let Some(val) = v.as_str() {
-                    spec.env.insert(k.clone(), val.to_string());
-                }
+/// Extract the `[env]` table of a `.coulson.toml` manifest as a map.
+fn manifest_env_map(manifest: &Option<serde_json::Value>) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if let Some(obj) = manifest
+        .as_ref()
+        .and_then(|m| m.get("env"))
+        .and_then(|v| v.as_object())
+    {
+        for (k, v) in obj {
+            if let Some(val) = v.as_str() {
+                out.insert(k.clone(), val.to_string());
             }
         }
     }
+    out
+}
+
+/// Build the [`LayeredEnv`] for a managed process from all sources, lowest
+/// precedence first. `provider_defaults` is the provider's framework env (PORT,
+/// PYTHONUNBUFFERED, …) with no user config mixed in.
+///
+/// Precedence: `provider defaults < .coulson.toml [env] < env_url < .coulsonrc`.
+/// `coulsonrc` is the snapshot parsed once at the start of the spawn, passed in
+/// so selection decisions and the final env agree on one file read.
+///
+/// `PORT` is special: it is the contract between the child (bind address) and
+/// the port Coulson proxies to (`listen_target`), which the provider chose via
+/// `resolve_port` (reading the manifest `port` / `.coulsonrc` / allocation).
+/// `resolve_port` never consults `.coulson.toml [env]` or `env_url`, so a `PORT`
+/// in those layers would desync the child's `$PORT` from `listen_target` and
+/// break routing. It is therefore stripped from those overlay layers; the
+/// provider-chosen value (echoed by `.coulsonrc` when set there) stands.
+fn build_layered_env(
+    provider_defaults: HashMap<String, String>,
+    manifest: &Option<serde_json::Value>,
+    env_url_env: Option<&HashMap<String, String>>,
+    coulsonrc: &HashMap<String, String>,
+    root: &Path,
+) -> LayeredEnv {
+    let mut env = LayeredEnv::default();
+    env.push(EnvSource::Provider, provider_defaults);
+
+    let mut toml = manifest_env_map(manifest);
+    if toml.remove("PORT").is_some() {
+        debug!("ignoring PORT in .coulson.toml [env]; PORT is managed by the provider");
+    }
+    env.push(EnvSource::TomlEnv, toml);
+
+    if let Some(remote) = env_url_env {
+        let mut remote = remote.clone();
+        if remote.remove("PORT").is_some() {
+            debug!("ignoring PORT from env_url; PORT is managed by the provider");
+        }
+        env.push(EnvSource::EnvUrl, remote);
+    }
+
+    env.push(
+        EnvSource::Dotenv(root.join(".coulsonrc")),
+        coulsonrc.clone(),
+    );
+    env
+}
+
+/// Apply the layered environment onto `spec.env` (merged, with the
+/// `COULSON_MANAGED_SERVICES` meta-var stripped) and return the resolved entries
+/// (with provenance, meta-var stripped) for storage / inspection. The meta-var
+/// selects companion processes and must never reach the child environment.
+fn apply_and_capture_env(
+    spec: &mut ProcessSpec,
+    manifest: &Option<serde_json::Value>,
+    env_url_env: Option<&HashMap<String, String>>,
+    coulsonrc: &HashMap<String, String>,
+    root: &Path,
+) -> Vec<EnvEntry> {
+    let layered = build_layered_env(
+        std::mem::take(&mut spec.env),
+        manifest,
+        env_url_env,
+        coulsonrc,
+        root,
+    );
+    let mut merged = layered.merge();
+    merged.remove("COULSON_MANAGED_SERVICES");
+    spec.env = merged;
+
+    let mut entries = layered.resolve();
+    entries.retain(|e| e.key != "COULSON_MANAGED_SERVICES");
+    entries
 }
 
 /// Parse environment variables from a response body.
@@ -1234,15 +1467,15 @@ fn parse_env_body(body: &str, content_type: &str) -> anyhow::Result<HashMap<Stri
             }
         }
     } else {
-        for line in body.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let line = line.strip_prefix("export ").unwrap_or(line);
-            if let Some((k, v)) = line.split_once('=') {
-                let v = v.trim_matches('"').trim_matches('\'');
-                env.insert(k.trim().to_string(), v.to_string());
+        // dotenv body: parse with dotenvy (same engine as `.coulsonrc`).
+        for item in dotenvy::from_read_iter(body.as_bytes()) {
+            match item {
+                Ok((k, v)) => {
+                    env.insert(k, v);
+                }
+                Err(e) => {
+                    debug!(error = %e, "skipping invalid dotenv line from env_url");
+                }
             }
         }
     }
@@ -2456,11 +2689,167 @@ mod tests {
             !script.contains(" sh -c "),
             "wrapper must not downgrade to sh -c, got:\n{script}"
         );
-        // env(1) prefix must still be present so rc-file overrides lose.
+        // env(1) prefix must still be present so the login shell's rc files
+        // (~/.zshrc etc.) cannot override the injected spec env. (This is the
+        // shell rc layer, unrelated to `.coulsonrc` precedence.)
         assert!(
             script.contains("env '"),
             "wrapper should re-apply env via env(1), got:\n{script}"
         );
+    }
+
+    #[test]
+    fn finalize_managed_env_precedence_and_strips_managed_services() {
+        use crate::process::provider::ListenTarget;
+        let dir =
+            std::env::temp_dir().join(format!("coulson-test-finalize-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".coulsonrc"),
+            "RC_WINS=from_rc\nCOULSON_MANAGED_SERVICES=worker\nONLY_RC=r\n",
+        )
+        .unwrap();
+
+        // `.coulson.toml [env]` carries some keys; `env_url` and `.coulsonrc`
+        // override subsets so each precedence edge is exercised.
+        let manifest = Some(serde_json::json!({
+            "env": {
+                "RC_WINS": "from_toml",
+                "URL_WINS": "from_toml",
+                "ONLY_TOML": "t",
+            }
+        }));
+        let mut url = HashMap::new();
+        url.insert("URL_WINS".to_string(), "from_url".to_string());
+        url.insert("ONLY_URL".to_string(), "u".to_string());
+
+        // Provider seed: defaults + early low-priority `.coulsonrc` copy.
+        let mut env = HashMap::new();
+        env.insert("ONLY_PROVIDER".to_string(), "p".to_string());
+        let mut spec = ProcessSpec {
+            command: PathBuf::new(),
+            args: vec![],
+            env,
+            working_dir: PathBuf::from("/tmp"),
+            listen_target: ListenTarget::Tcp {
+                host: String::new(),
+                port: 0,
+            },
+        };
+
+        let coulsonrc = crate::process::provider::load_coulsonrc(&dir);
+        let entries = apply_and_capture_env(&mut spec, &manifest, Some(&url), &coulsonrc, &dir);
+
+        // --- merged child env: precedence + survival + strip ---
+        // `.coulsonrc` (manual local override) beats both toml and env_url.
+        assert_eq!(spec.env.get("RC_WINS").map(String::as_str), Some("from_rc"));
+        // env_url beats `.coulson.toml [env]`.
+        assert_eq!(
+            spec.env.get("URL_WINS").map(String::as_str),
+            Some("from_url")
+        );
+        // Each unique key from every layer survives.
+        assert_eq!(spec.env.get("ONLY_TOML").map(String::as_str), Some("t"));
+        assert_eq!(spec.env.get("ONLY_URL").map(String::as_str), Some("u"));
+        assert_eq!(spec.env.get("ONLY_RC").map(String::as_str), Some("r"));
+        assert_eq!(spec.env.get("ONLY_PROVIDER").map(String::as_str), Some("p"));
+        // The managed-services meta-var must never leak into the child env.
+        assert!(!spec.env.contains_key("COULSON_MANAGED_SERVICES"));
+
+        // --- captured provenance: winning source per key, meta-var excluded ---
+        let kind = |k: &str| entries.iter().find(|e| e.key == k).map(|e| e.source.kind());
+        assert_eq!(kind("RC_WINS"), Some("dotenv"));
+        assert_eq!(kind("URL_WINS"), Some("env_url"));
+        assert_eq!(kind("ONLY_TOML"), Some("toml"));
+        assert_eq!(kind("ONLY_PROVIDER"), Some("provider"));
+        assert!(kind("COULSON_MANAGED_SERVICES").is_none());
+        // The dotenv source carries the concrete file.
+        let rc = entries.iter().find(|e| e.key == "RC_WINS").unwrap();
+        assert!(matches!(&rc.source, EnvSource::Dotenv(p) if p.ends_with(".coulsonrc")));
+        // Ordered by source precedence (low → high), key within tier.
+        let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "ONLY_PROVIDER",
+                "ONLY_TOML",
+                "ONLY_URL",
+                "URL_WINS",
+                "ONLY_RC",
+                "RC_WINS"
+            ]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn layered_env_merge_and_resolve() {
+        let mut env = LayeredEnv::default();
+        env.push(
+            EnvSource::Provider,
+            HashMap::from([("A".into(), "prov".into()), ("PORT".into(), "1".into())]),
+        );
+        env.push(
+            EnvSource::TomlEnv,
+            HashMap::from([("A".into(), "toml".into()), ("B".into(), "toml".into())]),
+        );
+        env.push(
+            EnvSource::EnvUrl,
+            HashMap::from([("B".into(), "url".into()), ("C".into(), "url".into())]),
+        );
+        env.push(
+            EnvSource::Dotenv(PathBuf::from("/app/.coulsonrc")),
+            HashMap::from([("A".into(), "rc".into()), ("D".into(), "rc".into())]),
+        );
+
+        // merge: higher layers win.
+        let merged = env.merge();
+        assert_eq!(merged.get("A").map(String::as_str), Some("rc")); // dotenv top
+        assert_eq!(merged.get("B").map(String::as_str), Some("url")); // env_url > toml
+        assert_eq!(merged.get("C").map(String::as_str), Some("url"));
+        assert_eq!(merged.get("D").map(String::as_str), Some("rc"));
+        assert_eq!(merged.get("PORT").map(String::as_str), Some("1")); // provider-only
+
+        // resolve: same fold, tagged with the winning source; sorted by key.
+        let resolved = env.resolve();
+        let kind = |k: &str| {
+            resolved
+                .iter()
+                .find(|e| e.key == k)
+                .map(|e| e.source.kind())
+        };
+        assert_eq!(kind("A"), Some("dotenv"));
+        assert_eq!(kind("B"), Some("env_url"));
+        assert_eq!(kind("C"), Some("env_url"));
+        assert_eq!(kind("PORT"), Some("provider"));
+        // Ordered by source precedence (low → high), key within tier:
+        // provider(PORT) < env_url(B,C) < dotenv(A,D).
+        let keys: Vec<&str> = resolved.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["PORT", "B", "C", "A", "D"]);
+    }
+
+    #[test]
+    fn port_is_reserved_from_toml_and_env_url() {
+        // PORT is the provider/listen_target contract; toml [env] and env_url
+        // must not be able to override it (resolve_port never reads them).
+        let provider = HashMap::from([("PORT".to_string(), "PROVIDER".to_string())]);
+        let manifest = Some(serde_json::json!({ "env": { "PORT": "9999", "X": "x" } }));
+        let url = HashMap::from([("PORT".to_string(), "8888".to_string())]);
+        let coulsonrc = HashMap::new();
+        let merged = build_layered_env(
+            provider,
+            &manifest,
+            Some(&url),
+            &coulsonrc,
+            Path::new("/app"),
+        )
+        .merge();
+        // PORT stays the provider's value; overlays' PORT is stripped.
+        assert_eq!(merged.get("PORT").map(String::as_str), Some("PROVIDER"));
+        // Non-PORT overlay keys still apply.
+        assert_eq!(merged.get("X").map(String::as_str), Some("x"));
     }
 
     #[test]

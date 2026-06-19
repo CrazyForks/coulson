@@ -200,7 +200,6 @@ impl ProcessProvider for DockerProvider {
 
         let mut env = std::collections::HashMap::new();
         env.insert("PORT".to_string(), port.to_string());
-        env.extend(app.env_overrides.clone());
 
         debug!(
             root = %root.display(),

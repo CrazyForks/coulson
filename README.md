@@ -195,7 +195,19 @@ PORT=4000
 DATABASE_URL=postgres://localhost/myapp_dev
 ```
 
-When `PORT` is set, the app always starts on that fixed port instead of auto-allocating one. Supports `KEY=VALUE` format with `#` comments, optional quoting, and `export` prefix.
+When `PORT` is set, the app always starts on that fixed port instead of auto-allocating one. Standard dotenv format (parsed by `dotenvy`): `KEY=VALUE`, `#` comments, quoting, `export` prefix, and `${VAR}` interpolation (escape a literal `$` as `\$` or single-quote it).
+
+`${VAR}` interpolation resolves against earlier same-file entries **and the daemon's own environment** — and a matching process-env var takes precedence over a same-file definition. In practice this only matters in development: run the daemon under a service manager (launchd/systemd) and it executes in a clean, minimal environment, so interpolation only sees infrastructure vars. When you start the daemon from an interactive shell, any variable you `export`ed there is visible to `${VAR}` and can shadow a same-file value.
+
+`.coulsonrc` is the **manual, local override** file and has the **highest precedence** — it wins over `.coulson.toml [env]` and `env_url`. The intended split: `.coulson.toml` holds programmatic/provisioned config (committed), while `.coulsonrc` holds hand-edited local overrides (typically gitignored).
+
+**Environment precedence** (lowest → highest):
+
+```
+provider defaults  <  .coulson.toml [env]  <  env_url  <  .coulsonrc
+```
+
+Rationale: committed `[env]` provides defaults/placeholders; `env_url` delivers authoritative remote secrets that override those defaults; `.coulsonrc` is the hand-edited local override that wins over everything (handy for pointing at a local DB while debugging). Below the provider defaults sit the user login-shell rc and the daemon's own environment.
 
 ### `.coulson.toml` — Per-App Configuration
 

@@ -54,6 +54,7 @@ percent-encoding.workspace = true
 procfile.workspace = true
 libc.workspace = true
 keyring.workspace = true
+dotenvy.workspace = true
 
 [features]
 builtin-quick-tunnel = []

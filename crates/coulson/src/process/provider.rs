@@ -238,43 +238,40 @@ pub fn resolve_port(env: &HashMap<String, String>) -> Result<u16> {
     }
 }
 
-/// Parse a `.coulsonrc` file from the app root directory.
+/// Load the `.coulsonrc` file from the app root directory.
 ///
-/// Format: simple `KEY=VALUE` lines (shell-style). Supports:
-/// - `#` comments and blank lines
-/// - Optional quoting (`KEY="value"` or `KEY='value'`)
-/// - `export KEY=VALUE` prefix
+/// `.coulsonrc` is the **manual, local override** file (typically gitignored),
+/// as opposed to `.coulson.toml` which holds programmatic/provisioned config.
+/// It therefore takes the highest precedence in env resolution (applied last).
+///
+/// Parsed with `dotenvy` (standard dotenv semantics): `KEY=VALUE`, `#`
+/// comments, `export` prefix, quoting, and `${VAR}` interpolation. Because
+/// interpolation is enabled, a literal `$` must be escaped (`\$`) or
+/// single-quoted. Parsing never mutates the daemon's own environment.
 pub fn load_coulsonrc(root: &Path) -> HashMap<String, String> {
-    let path = root.join(".coulsonrc");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return HashMap::new(),
-    };
-    debug!(path = %path.display(), "loaded .coulsonrc");
-    parse_dotenv(&content)
+    parse_dotenv_file(&root.join(".coulsonrc"))
 }
 
-fn parse_dotenv(content: &str) -> HashMap<String, String> {
+/// Parse a dotenv-format file into a map via `dotenvy`, without touching the
+/// process environment. A missing file yields an empty map.
+pub fn parse_dotenv_file(path: &Path) -> HashMap<String, String> {
     let mut env = HashMap::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    match dotenvy::from_path_iter(path) {
+        Ok(iter) => {
+            for item in iter {
+                match item {
+                    Ok((key, val)) => {
+                        env.insert(key, val);
+                    }
+                    Err(e) => {
+                        debug!(path = %path.display(), error = %e, "skipping invalid dotenv entry");
+                    }
+                }
+            }
+            debug!(path = %path.display(), count = env.len(), "loaded dotenv file");
         }
-        let line = line.strip_prefix("export ").unwrap_or(line).trim();
-        if let Some((key, val)) = line.split_once('=') {
-            let key = key.trim();
-            let val = val.trim();
-            // Strip matching quotes
-            let val = if val.len() >= 2
-                && ((val.starts_with('"') && val.ends_with('"'))
-                    || (val.starts_with('\'') && val.ends_with('\'')))
-            {
-                &val[1..val.len() - 1]
-            } else {
-                val
-            };
-            env.insert(key.to_string(), val.to_string());
+        Err(_) => {
+            // Missing file is the common case; nothing to load.
         }
     }
     env
@@ -380,5 +377,55 @@ mod tests {
             should_detect: false,
         });
         assert_eq!(reg.kinds(), vec!["a", "b"]);
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "coulson-test-dotenv-{label}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn parse_dotenv_file_missing_is_empty() {
+        let dir = temp_dir("missing");
+        let env = parse_dotenv_file(&dir.join(".coulsonrc"));
+        assert!(env.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_dotenv_file_basic_quotes_export_comments() {
+        let dir = temp_dir("basic");
+        std::fs::write(
+            dir.join(".coulsonrc"),
+            "# comment\nexport FOO=bar\nQUOTED=\"hello world\"\n\nEMPTYLINE=ok\n",
+        )
+        .unwrap();
+        let env = parse_dotenv_file(&dir.join(".coulsonrc"));
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(env.get("QUOTED").map(String::as_str), Some("hello world"));
+        assert_eq!(env.get("EMPTYLINE").map(String::as_str), Some("ok"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_dotenv_file_interpolates_within_file() {
+        // dotenvy substitutes ${VAR} referencing earlier keys in the same file.
+        // Use a coulson-prefixed name so an ambient env var of the same name
+        // can't override the same-file value (dotenvy consults the process env
+        // and lets it win — see README), which would make this test flaky.
+        let dir = temp_dir("interp");
+        std::fs::write(
+            dir.join(".coulsonrc"),
+            "COULSON_RC_TEST_BASE=https://x\nURL=${COULSON_RC_TEST_BASE}/api\n",
+        )
+        .unwrap();
+        let env = parse_dotenv_file(&dir.join(".coulsonrc"));
+        assert_eq!(env.get("URL").map(String::as_str), Some("https://x/api"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -58,12 +58,9 @@ impl ProcessProvider for AsgiProvider {
         // access logs hit the log file immediately instead of sitting in
         // Python's block buffer (which kicks in when stdout is a file).
         env.insert("PYTHONUNBUFFERED".into(), "1".into());
-        // uvicorn's Click CLI enables `auto_envvar_prefix="UVICORN"`, so any
-        // flag can be toggled via `UVICORN_<FLAG>` env vars the user sets in
-        // `.coulson.toml` / env_overrides (e.g. `UVICORN_RELOAD=true`,
-        // `UVICORN_LOG_LEVEL=debug`). No need to special-case individual
-        // flags here.
-        env.extend(app.env_overrides.clone());
+        // Provider returns framework defaults only. User env (incl. uvicorn's
+        // `UVICORN_*` flags via Click's `auto_envvar_prefix`) is layered on top
+        // by the orchestrator from `.coulson.toml [env]` / env_url / `.coulsonrc`.
 
         Ok(ProcessSpec {
             command: binary,
@@ -335,25 +332,41 @@ mod tests {
     #[test]
     fn uvicorn_env_overrides_are_preserved() {
         // uvicorn supports `UVICORN_*` env vars natively via Click's
-        // `auto_envvar_prefix`. Make sure the provider just passes them
-        // through without stripping or translating.
+        // `auto_envvar_prefix`. The provider returns defaults-only now — the
+        // user's `UVICORN_*` are layered on top by the orchestrator. Verify the
+        // provider does NOT bake them in, but they survive into the merged env.
         let root = temp_app_dir("uvicorn-env-passthrough");
         fs::write(root.join("app.py"), "").unwrap();
         place_venv_binary(&root, "uvicorn");
-        let app = make_managed_app(
-            &root,
-            vec![("UVICORN_RELOAD", "true"), ("UVICORN_LOG_LEVEL", "debug")],
-        );
+        let app = make_managed_app(&root, vec![]);
         let spec = AsgiProvider.resolve(&app).unwrap();
+        // Defaults-only: PYTHONUNBUFFERED yes, no user UVICORN_* mixed in.
         assert_eq!(
-            spec.env.get("UVICORN_RELOAD").map(String::as_str),
+            spec.env.get("PYTHONUNBUFFERED").map(String::as_str),
+            Some("1")
+        );
+        assert!(!spec.env.contains_key("UVICORN_RELOAD"));
+        assert!(!spec.args.contains(&"--reload".to_string()));
+
+        // Layered on top (via `.coulsonrc`), UVICORN_* reach the merged child env.
+        let coulsonrc = std::collections::HashMap::from([
+            ("UVICORN_RELOAD".to_string(), "true".to_string()),
+            ("UVICORN_LOG_LEVEL".to_string(), "debug".to_string()),
+        ]);
+        let merged =
+            crate::process::build_layered_env(spec.env, &None, None, &coulsonrc, &root).merge();
+        assert_eq!(
+            merged.get("UVICORN_RELOAD").map(String::as_str),
             Some("true")
         );
         assert_eq!(
-            spec.env.get("UVICORN_LOG_LEVEL").map(String::as_str),
+            merged.get("UVICORN_LOG_LEVEL").map(String::as_str),
             Some("debug")
         );
-        assert!(!spec.args.contains(&"--reload".to_string()));
+        assert_eq!(
+            merged.get("PYTHONUNBUFFERED").map(String::as_str),
+            Some("1")
+        );
         fs::remove_dir_all(&root).ok();
     }
 
