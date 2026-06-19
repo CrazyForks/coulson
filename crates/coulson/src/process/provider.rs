@@ -41,14 +41,17 @@ pub struct ManagedApp {
     pub manifest: Option<Value>,
     /// User-defined environment variable overrides (via control API).
     pub env_overrides: HashMap<String, String>,
-    /// Directory where Unix sockets should be placed.
+    /// Per-app runtime directory where this app's Unix socket and logs live
+    /// (`$RUNTIME/managed/{name}/`). Named `socket_dir` for historical reasons.
     pub socket_dir: PathBuf,
 }
 
 impl ManagedApp {
-    /// Convenience: build the standard socket path for this app.
+    /// Convenience: build the web process socket path for this app. The app
+    /// name is already encoded in `socket_dir` (the per-app directory), so the
+    /// file is named after the process type rather than repeating the name.
     pub fn socket_path(&self) -> PathBuf {
-        self.socket_dir.join(format!("{}.sock", self.name))
+        self.socket_dir.join("web.sock")
     }
 }
 
