@@ -421,7 +421,7 @@ impl AppRepository {
             Some((_id, 0)) => ScanUpsertResult::SkippedManual,
             Some((id, _)) => {
                 conn.execute(
-                    "UPDATE apps SET name = ?1, path_prefix = ?2, target_type = ?3, target_value = ?4, timeout_ms = ?5, updated_at = ?6, scan_managed = 1, scan_source = ?7, cors_enabled = ?8, force_https = ?9, basic_auth_user = ?10, basic_auth_pass = ?11, spa_rewrite = ?12, listen_port = ?13, fs_entry = ?14 WHERE id = ?15",
+                    "UPDATE apps SET name = ?1, path_prefix = ?2, target_type = ?3, target_value = ?4, timeout_ms = ?5, updated_at = ?6, scan_managed = 1, scan_source = ?7, cors_enabled = ?8, force_https = ?9, basic_auth_user = ?10, basic_auth_pass = ?11, spa_rewrite = ?12, listen_port = ?13, fs_entry = ?14, enabled = ?15 WHERE id = ?16",
                     params![
                         input.name,
                         path_prefix_db,
@@ -437,6 +437,7 @@ impl AppRepository {
                         if input.spa_rewrite { 1 } else { 0 },
                         input.listen_port.map(|v| v as i64),
                         fs_entry,
+                        if enabled { 1 } else { 0 },
                         id
                     ],
                 )?;
@@ -505,8 +506,8 @@ impl AppRepository {
             Some((_id, 0)) => ScanUpsertResult::SkippedManual,
             Some((id, _)) => {
                 conn.execute(
-                    "UPDATE apps SET name = ?1, kind = ?2, target_type = 'managed', target_value = ?3, updated_at = ?4, scan_managed = 1, scan_source = ?5, fs_entry = ?6 WHERE id = ?7",
-                    params![name, kind, app_root, now, source, fs_entry, id],
+                    "UPDATE apps SET name = ?1, kind = ?2, target_type = 'managed', target_value = ?3, updated_at = ?4, scan_managed = 1, scan_source = ?5, fs_entry = ?6, enabled = ?7 WHERE id = ?8",
+                    params![name, kind, app_root, now, source, fs_entry, if enabled { 1 } else { 0 }, id],
                 )?;
                 ScanUpsertResult::Updated
             }
@@ -562,8 +563,8 @@ impl AppRepository {
             Some((_id, 0)) => ScanUpsertResult::SkippedManual,
             Some((id, _)) => {
                 conn.execute(
-                    "UPDATE apps SET name = ?1, kind = 'static', target_type = 'static_dir', target_value = ?2, updated_at = ?3, scan_managed = 1, scan_source = ?4, fs_entry = ?5 WHERE id = ?6",
-                    params![name, static_root, now, source, fs_entry, id],
+                    "UPDATE apps SET name = ?1, kind = 'static', target_type = 'static_dir', target_value = ?2, updated_at = ?3, scan_managed = 1, scan_source = ?4, fs_entry = ?5, enabled = ?6 WHERE id = ?7",
+                    params![name, static_root, now, source, fs_entry, if enabled { 1 } else { 0 }, id],
                 )?;
                 ScanUpsertResult::Updated
             }
@@ -1352,6 +1353,31 @@ mod tests {
         let apps = repo.list_enabled().expect("list");
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].domain.0, "myapp.coulson.local");
+    }
+
+    #[test]
+    fn rescan_applies_enabled_change_to_managed_route() {
+        let repo = AppRepository {
+            conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            domain_suffix: "coulson.local".to_string(),
+            change_tx: None,
+        };
+        repo.init_schema().expect("schema");
+        let domain = DomainName("myapp.coulson.local".to_string());
+
+        // First scan: enabled
+        let (app, op) = repo
+            .upsert_scanned_managed("myapp", &domain, "/srv/myapp", "asgi", true, "fs", "entry")
+            .expect("first upsert");
+        assert!(matches!(op, ScanUpsertResult::Inserted));
+        assert!(app.enabled);
+
+        // Rescan with enabled = false must flip the stored state.
+        let (app, op) = repo
+            .upsert_scanned_managed("myapp", &domain, "/srv/myapp", "asgi", false, "fs", "entry")
+            .expect("second upsert");
+        assert!(matches!(op, ScanUpsertResult::Updated));
+        assert!(!app.enabled);
     }
 
     #[test]
