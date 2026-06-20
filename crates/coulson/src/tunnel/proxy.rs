@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -18,6 +19,55 @@ const RESPONSE_META_ORIGIN: &str = r#"{"src":"origin"}"#;
 /// only enforced when this header is present. Stripped before forwarding to
 /// the backend.
 pub const VIA_TUNNEL_HEADER: &str = "x-coulson-via-tunnel";
+
+/// Maximum request body buffered per tunnel request before returning 413.
+/// Tunnel bodies are fully buffered in memory before being forwarded to the
+/// local proxy, so this caps the peak memory a single (or many concurrent)
+/// uploads can consume and prevents an unbounded-upload OOM of the daemon.
+///
+/// Configured via `CoulsonConfig::max_tunnel_body_mb` (toml `max_tunnel_body_mb`
+/// / env `COULSON_MAX_TUNNEL_BODY_MB`) and pushed here once at daemon startup by
+/// [`set_max_tunnel_request_body`]. The default (100 MiB) applies until then, so
+/// paths that never call the setter (e.g. CLI quick tunnels) stay bounded.
+static MAX_TUNNEL_REQUEST_BODY: AtomicUsize = AtomicUsize::new(100 * 1024 * 1024);
+
+/// Set the per-request tunnel body cap (bytes). Called once at daemon startup
+/// from the loaded `CoulsonConfig`.
+pub fn set_max_tunnel_request_body(bytes: usize) {
+    MAX_TUNNEL_REQUEST_BODY.store(bytes, Ordering::Relaxed);
+}
+
+/// Read the full h2 request body into memory, enforcing the configured
+/// [`MAX_TUNNEL_REQUEST_BODY`] cap. Returns `Ok(None)` if the body exceeds it
+/// (the caller should respond `413 Payload Too Large`). Flow-control capacity is
+/// released as chunks arrive, matching the unbounded path's backpressure.
+async fn collect_body_capped(body: &mut RecvStream) -> anyhow::Result<Option<Bytes>> {
+    let max = MAX_TUNNEL_REQUEST_BODY.load(Ordering::Relaxed);
+    let mut body_bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        body.flow_control().release_capacity(chunk.len())?;
+        if body_bytes.len() + chunk.len() > max {
+            return Ok(None);
+        }
+        body_bytes.extend_from_slice(&chunk);
+    }
+    Ok(Some(Bytes::from(body_bytes)))
+}
+
+/// Send a `413 Payload Too Large` response on the h2 stream.
+fn send_payload_too_large(
+    send_response: &mut h2::server::SendResponse<Bytes>,
+) -> anyhow::Result<()> {
+    let response = http::Response::builder()
+        .status(413)
+        .header("content-type", "text/plain")
+        .body(())
+        .unwrap();
+    let mut send_stream = send_response.send_response(response, false)?;
+    send_stream.send_data(Bytes::from_static(b"Payload Too Large"), true)?;
+    Ok(())
+}
 
 /// Proxy an HTTP request to the local Pingora proxy with a fixed Host header.
 /// Used for per-app tunnels where the backend is not a TCP port (e.g. static_dir, managed).
@@ -83,14 +133,16 @@ pub async fn proxy_to_local_with_host(
         .unwrap_or_else(|| local_host.to_string());
     append_forwarding_headers(&mut local_req, &original_host, &parts.headers);
 
-    let mut body_bytes = Vec::new();
-    while let Some(chunk) = body.data().await {
-        let chunk = chunk?;
-        body.flow_control().release_capacity(chunk.len())?;
-        body_bytes.extend_from_slice(&chunk);
-    }
+    let body_bytes = match collect_body_capped(&mut body).await? {
+        Some(b) => b,
+        None => {
+            warn!(local_host = %local_host, max = MAX_TUNNEL_REQUEST_BODY.load(Ordering::Relaxed), "tunnel request body exceeds cap; returning 413");
+            send_payload_too_large(&mut send_response)?;
+            return Ok(());
+        }
+    };
 
-    let local_req = local_req.body(http_body_util::Full::new(Bytes::from(body_bytes)))?;
+    let local_req = local_req.body(http_body_util::Full::new(body_bytes))?;
 
     let client = Client::builder(TokioExecutor::new()).build_http();
     let local_resp = match client.request(local_req).await {
@@ -246,15 +298,17 @@ pub async fn proxy_by_host(
     // Let the backend know the original tunnel host and protocol
     append_forwarding_headers(&mut local_req, original_host, &parts.headers);
 
-    // Collect body
-    let mut body_bytes = Vec::new();
-    while let Some(chunk) = body.data().await {
-        let chunk = chunk?;
-        body.flow_control().release_capacity(chunk.len())?;
-        body_bytes.extend_from_slice(&chunk);
-    }
+    // Collect body (capped to bound peak memory)
+    let body_bytes = match collect_body_capped(&mut body).await? {
+        Some(b) => b,
+        None => {
+            warn!(local_host = %local_host, max = MAX_TUNNEL_REQUEST_BODY.load(Ordering::Relaxed), "tunnel request body exceeds cap; returning 413");
+            send_payload_too_large(&mut send_response)?;
+            return Ok(());
+        }
+    };
 
-    let local_req = local_req.body(http_body_util::Full::new(Bytes::from(body_bytes)))?;
+    let local_req = local_req.body(http_body_util::Full::new(body_bytes))?;
 
     let client = Client::builder(TokioExecutor::new()).build_http();
     let local_resp = match client.request(local_req).await {

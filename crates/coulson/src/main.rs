@@ -1052,6 +1052,11 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
         std::fs::remove_file(&cfg.control_socket)?;
     }
 
+    // Apply the configured tunnel request-body cap before any tunnel starts.
+    // Saturate rather than wrap/panic on an absurd config value (a wrap could
+    // silently shrink the cap instead of enlarging it).
+    tunnel::proxy::set_max_tunnel_request_body(cfg.max_tunnel_body_mb.saturating_mul(1024 * 1024));
+
     let state = build_state(&cfg)?;
 
     let startup_scan = scanner::sync_from_apps_root(&state)?;
