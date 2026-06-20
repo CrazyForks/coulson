@@ -78,6 +78,8 @@ pub struct CoulsonConfig {
     pub idle_timeout_secs: u64,
     pub link_dir: bool,
     pub inspect_max_requests: usize,
+    /// Max request body (MiB) buffered per tunnel request before returning 413.
+    pub max_tunnel_body_mb: usize,
     pub certs_dir: PathBuf,
     pub runtime_dir: PathBuf,
     pub process_backend: ProcessBackend,
@@ -118,6 +120,7 @@ impl Default for CoulsonConfig {
             idle_timeout_secs: 900,
             link_dir: false,
             inspect_max_requests: 200,
+            max_tunnel_body_mb: 100,
             certs_dir: xdg_config_home().join(format!("{DIR_NAME}/certs")),
             runtime_dir,
             process_backend: ProcessBackend::Auto,
@@ -164,6 +167,9 @@ impl CoulsonConfig {
         }
         if let Some(v) = file.inspect_max_requests {
             cfg.inspect_max_requests = v;
+        }
+        if let Some(v) = file.max_tunnel_body_mb {
+            cfg.max_tunnel_body_mb = v;
         }
         if let Some(ref v) = file.certs_dir {
             cfg.certs_dir = expand_tilde(v);
@@ -229,6 +235,12 @@ impl CoulsonConfig {
             cfg.inspect_max_requests = raw
                 .parse()
                 .with_context(|| format!("invalid COULSON_INSPECT_MAX_REQUESTS: {raw}"))?;
+        }
+
+        if let Ok(raw) = env::var("COULSON_MAX_TUNNEL_BODY_MB") {
+            cfg.max_tunnel_body_mb = raw
+                .parse()
+                .with_context(|| format!("invalid COULSON_MAX_TUNNEL_BODY_MB: {raw}"))?;
         }
 
         if let Ok(path) = env::var("COULSON_CERTS_DIR") {
@@ -345,6 +357,7 @@ struct ConfigFile {
     idle_timeout_secs: Option<u64>,
     link_dir: Option<bool>,
     inspect_max_requests: Option<usize>,
+    max_tunnel_body_mb: Option<usize>,
     certs_dir: Option<String>,
     runtime_dir: Option<String>,
     process_backend: Option<String>,
@@ -408,11 +421,41 @@ impl ConfigFile {
             idle_timeout_secs,
             link_dir,
             inspect_max_requests,
+            max_tunnel_body_mb,
             certs_dir,
             runtime_dir,
             process_backend,
             hook_timeout_secs,
             inspector
         );
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_overrides_max_tunnel_body_mb() {
+        let mut base = ConfigFile {
+            max_tunnel_body_mb: Some(100),
+            ..Default::default()
+        };
+        let dev = ConfigFile {
+            max_tunnel_body_mb: Some(512),
+            ..Default::default()
+        };
+        base.merge(dev);
+        assert_eq!(base.max_tunnel_body_mb, Some(512));
+    }
+
+    #[test]
+    fn merge_keeps_base_when_dev_field_unset() {
+        let mut base = ConfigFile {
+            max_tunnel_body_mb: Some(100),
+            ..Default::default()
+        };
+        base.merge(ConfigFile::default());
+        assert_eq!(base.max_tunnel_body_mb, Some(100));
     }
 }
