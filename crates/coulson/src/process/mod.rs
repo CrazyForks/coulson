@@ -126,6 +126,17 @@ pub enum StartStatus {
     Starting,
 }
 
+/// Outcome of [`ProcessManager::ensure_started`]. Distinguishes a real start
+/// result from the control signal that the caller must prefetch `env_url`
+/// off-lock and retry (see [`prepare_and_ensure_started`]).
+pub(crate) enum EnsureStarted {
+    Status(StartStatus),
+    /// About to cold-start, but `env_url` is configured and no prefetched env
+    /// was supplied (the process looked alive when the prefetch was skipped but
+    /// has since exited). The caller must prefetch and call again.
+    NeedsEnvUrl,
+}
+
 #[derive(serde::Serialize)]
 pub struct ProcessInfo {
     pub app_id: i64,
@@ -532,14 +543,14 @@ impl ProcessManager {
 
     /// Non-blocking variant: spawns the process if needed but does NOT wait for readiness.
     /// `env_url_env` should be pre-fetched outside the lock via `prefetch_env_url()`.
-    pub async fn ensure_started(
+    pub(crate) async fn ensure_started(
         &mut self,
         app_id: i64,
         name: &str,
         root: &Path,
         kind: &str,
         env_url_env: Option<HashMap<String, String>>,
-    ) -> anyhow::Result<StartStatus> {
+    ) -> anyhow::Result<EnsureStarted> {
         // Check existing process state in a limited scope to avoid borrow conflicts
         enum ExistingState {
             AlreadyReady(ListenTarget),
@@ -582,14 +593,14 @@ impl ProcessManager {
 
         match existing {
             Some(ExistingState::AlreadyReady(target)) => {
-                return Ok(StartStatus::Ready(target));
+                return Ok(EnsureStarted::Status(StartStatus::Ready(target)));
             }
             Some(ExistingState::JustBecameReady(target)) => {
                 self.fire_hook(HookEvent::AppReady, app_id, name, root, kind);
-                return Ok(StartStatus::Ready(target));
+                return Ok(EnsureStarted::Status(StartStatus::Ready(target)));
             }
             Some(ExistingState::StillStarting) => {
-                return Ok(StartStatus::Starting);
+                return Ok(EnsureStarted::Status(StartStatus::Starting));
             }
             Some(ExistingState::TimedOut) => {
                 let removed = self.processes.remove(&app_id).unwrap();
@@ -622,6 +633,16 @@ impl ProcessManager {
                 cleanup_listen_target(&removed.primary.listen_target);
             }
             None => {} // No existing process, proceed to spawn
+        }
+
+        // We are about to cold-start. If `env_url` is configured but we have no
+        // prefetched env (the process looked alive when the prefetch was skipped
+        // but has since exited), bail to the caller to prefetch off-lock and
+        // retry — otherwise the new child would miss the remote env layer. This
+        // closes the exit-race window the held lock cannot: the lock guards the
+        // `processes` map, not the OS process's liveness.
+        if env_url_env.is_none() && env_url_configured(root) {
+            return Ok(EnsureStarted::NeedsEnvUrl);
         }
 
         let (mut spec, app_dir, prov_name, companion_types, manifest, coulsonrc) =
@@ -732,7 +753,7 @@ impl ProcessManager {
             },
         );
 
-        Ok(StartStatus::Starting)
+        Ok(EnsureStarted::Status(StartStatus::Starting))
     }
 
     /// Kill a specific managed process. Returns true if it was found and killed.
@@ -1606,11 +1627,32 @@ pub async fn prefetch_env_url(root: &Path) -> anyhow::Result<Option<HashMap<Stri
     Ok(Some(env))
 }
 
+/// True if the app's `.coulson.toml` configures an `env_url`. Cheap manifest
+/// read used to decide whether a cold-start without prefetched env must fetch.
+fn env_url_configured(root: &Path) -> bool {
+    load_coulson_toml_manifest(root)
+        .and_then(|m| {
+            m.get("env_url")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+        })
+        .unwrap_or(false)
+}
+
 /// Encapsulates the lock-drop-prefetch-relock dance for starting a managed process.
 ///
-/// If the process is already alive, skips the env_url prefetch entirely.
-/// Otherwise, drops the PM lock, fetches env_url, re-acquires the lock,
+/// If the process is already alive, skips the `env_url` prefetch entirely (hot
+/// path). Otherwise drops the PM lock, fetches `env_url`, re-acquires the lock,
 /// and calls `ensure_started`.
+///
+/// The held lock guards the `processes` map but cannot keep the OS process
+/// alive, so a process that looked alive when the prefetch was skipped can still
+/// exit before `ensure_started` spawns. `ensure_started` therefore signals
+/// [`EnsureStarted::NeedsEnvUrl`] instead of cold-starting with `None` when an
+/// `env_url` is configured; we then prefetch off-lock and retry. This fully
+/// closes the exit race (not just narrows it). Converges in at most two
+/// iterations: the signal path leaves no live process, so the retry takes the
+/// prefetch branch and `ensure_started` spawns with the remote env.
 pub async fn prepare_and_ensure_started(
     pm: &ProcessManagerHandle,
     app_id: i64,
@@ -1618,19 +1660,29 @@ pub async fn prepare_and_ensure_started(
     root: &Path,
     kind: &str,
 ) -> anyhow::Result<StartStatus> {
-    let env_url_env = {
-        let mut guard = pm.lock().await;
-        if guard.has_live_process(app_id) {
-            None
-        } else {
-            drop(guard);
+    loop {
+        let need_prefetch = {
+            let mut guard = pm.lock().await;
+            !guard.has_live_process(app_id)
+        };
+        let env_url_env = if need_prefetch {
             prefetch_env_url(root).await?
+        } else {
+            None
+        };
+        let mut guard = pm.lock().await;
+        match guard
+            .ensure_started(app_id, name, root, kind, env_url_env)
+            .await?
+        {
+            EnsureStarted::Status(status) => return Ok(status),
+            EnsureStarted::NeedsEnvUrl => {
+                // Process exited after the prefetch was skipped; loop to prefetch
+                // env_url off-lock before the cold-start.
+                drop(guard);
+            }
         }
-    };
-    let mut guard = pm.lock().await;
-    guard
-        .ensure_started(app_id, name, root, kind, env_url_env)
-        .await
+    }
 }
 
 /// Build the full shell command string from a ProcessSpec.
