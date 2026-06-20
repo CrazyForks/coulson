@@ -164,6 +164,11 @@
   // -- SSE --
   {% if app.inspect_enabled %}
   var evtSource = new EventSource(basePath + '/requests/stream');
+  var esc = function(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  };
   evtSource.onmessage = function(e) {
     var d = JSON.parse(e.data);
     var row = document.createElement('tr');
@@ -195,7 +200,7 @@
     }
 
     var ts = formatLocalTime(d.timestamp);
-    var qs = d.query_string ? '<span class="text-zinc-400">?' + d.query_string + '</span>' : '';
+    var qs = d.query_string ? '<span class="text-zinc-400">?' + esc(d.query_string) + '</span>' : '';
     var statusHtml = d.status_code
       ? '<span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-semibold ' + sc + '">' + d.status_code + '</span>'
       : '<span class="text-xs text-zinc-400">\u2014</span>';
@@ -203,8 +208,8 @@
 
     row.innerHTML =
       '<td class="px-4 py-2.5 text-xs text-zinc-500 dark:text-zinc-400 whitespace-nowrap font-mono"><time data-ts="' + d.timestamp + '">' + ts + '</time></td>' +
-      '<td class="px-4 py-2.5"><span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-semibold ' + mc + '">' + d.method + '</span></td>' +
-      '<td class="px-4 py-2.5 font-mono text-sm max-w-xs truncate">' + d.path + qs + '</td>' +
+      '<td class="px-4 py-2.5"><span class="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-semibold ' + mc + '">' + esc(d.method) + '</span></td>' +
+      '<td class="px-4 py-2.5 font-mono text-sm max-w-xs truncate">' + esc(d.path) + qs + '</td>' +
       '<td class="px-4 py-2.5">' + statusHtml + '</td>' +
       '<td class="px-4 py-2.5 text-right text-xs text-zinc-500 dark:text-zinc-400 whitespace-nowrap">' + duration + '</td>';
 
