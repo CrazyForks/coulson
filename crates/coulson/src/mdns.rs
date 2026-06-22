@@ -6,7 +6,7 @@ use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::SharedState;
 
@@ -90,7 +90,7 @@ pub async fn run_mdns_responder(state: SharedState) -> anyhow::Result<()> {
                         .await
                         .unwrap_or(false);
                     if ok {
-                        info!("mdns health check ok for {health_domain}");
+                        debug!("mdns health check ok for {health_domain}");
                     } else {
                         warn!("mdns health check failed for {health_domain}, triggering re-registration");
                         let _ = state.network_change_tx.send(());
