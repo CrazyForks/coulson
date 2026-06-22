@@ -1,8 +1,10 @@
 # Coulson
 
-A macOS local development gateway. Say goodbye to `localhost:port` — each project gets its own domain, ready to use on first visit with automatic startup.
+Coulson is a local development gateway that gives every project its own domain — `myapp.coulson.local` instead of `localhost:3000`. Apps start automatically on the first request and stop when idle, so you never hunt for a free port or kill a stray process again.
 
-One solution covering local, LAN, and public access — `.local` domains let phones and nearby devices connect directly, and a single command generates a public URL via Tunnel. Works great with AI IDEs like Cursor and Windsurf.
+It's built for how people actually develop now: many projects running at once, and AI assistants driving them. When you tell Cursor, Claude Code, or Windsurf "restart myapp", it runs one deterministic command — `coulson restart myapp` — with no port to guess, no process to find, and no orphaned file watchers or bundlers left hogging ports. One tool covers local, LAN, and public access: `.local` domains let phones and nearby devices connect directly, and a single command exposes a public URL over Cloudflare Tunnel.
+
+It replaces the `localhost:port` mess — and the stack of `puma-dev` / `pow` / `ngrok` / `Caddy` configs you'd otherwise stitch together — with one zero-config gateway for Python (ASGI), Node.js, Docker Compose, and static sites.
 
 ## Why Not Just `localhost:port`?
 
@@ -34,7 +36,48 @@ Coulson gives every project its own domain (`myapp.coulson.local`). Cookies, sto
 
 ![Request Inspector](https://coulson.hola.ac/assets/screenshot-inspector.png)
 
+## Try It in 30 Seconds
+
+Point Coulson at a project and open its domain — that's the whole loop:
+
+```bash
+ln -s ~/Projects/myapp ~/.coulson/myapp   # any Python ASGI / Node.js / Docker Compose / static project
+open http://myapp.coulson.local           # first request auto-starts it; idle apps stop themselves
+```
+
+No port to pick, no server to start by hand, no config file required. Tell your AI assistant "restart myapp" and it runs `coulson restart myapp`.
+
+## How It Compares
+
+Coulson folds the jobs of a local reverse proxy, a process manager, and a tunnel into one zero-config tool. The closest alternatives each solve only part of it:
+
+| | Coulson | puma-dev / pow | Laravel Valet | ngrok / cloudflared |
+|---|---|---|---|---|
+| Per-project local domain | ✅ | ✅ | ✅ | — |
+| Languages | Python, Node.js, Docker, static | Rack / Ruby only | PHP only | any (proxy only) |
+| Auto start on request | ✅ | ✅ | always-on | — |
+| Idle stop | ✅ | ✅ | — | — |
+| LAN / mobile access (mDNS) | ✅ | — | — | — |
+| Public URL (Tunnel) | ✅ built-in | — | — | ✅ (this is all it does) |
+| AI-assistant control | ✅ `coulson restart <app>` | — | — | — |
+
+It's the only one of these built around language-agnostic apps and first-class AI-assistant control.
+
+## How It Works
+
+Coulson runs as a single unprivileged daemon that combines a reverse proxy, a process supervisor, and a name-resolution layer. The design goal: nothing surprising and nothing privileged happens at request time.
+
+**Routing.** Each entry in your apps directory (`~/.coulson/<name>`, a directory or symlink) becomes the host `<name>.<suffix>` (default suffix `coulson.local`). Coulson advertises `.local` names over mDNS so your OS resolves them with no `/etc/hosts` edits; by default they point at loopback. The proxy matches a request's `Host` header to an app.
+
+**Lazy lifecycle.** Apps aren't running until needed. On the first request, Coulson detects the app's type (Python ASGI, Node.js, Docker Compose, Procfile, or static), cold-starts it, and holds the request behind a loading page until the process is ready — then proxies through. After `idle_timeout` (default 15 minutes) with no traffic, the process is stopped; the next request starts it again. This is why "restart myapp" is simply "stop the process" — the next visit recreates it.
+
+**No root at request time.** TLS uses a CA generated locally on your machine, not a public one. Privileged ports (80/443) are never bound by the daemon itself — on macOS a tiny socket-activated forwarder holds them, on Linux a capability or sysctl lets the daemon bind them directly. The proxy, your apps, and tunnels all run as your normal user. See [Security & Permissions](#security--permissions) for the full model.
+
+Built on [Pingora](https://github.com/cloudflare/pingora), Cloudflare's production Rust proxy framework.
+
 ## Install
+
+> **Platform:** Coulson's core — proxy, process management, routing, mDNS, and Tunnel — is cross-platform Rust. The packaged app and one-click setup below ship for macOS today; on other platforms, run the `coulson` daemon directly.
 
 Download [Coulson.app](https://github.com/ratazzi/coulson/releases) and open it. The daemon starts automatically.
 
@@ -55,6 +98,27 @@ Take over ports 80/443 so you can omit port numbers when accessing:
 ```bash
 sudo coulson trust --forward
 ```
+
+## Security & Permissions
+
+The privileged and security-sensitive parts are deliberately small, auditable, and reversible.
+
+**TLS certificates — generated locally, never uploaded.** Coulson generates its own CA and per-domain certificates on your machine, with no external CA and no network call. The CA private key is written under `~/.config/coulson/certs` with owner-only permissions and never leaves your machine. `sudo coulson trust` adds only the *public* CA certificate to the system keychain so the browser trusts `https://*.coulson.local`.
+
+**Port 80/443 takeover — a separate, forward-only process; no root at runtime.** `coulson trust --forward` does *not* make the daemon run as root or bind privileged ports. It installs a launchd daemon that holds 80/443 via **socket activation**: launchd binds the ports and hands the already-open sockets to a tiny `coulson forward` process that does nothing but forward bytes to Coulson's high ports (`18080`/`18443`). The forwarder never calls `bind()` on a privileged port and holds no privileges while running. The main daemon stays an unprivileged user process.
+
+**Where `sudo` is actually required — one-time setup only.** Exactly two commands need root, both one-time:
+- `sudo coulson trust` — add the CA to the system keychain
+- `sudo coulson trust --forward` — install the launchd forwarding daemon (writes `/Library/LaunchDaemons/com.coulson.forward.plist`)
+
+Every other command — `serve`, `add`, `start`, `restart`, `tunnel`, … — runs as your normal user. If a command needs root and you forgot `sudo`, it exits with a clear message naming the exact command to run; it never silently escalates.
+
+**Uninstall / cleanup.**
+- Forwarding daemon: `sudo launchctl bootout system /Library/LaunchDaemons/com.coulson.forward.plist && sudo rm /Library/LaunchDaemons/com.coulson.forward.plist`
+- Trusted CA: remove the "Coulson" certificate in Keychain Access.
+- State and config live under `~/.local/state/coulson` (db, control socket) and `~/.config/coulson` (certs, `config.toml`) — delete to reset.
+
+> **Platform note:** the one-command privileged setup above (launchd, keychain) is macOS-specific. On Linux you don't need the separate forwarder at all — point Coulson directly at the privileged ports (`COULSON_LISTEN_HTTP=0.0.0.0:80`, `COULSON_LISTEN_HTTPS=0.0.0.0:443`) and let the unprivileged daemon bind them via any standard mechanism: `AmbientCapabilities=CAP_NET_BIND_SERVICE` in the systemd unit, `setcap 'cap_net_bind_service=+ep' coulson`, or the `net.ipv4.ip_unprivileged_port_start=0` sysctl. This is configuration, not a missing feature — the macOS forwarder exists only because launchd is macOS's clean way to hand an unprivileged process a pre-bound socket. A turnkey `coulson trust --forward` equivalent for Linux (a generated systemd unit) isn't shipped yet; the steps above are manual. See the Platform note under [Install](#install).
 
 ## Quick Start
 
@@ -303,6 +367,105 @@ All projects share one Tunnel connection — no per-app setup needed, new projec
 Supports TOML config file (`~/.config/coulson/config.toml`) and environment variables. See [example](config.example.toml).
 
 Priority: defaults < config file < environment variables.
+
+## Command Reference
+
+`coulson` has no global flags — all configuration comes from environment variables and `~/.config/coulson/config.toml` (see [Configuration](#configuration)). Run `coulson <command> --help` for the authoritative flag list. Most app commands take an optional `[name]` (app name or domain); omit it to match the current working directory.
+
+**Apps**
+
+| Command | What it does |
+|---|---|
+| `coulson serve` | Start the daemon (proxy + control + scanner) |
+| `coulson scan` | One-shot scan of the apps directory |
+| `coulson ls [--managed\|--manual] [--domain <d>]` | List registered apps |
+| `coulson add [name] [target] [--link <path>] [--tunnel]` | Add an app (alias: `recruit`) |
+| `coulson rm [name]` | Remove an app (alias: `dismiss`; prompts to confirm) |
+| `coulson warnings` | Show scan warnings |
+| `coulson doctor [--pf]` | Check system health |
+
+**Process**
+
+| Command | What it does |
+|---|---|
+| `coulson start\|stop\|restart [name]` | Start / stop / restart a managed process |
+| `coulson ps` | Show running managed processes |
+| `coulson logs [name] [-f] [-n <lines>] [--path]` | Show logs (`--path` prints the log file path) |
+| `coulson env [name] [--bare\|--json] [--preview] [--no-remote]` | Show the resolved environment a process would receive |
+| `coulson open [name]` | Open the app URL in the default browser |
+| `coulson attach [name]` | Attach to the process's tmux session |
+
+**Sharing & TLS**
+
+| Command | What it does |
+|---|---|
+| `coulson trust [--forward] [--force]` | Trust the local CA, optionally install forwarding — needs `sudo` |
+| `coulson share <name> [--expires <dur>]` | Generate a sharing URL (default expiry `24h`) |
+| `coulson unshare <name>` | Disable share auth for an app |
+
+**Tunnel**
+
+| Command | What it does |
+|---|---|
+| `coulson tunnel status` | Show tunnel status |
+| `coulson tunnel start [name] [--mode quick\|global\|named]` | Activate a tunnel for an app |
+| `coulson tunnel stop [name]` | Deactivate a tunnel (keeps config) |
+| `coulson tunnel setup --domain <d> [--tunnel-name <n>] [--api-token <t>] [--account-id <id>]` | Create a global named tunnel via the Cloudflare API |
+| `coulson tunnel teardown [--api-token <t>]` | Delete the global named tunnel |
+| `coulson tunnel connect [--token <t>] [--domain <d>]` / `disconnect` | Connect / disconnect the global named tunnel |
+| `coulson tunnel app-setup <name> --domain <d> [--token <t>]` / `app-teardown <name>` | Per-app named tunnel |
+| `coulson tunnel login <token>` / `logout` | Save / remove a Cloudflare API token in the keychain |
+
+## Behavior & Failure Modes
+
+Written for scripting and AI agents that need predictable commands and failure paths.
+
+**Exit codes.** Every CLI command returns `0` on success and `1` on any failure — there are no distinct codes per error type. The cause is always printed to **stderr** (`Error: …`); parse stderr, not the exit code, to distinguish failures.
+
+**Non-interactive / CI / agents.** Only one command prompts: `coulson rm` asks `Remove <app>? [y/N]`. With no TTY (piped/CI/agent), the read hits EOF, defaults to **No**, prints `Cancelled.`, and exits `0` — it never hangs and never deletes. There is no `--yes` bypass, so **`rm` is effectively a safe no-op in non-interactive contexts.** Every other command is non-interactive and never requires a TTY.
+
+**First-request auto-start (HTTP).** A cold app returns predictable statuses:
+- Browser (`Accept: text/html`): **503** loading page with `Retry-After: 1` while starting.
+- Non-browser client: polls up to **30s**, then **504** "Gateway Timeout" if still not ready.
+- App can't be resolved/started, or its process exited: **502** "Bad Gateway".
+
+The underlying error (e.g. `uvicorn not found`) is written to the app's log file, not the HTTP body — read it with `coulson logs <app>`.
+
+**Runtime detection — and what makes it fail.**
+
+| Runtime | Detected when | Start fails if |
+|---|---|---|
+| Python ASGI | `app.py`/`main.py` + `pyproject.toml`/`requirements.txt` | `uvicorn` not in `.venv/bin`, `venv/bin`, or `PATH` |
+| Node.js | `package.json` with a `dev` or `start` script | package manager / `node` not in `node_modules/.bin` or `PATH` |
+| Docker Compose | a `docker-compose.yml`/`compose.yml` (a bare `Dockerfile` is **not** enough) | `docker` not in `PATH`, or `docker compose up` exits non-zero |
+| Procfile | a `web:` line in `Procfile` | no `web:` process type |
+| Rack (`config.ru`) | detected, but **not yet implemented** | always — every start reports `Rack provider is not yet implemented` |
+
+**Gotcha — silent static fallback.** If *nothing* above is detected for a directory, Coulson does **not** error; it serves the directory as static files. A misconfigured app (e.g. a missing `pyproject.toml`) can therefore quietly become a static site instead of failing. Run `coulson warnings` and `coulson doctor` to catch this.
+
+**No persistent failure state, no backoff.** Coulson never records an app as permanently "failed." A start failure surfaces per attempt (HTTP 502/504, or `coulson start` exit 1); the next request retries a fresh cold start, and a process that crashes after becoming ready is auto-restarted on the next request. Startup readiness timeout is **120s for Docker, 30s otherwise**.
+
+## Name Resolution & Troubleshooting
+
+**How `.local` names resolve.** Coulson advertises each app's `.local` domain over mDNS (plus the bare suffix and `dashboard.<suffix>`). By default a name resolves to **loopback** (`127.0.0.1`), so it works on the machine running Coulson with zero configuration.
+
+**LAN / mobile access is per-app and opt-in.** To let phones and other devices reach an app, enable LAN access for that app — it then advertises your real LAN IP instead of loopback. This also requires the proxy to listen on `0.0.0.0` (the default), not loopback; `coulson doctor` reports which. Boundaries worth knowing:
+
+- **Only `.local` names are advertised.** If you set a custom non-`.local` `COULSON_DOMAIN_SUFFIX`, Coulson does no mDNS — you must provide DNS or `/etc/hosts` entries yourself.
+- **VPNs and virtual interfaces are skipped.** LAN-IP detection ignores tunnel/VPN/container interfaces (`utun`, `tun`, `ppp`, `wg`, `docker`, `bridge`, …), so an active VPN can leave LAN access without a usable address.
+- **The network must pass mDNS multicast.** Many corporate/guest WiFi networks block multicast; other devices then can't resolve `.local` even though the local machine still can.
+- **The other device must speak mDNS.** macOS/iOS do natively; Linux needs `avahi-daemon` + `nss-mdns`; Windows needs Bonjour.
+
+**First stop for any problem: `coulson doctor`.** It checks, in order: apps directory, database, daemon reachability, proxy port, `.local` resolution (mDNS health), Cloudflare token, scan warnings, LAN-access listen address, and TLS certificates (add `--pf` to also verify port forwarding). Each line is a pass/fail with the specific path or value, so a red line points straight at the broken piece.
+
+| Symptom | Likely cause / fix |
+|---|---|
+| `.local` name doesn't resolve at all | mDNS unhealthy — run `coulson doctor`; confirm the daemon is running (`coulson serve`) |
+| Resolves on your machine but not on a phone | per-app LAN access not enabled, on a VPN, or WiFi blocks multicast |
+| Browser shows a TLS warning | CA not trusted — run `sudo coulson trust` |
+| App serves files instead of running | nothing was detected — see the static-fallback gotcha above; run `coulson warnings` |
+| 502 / 503 / 504 on first visit | see [Behavior & Failure Modes](#behavior--failure-modes); read `coulson logs <app>` |
+| Port 80/443 access fails | forwarding not installed — `sudo coulson trust --forward` (macOS); on Linux see the Platform note under Install |
 
 ## Built With
 
