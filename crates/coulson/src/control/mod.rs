@@ -708,7 +708,7 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
 
             let tunnel_name = params
                 .tunnel_name
-                .unwrap_or_else(|| format!("coulson-{}", &params.domain));
+                .unwrap_or_else(|| format!("coulson-{}", params.domain));
 
             let (credentials, tunnel_id) =
                 match tunnel::named::create_named_tunnel(&api_token, &account_id, &tunnel_name)

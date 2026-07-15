@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coulson v0.4.1 Release Notes</title>
+<style>
+  :root {
+    --fg: #1e293b;
+    --fg-secondary: #64748b;
+    --bg: #ffffff;
+    --border: #e2e8f0;
+    --accent: #0284c7;
+    --tag-bg: #f0f9ff;
+    --tag-fg: #0369a1;
+    --code-bg: #f8fafc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e2e8f0;
+      --fg-secondary: #94a3b8;
+      --bg: #0f172a;
+      --border: #1e293b;
+      --accent: #38bdf8;
+      --tag-bg: #0c4a6e;
+      --tag-fg: #7dd3fc;
+      --code-bg: #1e293b;
+    }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--fg);
+    background: var(--bg);
+    padding: 16px;
+    -webkit-font-smoothing: antialiased;
+  }
+  h2 {
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .meta {
+    font-size: 12px;
+    color: var(--fg-secondary);
+    margin-bottom: 12px;
+  }
+  .section { margin-bottom: 14px; }
+  .section-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-secondary);
+    margin-bottom: 6px;
+  }
+  ul {
+    list-style: none;
+    padding: 0;
+  }
+  li {
+    position: relative;
+    padding-left: 16px;
+    margin-bottom: 4px;
+    font-size: 13px;
+  }
+  li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 7px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+  .tag {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 500;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--tag-bg);
+    color: var(--tag-fg);
+    margin-left: 4px;
+    vertical-align: middle;
+  }
+  code {
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 12px;
+    background: var(--code-bg);
+    padding: 1px 4px;
+    border-radius: 3px;
+  }
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 14px 0;
+  }
+  a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h2>Coulson 0.4.1</h2>
+<div class="meta">July 15, 2026</div>
+
+<div class="section">
+  <div class="section-title">New</div>
+  <ul>
+    <li>Embedded request inspector at <code>/_coulson/</code> with loopback-pinned replay <span class="tag">inspector</span></li>
+    <li>Live log tail in dashboard — SSE streaming with per-process tabs and ANSI color rendering <span class="tag">dashboard</span></li>
+    <li>Layered env model — <code>.coulsonrc</code> takes highest precedence over <code>[env]</code> and <code>env_url</code> <span class="tag">process</span></li>
+    <li>CLI <code>coulson env</code> to inspect a managed app's resolved environment <span class="tag">cli</span></li>
+    <li>Basic auth support in <code>env_url</code> <span class="tag">process</span></li>
+    <li>Custom <code>log_path</code> and per-app <code>idle_timeout_secs</code> in <code>.coulson.toml</code> <span class="tag">process</span></li>
+    <li>CLI <code>coulson logs --path</code> to print the log file path <span class="tag">cli</span></li>
+    <li>CLI <code>--version</code> flag <span class="tag">cli</span></li>
+    <li><code>app_add</code> hook now fires for scanner-discovered apps <span class="tag">hooks</span></li>
+    <li>Configurable per-request body size cap on tunnel ingress <span class="tag">tunnel</span></li>
+    <li>Linux aarch64 build in nightly CI <span class="tag">ci</span></li>
+  </ul>
+</div>
+
+<div class="section">
+  <div class="section-title">Fixed</div>
+  <ul>
+    <li><code>env_url</code> cold-start race on proxy restart <span class="tag">process</span></li>
+    <li><code>COULSON_MANAGED_SERVICES</code> honored when set via <code>.coulson.toml</code> <code>[env]</code> <span class="tag">process</span></li>
+    <li>Inner shell startup files locked down so env injection sticks (bash, zsh, fish) <span class="tag">process</span></li>
+    <li><code>enabled</code> changes now applied to scan-owned routes on rescan <span class="tag">scanner</span></li>
+    <li>Escape request fields in inspector SSE rows <span class="tag">dashboard</span></li>
+    <li><code>logs</code> command queries daemon for runtime dir to avoid XDG drift <span class="tag">cli</span></li>
+    <li>mDNS health check ok log lowered from info to debug <span class="tag">mdns</span></li>
+  </ul>
+</div>
+
+<div class="section">
+  <div class="section-title">Changed</div>
+  <ul>
+    <li>Per-app runtime dir with process-type log/socket names <span class="tag">process</span></li>
+    <li>Dropped <code>ASGI_RELOAD</code> translation — rely on uvicorn's native <code>UVICORN_*</code> env vars <span class="tag">process</span></li>
+    <li>README overhaul — quickstart, comparison, security and reference sections <span class="tag">docs</span></li>
+  </ul>
+</div>
+
+<hr>
+<div class="meta">
+  <a href="https://github.com/ratazzi/coulson">View on GitHub</a>
+</div>
+
+</body>
+</html>
