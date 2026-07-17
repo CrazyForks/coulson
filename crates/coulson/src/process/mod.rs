@@ -235,6 +235,15 @@ impl LayeredEnv {
         }
     }
 
+    /// Winning value for a single key: the highest layer that sets it.
+    fn get(&self, key: &str) -> Option<&str> {
+        self.layers
+            .iter()
+            .rev()
+            .find_map(|(_src, vars)| vars.get(key))
+            .map(String::as_str)
+    }
+
     /// The final merged environment; higher layers win.
     fn merge(&self) -> HashMap<String, String> {
         let mut out = HashMap::new();
@@ -1408,10 +1417,9 @@ pub(crate) fn load_coulson_toml_manifest(root: &Path) -> Option<serde_json::Valu
 }
 
 /// Extract the `[env]` table of a `.coulson.toml` manifest as a map.
-fn manifest_env_map(manifest: &Option<serde_json::Value>) -> HashMap<String, String> {
+fn manifest_env_map(manifest: Option<&serde_json::Value>) -> HashMap<String, String> {
     let mut out = HashMap::new();
     if let Some(obj) = manifest
-        .as_ref()
         .and_then(|m| m.get("env"))
         .and_then(|v| v.as_object())
     {
@@ -1449,7 +1457,7 @@ fn build_layered_env(
     let mut env = LayeredEnv::default();
     env.push(EnvSource::Provider, provider_defaults);
 
-    let mut toml = manifest_env_map(manifest);
+    let mut toml = manifest_env_map(manifest.as_ref());
     if toml.remove("PORT").is_some() {
         debug!("ignoring PORT in .coulson.toml [env]; PORT is managed by the provider");
     }
@@ -2315,20 +2323,22 @@ pub(crate) fn is_valid_process_type(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Look up `COULSON_MANAGED_SERVICES` (the companion-process selector) from
-/// `.coulson.toml [env]` first, then `.coulsonrc`. This is a control directive
-/// read before the env is layered, so it uses its own lookup rather than the
-/// general env precedence (where `.coulsonrc` wins). See PR #15.
+/// Look up `COULSON_MANAGED_SERVICES` (the companion-process selector) with
+/// the same layer stack as the child env, so `.coulsonrc` overrides
+/// `.coulson.toml [env]` here exactly as it does for every other variable.
+/// `env_url` is not a layer: companions are selected before the remote env is
+/// fetched.
 fn lookup_managed_services(
     env_overrides: &HashMap<String, String>,
     manifest: Option<&serde_json::Value>,
 ) -> Option<String> {
-    manifest
-        .and_then(|m| m.get("env"))
-        .and_then(|env| env.get("COULSON_MANAGED_SERVICES"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| env_overrides.get("COULSON_MANAGED_SERVICES").cloned())
+    let mut env = LayeredEnv::default();
+    env.push(EnvSource::TomlEnv, manifest_env_map(manifest));
+    env.push(
+        EnvSource::Dotenv(PathBuf::from(".coulsonrc")),
+        env_overrides.clone(),
+    );
+    env.get("COULSON_MANAGED_SERVICES").map(str::to_string)
 }
 
 /// Parse `COULSON_MANAGED_SERVICES` value into companion process types (excluding "web").
@@ -2432,14 +2442,14 @@ mod tests {
     // -- lookup_managed_services (env source resolution) --
 
     #[test]
-    fn lookup_managed_services_toml_wins_over_dotenv() {
+    fn lookup_managed_services_coulsonrc_wins_over_toml() {
         let mut dotenv = HashMap::new();
         dotenv.insert("COULSON_MANAGED_SERVICES".to_string(), "worker".to_string());
         let manifest = serde_json::json!({
             "env": { "COULSON_MANAGED_SERVICES": "worker,scheduler" }
         });
         let got = lookup_managed_services(&dotenv, Some(&manifest));
-        assert_eq!(got.as_deref(), Some("worker,scheduler"));
+        assert_eq!(got.as_deref(), Some("worker"));
     }
 
     #[test]
