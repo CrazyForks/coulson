@@ -2334,6 +2334,8 @@ fn run_ps(cfg: CoulsonConfig) -> anyhow::Result<()> {
     struct PsRow {
         #[tabled(rename = "NAME")]
         name: String,
+        #[tabled(rename = "TYPE")]
+        process_type: String,
         #[tabled(rename = "PID")]
         pid: String,
         #[tabled(rename = "KIND")]
@@ -2359,6 +2361,11 @@ fn run_ps(cfg: CoulsonConfig) -> anyhow::Result<()> {
                 .unwrap_or_else(|| (app_id.to_string(), String::new()));
             let pid = p.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
             let kind_raw = p.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let process_type = p
+                .get("process_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("web")
+                .to_string();
             let kind = match kind_raw {
                 "asgi" => "ASGI",
                 "node" => "Node",
@@ -2379,6 +2386,7 @@ fn run_ps(cfg: CoulsonConfig) -> anyhow::Result<()> {
 
             PsRow {
                 name: name.bold().to_string(),
+                process_type,
                 pid: pid.to_string(),
                 kind: kind.to_string(),
                 uptime,
