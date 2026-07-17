@@ -1311,11 +1311,28 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
         }
     });
 
-    let reaper_pm = state.process_manager.clone();
+    let reaper_state = state.clone();
     let reaper_task = tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(30)).await;
-            let mut pm = reaper_pm.lock().await;
+            // Reconcile against the store: apps can be deleted behind the
+            // ProcessManager's back (scanner prune, out-of-process `coulson
+            // scan`). On a store error skip reconciling — an empty set would
+            // read as "kill everything".
+            let live_app_ids = match reaper_state.store.list_filtered(None, None) {
+                Ok(apps) => Some(apps.iter().map(|a| a.id.0).collect()),
+                Err(err) => {
+                    error!(error = %err, "skipping orphan reconcile: store unavailable");
+                    None
+                }
+            };
+            let mut pm = reaper_state.process_manager.lock().await;
+            if let Some(live_app_ids) = live_app_ids {
+                let orphaned = pm.kill_orphans(&live_app_ids).await;
+                if orphaned > 0 {
+                    info!(orphaned, "reaped orphaned managed processes");
+                }
+            }
             let reaped = pm.reap_idle().await;
             if reaped > 0 {
                 info!(reaped, "reaped idle managed processes");
@@ -2353,10 +2370,12 @@ fn run_ps(cfg: CoulsonConfig) -> anyhow::Result<()> {
                 .get("app_id")
                 .map(|v| v.to_string().trim_matches('"').to_string())
                 .unwrap_or_default();
+            // A process whose app is gone from the store (deleted app dir,
+            // `coulson rm`) lingers until the orphan reaper's next tick.
             let (name, _domain) = app_map
                 .get(&app_id)
                 .cloned()
-                .unwrap_or_else(|| (app_id.to_string(), String::new()));
+                .unwrap_or_else(|| (format!("#{app_id} (removed)"), String::new()));
             let pid = p.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
             let kind_raw = p.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown");
             let kind = match kind_raw {

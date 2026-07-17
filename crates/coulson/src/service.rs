@@ -77,6 +77,13 @@ pub fn app_delete(state: &SharedState, app_id: i64) -> Result<(), ServiceError> 
             state
                 .reload_routes()
                 .map_err(|e| ServiceError::Internal(e.to_string()))?;
+            // Stop the managed process group right away — nothing routes to it
+            // anymore, and the periodic orphan reconcile would only catch it
+            // on its next tick.
+            let pm = state.process_manager.clone();
+            tokio::spawn(async move {
+                pm.lock().await.kill_process(app_id).await;
+            });
             let hm = state.hook_manager.clone();
             tokio::spawn(async move {
                 hm.fire_with_hooks(&ctx, app_hooks_snapshot.as_ref()).await;

@@ -841,6 +841,25 @@ impl ProcessManager {
         to_remove.len()
     }
 
+    /// Kill process groups whose app no longer exists in the store. Apps can
+    /// be deleted without the ProcessManager hearing about it — scanner prune
+    /// after the app directory vanished, or an out-of-process `coulson scan`
+    /// writing the shared DB — so the reaper reconciles against the store as
+    /// the single source of truth. Returns the number of groups killed.
+    pub async fn kill_orphans(&mut self, live_app_ids: &std::collections::HashSet<i64>) -> usize {
+        let orphans: Vec<i64> = self
+            .processes
+            .keys()
+            .filter(|id| !live_app_ids.contains(id))
+            .copied()
+            .collect();
+        for app_id in &orphans {
+            info!(app_id, "reaping orphaned managed process (app removed)");
+            self.kill_process(*app_id).await;
+        }
+        orphans.len()
+    }
+
     /// Kill all managed processes (called on daemon shutdown).
     pub async fn shutdown_all(&mut self) {
         for (app_id, group) in self.processes.drain() {
