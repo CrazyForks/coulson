@@ -45,6 +45,7 @@ pub struct ProcessManagerConfig {
     pub hook_manager: Arc<HookManager>,
     pub hook_factory: HookContextFactory,
     pub log_tx: broadcast::Sender<LogLine>,
+    pub store: Arc<crate::store::AppRepository>,
 }
 
 pub fn new_process_manager(cfg: ProcessManagerConfig) -> ProcessManagerHandle {
@@ -106,6 +107,19 @@ struct ProcessGroup {
     root: PathBuf,
     /// Per-app idle timeout override from `.coulson.toml`.
     idle_timeout: Option<Duration>,
+    /// The validated store row captured at the spawn commit point. Lifecycle
+    /// events for this group (stop/idle, orphan reap) are built from this
+    /// snapshot, so their route context and per-app hooks survive row
+    /// deletion — event ownership follows the group, not the row.
+    app_snapshot: crate::domain::AppSpec,
+}
+
+/// Identity and snapshot of a group removed by `kill_process_quiet`.
+pub struct StoppedGroup {
+    pub name: String,
+    pub root: PathBuf,
+    pub kind: String,
+    pub app_snapshot: crate::domain::AppSpec,
 }
 
 pub struct ProcessManager {
@@ -117,6 +131,16 @@ pub struct ProcessManager {
     hook_manager: Arc<HookManager>,
     hook_factory: HookContextFactory,
     log_tx: broadcast::Sender<LogLine>,
+    /// Desired-state source of truth: consulted before committing to a spawn
+    /// so a deleted/changed app cannot be resurrected by an in-flight request.
+    store: Arc<crate::store::AppRepository>,
+}
+
+/// Whether a tracked group still belongs to the app described by the store
+/// row. Ids alone are ambiguous (SQLite reuses row ids after deletion, and
+/// the scanner can change a row's provider kind in place).
+fn group_identity_matches(group: &ProcessGroup, name: &str, root: &Path, kind: &str) -> bool {
+    group.name == name && group.root == root && group.primary.kind == kind
 }
 
 pub enum StartStatus {
@@ -307,15 +331,29 @@ impl ProcessManager {
             hook_manager: cfg.hook_manager,
             hook_factory: cfg.hook_factory,
             log_tx: cfg.log_tx,
+            store: cfg.store,
         }
     }
 
-    fn fire_hook(&self, event: HookEvent, app_id: i64, name: &str, root: &Path, kind: &str) {
+    /// Fire a lifecycle event from the caller's row snapshot: context fields
+    /// and hook config derive from the same `AppSpec`, which the caller owns
+    /// (the group's spawn-time snapshot, or the row just validated) — so the
+    /// event neither mixes generations nor depends on the row still existing.
+    fn fire_hook(
+        &self,
+        event: HookEvent,
+        app_id: i64,
+        name: &str,
+        root: &Path,
+        kind: &str,
+        row: &crate::domain::AppSpec,
+    ) {
         let ctx = self
             .hook_factory
-            .context_for_process(event, app_id, name, root, kind);
+            .context_for_process(event, app_id, name, root, kind, Some(row));
+        let app_hooks = row.hooks.clone();
         let hm = self.hook_manager.clone();
-        tokio::spawn(async move { hm.fire(&ctx).await });
+        tokio::spawn(async move { hm.fire_with_hooks(&ctx, app_hooks.as_ref()).await });
     }
 
     /// Whether the tmux backend is active.
@@ -408,6 +446,7 @@ impl ProcessManager {
         kind: &str,
         env_url_env: Option<HashMap<String, String>>,
     ) -> anyhow::Result<ListenTarget> {
+        self.remove_stale_group(app_id, name, root, kind).await?;
         // Check if already running and alive
         if let Some(group) = self.processes.get_mut(&app_id) {
             if is_alive(&mut group.primary.handle) {
@@ -422,6 +461,8 @@ impl ProcessManager {
             kill_handle(removed.primary.handle).await;
             cleanup_listen_target(&removed.primary.listen_target);
         }
+
+        let app_row = self.validate_app_current(app_id, name, root, kind)?;
 
         let (mut spec, app_dir, prov_name, companion_types, manifest, coulsonrc) =
             self.resolve_spec(app_id, name, root, kind)?;
@@ -441,7 +482,7 @@ impl ProcessManager {
             "starting managed process via {prov_name} provider",
         );
 
-        self.fire_hook(HookEvent::AppStart, app_id, name, root, kind);
+        self.fire_hook(HookEvent::AppStart, app_id, name, root, kind, &app_row);
 
         cleanup_listen_target(&spec.listen_target);
 
@@ -510,7 +551,7 @@ impl ProcessManager {
             return Err(e);
         }
 
-        self.fire_hook(HookEvent::AppReady, app_id, name, root, kind);
+        self.fire_hook(HookEvent::AppReady, app_id, name, root, kind, &app_row);
 
         let companions = self.spawn_companions(
             app_id,
@@ -544,6 +585,7 @@ impl ProcessManager {
                 name: name.to_string(),
                 root: root.to_path_buf(),
                 idle_timeout: app_idle_timeout,
+                app_snapshot: app_row,
             },
         );
 
@@ -560,6 +602,7 @@ impl ProcessManager {
         kind: &str,
         env_url_env: Option<HashMap<String, String>>,
     ) -> anyhow::Result<EnsureStarted> {
+        self.remove_stale_group(app_id, name, root, kind).await?;
         // Check existing process state in a limited scope to avoid borrow conflicts
         enum ExistingState {
             AlreadyReady(ListenTarget),
@@ -605,7 +648,10 @@ impl ProcessManager {
                 return Ok(EnsureStarted::Status(StartStatus::Ready(target)));
             }
             Some(ExistingState::JustBecameReady(target)) => {
-                self.fire_hook(HookEvent::AppReady, app_id, name, root, kind);
+                if let Some(snapshot) = self.processes.get(&app_id).map(|g| g.app_snapshot.clone())
+                {
+                    self.fire_hook(HookEvent::AppReady, app_id, name, root, kind, &snapshot);
+                }
                 return Ok(EnsureStarted::Status(StartStatus::Ready(target)));
             }
             Some(ExistingState::StillStarting) => {
@@ -644,6 +690,8 @@ impl ProcessManager {
             None => {} // No existing process, proceed to spawn
         }
 
+        let app_row = self.validate_app_current(app_id, name, root, kind)?;
+
         // We are about to cold-start. If `env_url` is configured but we have no
         // prefetched env (the process looked alive when the prefetch was skipped
         // but has since exited), bail to the caller to prefetch off-lock and
@@ -672,7 +720,7 @@ impl ProcessManager {
             "starting managed process via {prov_name} provider (non-blocking)",
         );
 
-        self.fire_hook(HookEvent::AppStart, app_id, name, root, kind);
+        self.fire_hook(HookEvent::AppStart, app_id, name, root, kind, &app_row);
 
         cleanup_listen_target(&spec.listen_target);
 
@@ -759,32 +807,53 @@ impl ProcessManager {
                 name: name.to_string(),
                 root: root.to_path_buf(),
                 idle_timeout: app_idle_timeout,
+                app_snapshot: app_row,
             },
         );
 
         Ok(EnsureStarted::Status(StartStatus::Starting))
     }
 
-    /// Kill a specific managed process. Returns true if it was found and killed.
+    /// Kill a specific managed process, firing `AppStop` from the group's
+    /// spawn-time snapshot — complete route context and per-app hooks even
+    /// when the row is already deleted (orphan reap after prune or an
+    /// out-of-process scan). Returns true if it was found and killed.
     pub async fn kill_process(&mut self, app_id: i64) -> bool {
-        if let Some(group) = self.processes.remove(&app_id) {
-            info!(app_id, "killing managed process");
-            for companion in group.companions {
-                kill_handle(companion.handle).await;
+        match self.kill_process_quiet(app_id).await {
+            Some(stopped) => {
+                self.fire_hook(
+                    HookEvent::AppStop,
+                    app_id,
+                    &stopped.name,
+                    &stopped.root,
+                    &stopped.kind,
+                    &stopped.app_snapshot,
+                );
+                true
             }
-            kill_handle(group.primary.handle).await;
-            cleanup_listen_target(&group.primary.listen_target);
-            self.fire_hook(
-                HookEvent::AppStop,
-                app_id,
-                &group.name,
-                &group.root,
-                &group.primary.kind,
-            );
-            true
-        } else {
-            false
+            None => false,
         }
+    }
+
+    /// Kill without emitting `AppStop`; returns the stopped group's identity
+    /// and spawn-time snapshot. Deletion uses this and fires its own ordered
+    /// lifecycle events (`AppStop` then `AppRemove`) built from the deleted
+    /// row, which still carries the route/tunnel fields a post-delete store
+    /// lookup would miss.
+    pub async fn kill_process_quiet(&mut self, app_id: i64) -> Option<StoppedGroup> {
+        let group = self.processes.remove(&app_id)?;
+        info!(app_id, "killing managed process");
+        for companion in group.companions {
+            kill_handle(companion.handle).await;
+        }
+        kill_handle(group.primary.handle).await;
+        cleanup_listen_target(&group.primary.listen_target);
+        Some(StoppedGroup {
+            name: group.name,
+            root: group.root,
+            kind: group.primary.kind,
+            app_snapshot: group.app_snapshot,
+        })
     }
 
     pub fn mark_active(&mut self, app_id: i64) {
@@ -813,28 +882,43 @@ impl ProcessManager {
                     listen = %listen_target_display(&group.primary.listen_target),
                     "reaping idle managed process"
                 );
-                // Fire AppIdle before reaping
+                // Both contexts and the hook config derive from the group's
+                // spawn-time snapshot — one owned source, so the ordered
+                // AppIdle/AppStop pair can neither mix generations nor lose
+                // its hooks to a concurrent prune/rewrite (the events belong
+                // to the group, not to the row's continued existence). Both
+                // events then fire in one detached ordered task: AppIdle
+                // strictly before AppStop, and nothing is ever awaited under
+                // the PM lock — an app_idle webhook must not stall every
+                // start / delete for the HTTP timeout.
+                let snapshot = &group.app_snapshot;
                 let idle_ctx = self.hook_factory.context_for_process(
                     HookEvent::AppIdle,
                     *app_id,
                     &group.name,
                     &group.root,
                     &group.primary.kind,
+                    Some(snapshot),
                 );
-                self.hook_manager.fire(&idle_ctx).await;
-                for companion in group.companions {
-                    kill_handle(companion.handle).await;
-                }
-                kill_handle(group.primary.handle).await;
-                cleanup_listen_target(&group.primary.listen_target);
-                // Fire AppStop after kill
-                self.fire_hook(
+                let stop_ctx = self.hook_factory.context_for_process(
                     HookEvent::AppStop,
                     *app_id,
                     &group.name,
                     &group.root,
                     &group.primary.kind,
+                    Some(snapshot),
                 );
+                let app_hooks = snapshot.hooks.clone();
+                for companion in group.companions {
+                    kill_handle(companion.handle).await;
+                }
+                kill_handle(group.primary.handle).await;
+                cleanup_listen_target(&group.primary.listen_target);
+                let hm = self.hook_manager.clone();
+                tokio::spawn(async move {
+                    hm.fire_with_hooks(&idle_ctx, app_hooks.as_ref()).await;
+                    hm.fire_with_hooks(&stop_ctx, app_hooks.as_ref()).await;
+                });
             }
         }
 
@@ -845,19 +929,93 @@ impl ProcessManager {
     /// be deleted without the ProcessManager hearing about it — scanner prune
     /// after the app directory vanished, or an out-of-process `coulson scan`
     /// writing the shared DB — so the reaper reconciles against the store as
-    /// the single source of truth. Returns the number of groups killed.
-    pub async fn kill_orphans(&mut self, live_app_ids: &std::collections::HashSet<i64>) -> usize {
+    /// the single source of truth.
+    ///
+    /// `live_apps` maps app_id → (name, root, kind) of the store's current
+    /// managed apps. Ids are AUTOINCREMENT and never reused; the additional
+    /// identity match is defense-in-depth against in-place row rewrites (the
+    /// scanner can change a row's root/kind under the same id). Returns the
+    /// number of groups killed.
+    pub async fn kill_orphans(
+        &mut self,
+        live_apps: &HashMap<i64, (String, PathBuf, String)>,
+    ) -> usize {
         let orphans: Vec<i64> = self
             .processes
-            .keys()
-            .filter(|id| !live_app_ids.contains(id))
-            .copied()
+            .iter()
+            .filter(|(id, group)| {
+                live_apps.get(id).is_none_or(|(name, root, kind)| {
+                    !group_identity_matches(group, name, root, kind)
+                })
+            })
+            .map(|(id, _)| *id)
             .collect();
         for app_id in &orphans {
             info!(app_id, "reaping orphaned managed process (app removed)");
             self.kill_process(*app_id).await;
         }
         orphans.len()
+    }
+
+    /// If the group tracked under `app_id` disagrees with the caller's
+    /// identity (the scanner can rewrite a row's kind/root in place), the
+    /// store arbitrates: when the *caller* is the stale side — a request that
+    /// captured an old route — it is refused without touching the group; only
+    /// when the caller matches the current row is the mismatched group killed
+    /// so the app starts fresh.
+    async fn remove_stale_group(
+        &mut self,
+        app_id: i64,
+        name: &str,
+        root: &Path,
+        kind: &str,
+    ) -> anyhow::Result<()> {
+        let conflicting = self
+            .processes
+            .get(&app_id)
+            .is_some_and(|g| !group_identity_matches(g, name, root, kind));
+        if conflicting {
+            let _current = self.validate_app_current(app_id, name, root, kind)?;
+            info!(
+                app_id,
+                "tracked process belongs to a superseded app; killing stale group"
+            );
+            self.kill_process(app_id).await;
+        }
+        Ok(())
+    }
+
+    /// Bail unless the store still has this managed app with the same
+    /// identity. A request that captured a route before deletion could
+    /// otherwise resurrect the app's process right after `app_delete()`
+    /// killed it. Runs under the PM lock at the point of committing to a
+    /// spawn, so it cannot interleave with deletion's row-delete + kill.
+    fn validate_app_current(
+        &self,
+        app_id: i64,
+        name: &str,
+        root: &Path,
+        kind: &str,
+    ) -> anyhow::Result<crate::domain::AppSpec> {
+        let row = self
+            .store
+            .get_by_id(app_id)
+            .context("store lookup before spawn")?;
+        let current = row.filter(|app| match &app.target {
+            crate::domain::BackendTarget::Managed {
+                root: r,
+                kind: k,
+                name: n,
+                ..
+            } => n == name && Path::new(r) == root && k == kind,
+            _ => false,
+        });
+        match current {
+            Some(app) => Ok(app),
+            None => {
+                anyhow::bail!("app {name} (id={app_id}) was removed or changed; refusing to start")
+            }
+        }
     }
 
     /// Kill all managed processes (called on daemon shutdown).
@@ -3280,6 +3438,70 @@ OVERRIDE = "toml_wins"
         .unwrap();
         let result = prefetch_env_url(&dir).await;
         assert!(result.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- validate_app_current (pre-spawn store revalidation) --
+
+    #[test]
+    fn validate_app_current_gates_spawn_on_store_row() {
+        let dir =
+            std::env::temp_dir().join(format!("coulson-test-validate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(
+            crate::store::AppRepository::new(&dir.join("db.sqlite"), "coulson.local").unwrap(),
+        );
+        store.init_schema().unwrap();
+        let (log_tx, _rx) = broadcast::channel(8);
+        let pm = ProcessManager::new(ProcessManagerConfig {
+            idle_timeout: Duration::from_secs(60),
+            registry: Arc::new(default_registry()),
+            runtime_dir: dir.clone(),
+            backend: ProcessBackend::Direct,
+            hook_manager: Arc::new(crate::hooks::HookManager::new(dir.join("hooks"), 5)),
+            hook_factory: crate::hooks::HookContextFactory::new(
+                80,
+                None,
+                true,
+                false,
+                "coulson.local".to_string(),
+            ),
+            log_tx,
+            store: Arc::clone(&store),
+        });
+
+        let root = dir.join("myapp");
+        // No row → a deleted app must not be resurrected.
+        assert!(pm
+            .validate_app_current(1, "myapp", &root, "procfile")
+            .is_err());
+
+        let domain = crate::domain::DomainName("myapp.coulson.local".to_string());
+        let (app, _) = store
+            .upsert_scanned_managed(
+                "myapp",
+                &domain,
+                root.to_str().unwrap(),
+                "procfile",
+                true,
+                "fs",
+                "e",
+                None,
+            )
+            .unwrap();
+        // Matching identity → allowed.
+        assert!(pm
+            .validate_app_current(app.id.0, "myapp", &root, "procfile")
+            .is_ok());
+        // Same id but changed provider kind → refuse.
+        assert!(pm
+            .validate_app_current(app.id.0, "myapp", &root, "node")
+            .is_err());
+        // Same id but different app identity (reused id) → refuse.
+        assert!(pm
+            .validate_app_current(app.id.0, "other", &root, "procfile")
+            .is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

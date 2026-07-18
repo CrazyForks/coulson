@@ -1,15 +1,11 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::RwLock;
 use serde::Deserialize;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
 use crate::domain::{BackendTarget, UrlContext};
-use crate::store::AppRepository;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
@@ -55,11 +51,10 @@ pub struct HookContext {
 
 /// Shared factory for building `HookContext` from app data or minimal process info.
 ///
-/// Encapsulates the port/suffix/store context that was previously duplicated
+/// Encapsulates the port/suffix context that was previously duplicated
 /// across `service.rs::hook_context_for_app` and `process/mod.rs::fire_hook`.
 #[derive(Clone)]
 pub struct HookContextFactory {
-    store: Arc<AppRepository>,
     http_port: u16,
     https_port: Option<u16>,
     use_default_http_port: bool,
@@ -69,7 +64,6 @@ pub struct HookContextFactory {
 
 impl HookContextFactory {
     pub fn new(
-        store: Arc<AppRepository>,
         http_port: u16,
         https_port: Option<u16>,
         use_default_http_port: bool,
@@ -77,7 +71,6 @@ impl HookContextFactory {
         domain_suffix: String,
     ) -> Self {
         Self {
-            store,
             http_port,
             https_port,
             use_default_http_port,
@@ -118,8 +111,11 @@ impl HookContextFactory {
         }
     }
 
-    /// Build context from minimal process info, enriching via store lookup.
-    /// Falls back to empty domain/urls when the app is not found in the store.
+    /// Context for a process-lifecycle event. Route/URL/tunnel fields come
+    /// from `row` — the caller's single row snapshot, so context and hook
+    /// config always describe the same generation of the app — while the
+    /// process identity (name/root/kind) comes from the group that actually
+    /// ran, which can predate an in-place row rewrite.
     pub fn context_for_process(
         &self,
         event: HookEvent,
@@ -127,8 +123,9 @@ impl HookContextFactory {
         name: &str,
         root: &Path,
         kind: &str,
+        row: Option<&crate::domain::AppSpec>,
     ) -> HookContext {
-        let (domain, app_urls, tunnel_url) = if let Ok(Some(app)) = self.store.get_by_id(app_id) {
+        let (domain, app_urls, tunnel_url) = if let Some(app) = row {
             let url_ctx = self.url_context();
             let urls = app.urls(&url_ctx);
             (Some(app.domain.0.clone()), urls, app.tunnel_url.clone())
@@ -150,7 +147,10 @@ impl HookContextFactory {
 }
 
 /// Per-app hook configuration parsed from `.coulson.toml` `[hooks]` section.
-#[derive(Debug, Clone, Deserialize)]
+/// Persisted as JSON in the app's store row — the row is the single source of
+/// truth, so every snapshot of a row (delete/prune RETURNING, reads) carries
+/// the hook configuration that belongs to that exact generation of the app.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct AppHooksConfig {
     #[serde(default)]
     pub skip_global: bool,
@@ -189,7 +189,7 @@ impl AppHooksConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct HookActionConfig {
     pub run: Option<String>,
     pub webhook: Option<String>,
@@ -199,7 +199,6 @@ pub struct HookManager {
     hooks_dir: PathBuf,
     timeout: Duration,
     http_client: reqwest::Client,
-    app_hooks: RwLock<HashMap<i64, AppHooksConfig>>,
 }
 
 impl HookManager {
@@ -211,40 +210,17 @@ impl HookManager {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_default(),
-            app_hooks: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Register per-app hooks from `.coulson.toml` (called during scan).
-    pub fn register_app_hooks(&self, app_id: i64, config: AppHooksConfig) {
-        self.app_hooks.write().insert(app_id, config);
-    }
-
-    /// Remove per-app hooks (called when app is deleted).
-    pub fn unregister_app_hooks(&self, app_id: i64) {
-        self.app_hooks.write().remove(&app_id);
-    }
-
-    /// Clear all per-app hooks (called before re-scanning to avoid stale entries).
-    pub fn clear_all_app_hooks(&self) {
-        self.app_hooks.write().clear();
-    }
-
-    /// Snapshot and remove per-app hooks for the given app (for use before deletion).
-    pub fn take_app_hooks(&self, app_id: i64) -> Option<AppHooksConfig> {
-        self.app_hooks.write().remove(&app_id)
-    }
-
-    /// Main entry point: fire global + per-app hooks for the given event.
+    /// Fire global hooks only. Per-app hooks live on the app's store row;
+    /// emitters that have (or destroyed) a row pass its config via
+    /// `fire_with_hooks` — there is no shared registry to look up or race.
     pub async fn fire(&self, ctx: &HookContext) {
-        let app_hooks = ctx.app_id.and_then(|id| {
-            let map = self.app_hooks.read();
-            map.get(&id).cloned()
-        });
-        self.fire_with_hooks(ctx, app_hooks.as_ref()).await;
+        self.fire_with_hooks(ctx, None).await;
     }
 
-    /// Fire with an explicit per-app hooks snapshot (avoids shared table lookup).
+    /// Fire global + per-app hooks with the caller's own hooks snapshot.
     pub async fn fire_with_hooks(&self, ctx: &HookContext, app_hooks: Option<&AppHooksConfig>) {
         let event_name = ctx.event.as_str();
 
@@ -263,11 +239,11 @@ impl HookManager {
                 }
                 if let Some(ref url) = action.webhook {
                     let payload = build_webhook_payload(ctx);
-                    let url = url.clone();
-                    let client = self.http_client.clone();
-                    tokio::spawn(async move {
-                        fire_webhook(&client, &url, &payload).await;
-                    });
+                    // Awaited inline (the client has a 10s timeout) so callers
+                    // that sequence lifecycle events — deletion fires AppStop
+                    // strictly before AppRemove — order webhook delivery too,
+                    // not just shell actions.
+                    fire_webhook(&self.http_client, url, &payload).await;
                 }
             }
         }
@@ -304,7 +280,14 @@ impl HookManager {
     /// Execute a shell command with hook environment variables.
     async fn fire_shell(&self, cmd: &str, ctx: &HookContext) {
         let event_name = ctx.event.as_str();
-        let cwd = ctx.app_root.clone().unwrap_or_else(|| PathBuf::from("."));
+        // The app root may already be gone when the hook fires — `app_stop`
+        // for a deleted/pruned app is exactly the cleanup case — and spawning
+        // with a missing cwd fails with ENOENT. Fall back to the daemon cwd;
+        // `COULSON_APP_ROOT` still carries the original path.
+        let cwd = match ctx.app_root {
+            Some(ref root) if root.is_dir() => root.clone(),
+            _ => PathBuf::from("."),
+        };
 
         let mut command = Command::new("sh");
         command.arg("-c").arg(cmd);

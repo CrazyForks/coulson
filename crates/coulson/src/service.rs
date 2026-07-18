@@ -55,50 +55,96 @@ pub fn app_get_by_id(state: &SharedState, app_id: i64) -> Result<AppSpec, Servic
     }
 }
 
-pub fn app_delete(state: &SharedState, app_id: i64) -> Result<(), ServiceError> {
-    let app = app_get_by_id(state, app_id)?;
-    // Snapshot per-app hooks before fs removal (which triggers watcher → clear_all_app_hooks)
-    let app_hooks_snapshot = state.hook_manager.take_app_hooks(app_id);
-    if let Some(ref fs_entry) = app.fs_entry {
-        scanner::remove_app_fs_entry(&state.apps_root, fs_entry);
-    }
-    let ctx = state
-        .hook_factory()
-        .context_for_app(HookEvent::AppRemove, &app);
-
-    let restore_hooks = |snapshot: Option<crate::hooks::AppHooksConfig>| {
-        if let Some(config) = snapshot {
-            state.hook_manager.register_app_hooks(app_id, config);
+pub async fn app_delete(state: &SharedState, app_id: i64) -> Result<(), ServiceError> {
+    // Row fetch+delete and process kill form one critical section under the
+    // PM lock, serializing deletion against the start paths (which validate
+    // the store row under the same lock before committing to a spawn): a
+    // start either completes fully before the delete — its group is killed
+    // here — or it revalidates after the row is gone and is refused. Nothing
+    // is mutated before the delete, so failures need no rollback.
+    let app;
+    let stopped;
+    {
+        let mut pm = state.process_manager.lock().await;
+        // Row delete and fs-entry removal commit as one write transaction:
+        // that pair is what a scan's in-transaction revalidation checks, so
+        // removing them non-atomically would let a stale discovery resurrect
+        // the app between the two steps. No awaits while the txn is alive.
+        {
+            let txn = match state.store.begin_write() {
+                Ok(txn) => txn,
+                Err(e) => return Err(ServiceError::Internal(e.to_string())),
+            };
+            // `delete_returning` snapshots and deletes in one statement — the
+            // scanner can rewrite the row in place, so cleanup and the
+            // AppRemove context must describe the row actually removed.
+            app = match txn.delete_returning(app_id) {
+                Ok(Some(app)) => app,
+                Ok(None) => return Err(ServiceError::NotFound),
+                Err(e) => return Err(ServiceError::Internal(e.to_string())),
+            };
+            // A Refused removal (directory, or fs error) aborts the delete:
+            // committing would leave the entry in place and the next scan
+            // would recreate the app — a success response that lies. The txn
+            // rolls back on drop, so nothing has changed. If the commit
+            // itself fails after a successful removal, the row rolls back
+            // while the entry is gone — the next scan prunes that row, so
+            // the state converges to deleted either way.
+            if let Some(ref fs_entry) = app.fs_entry {
+                if scanner::remove_app_fs_entry(&state.apps_root, fs_entry)
+                    == scanner::FsEntryRemoval::Refused
+                {
+                    return Err(ServiceError::Internal(format!(
+                        "apps_root entry '{fs_entry}' was not removed (directory or fs error); \
+                         a scan would recreate the app — remove the entry manually and retry"
+                    )));
+                }
+            }
+            if let Err(e) = txn.commit() {
+                return Err(ServiceError::Internal(e.to_string()));
+            }
         }
+        // The row is gone and ids are AUTOINCREMENT (never reused), so any
+        // group tracked under this id — whichever generation of the row
+        // started it, even one from before a managed→static rewrite — is
+        // stale: kill unconditionally (a no-op when no group exists). Quiet
+        // variant: the post-delete store lookup inside the normal AppStop
+        // path would miss the row and drop its route/tunnel fields, so the
+        // stop event is built below from the deleted snapshot instead, and
+        // sequenced before AppRemove.
+        stopped = pm.kill_process_quiet(app_id).await;
+    }
+    let factory = state.hook_factory();
+    // AppStop belongs to the generation that actually ran: context AND hooks
+    // come from the stopped group's spawn-time snapshot (the scanner can
+    // rewrite a row in place while an older generation is still running).
+    // AppRemove intentionally describes the deleted row — the generation the
+    // user removed.
+    let (stop_ctx, stop_hooks) = match stopped {
+        Some(s) => (
+            Some(factory.context_for_app(HookEvent::AppStop, &s.app_snapshot)),
+            s.app_snapshot.hooks,
+        ),
+        None => (None, None),
     };
+    let remove_ctx = factory.context_for_app(HookEvent::AppRemove, &app);
+    let remove_hooks = app.hooks.clone();
 
-    match state.store.delete(app_id) {
-        Ok(true) => {
-            state
-                .reload_routes()
-                .map_err(|e| ServiceError::Internal(e.to_string()))?;
-            // Stop the managed process group right away — nothing routes to it
-            // anymore, and the periodic orphan reconcile would only catch it
-            // on its next tick.
-            let pm = state.process_manager.clone();
-            tokio::spawn(async move {
-                pm.lock().await.kill_process(app_id).await;
-            });
-            let hm = state.hook_manager.clone();
-            tokio::spawn(async move {
-                hm.fire_with_hooks(&ctx, app_hooks_snapshot.as_ref()).await;
-            });
-            Ok(())
+    // Dispatch before the fallible route reload: the deletion is already
+    // committed, and these snapshots are the only source for its lifecycle
+    // events — an early return must not drop them. One task, sequential
+    // awaits: AppStop strictly precedes AppRemove.
+    let hm = state.hook_manager.clone();
+    tokio::spawn(async move {
+        if let Some(ctx) = stop_ctx {
+            hm.fire_with_hooks(&ctx, stop_hooks.as_ref()).await;
         }
-        Ok(false) => {
-            restore_hooks(app_hooks_snapshot);
-            Err(ServiceError::NotFound)
-        }
-        Err(e) => {
-            restore_hooks(app_hooks_snapshot);
-            Err(ServiceError::Internal(e.to_string()))
-        }
-    }
+        hm.fire_with_hooks(&remove_ctx, remove_hooks.as_ref()).await;
+    });
+    state
+        .reload_routes()
+        .map_err(|e| ServiceError::Internal(e.to_string()))?;
+    Ok(())
 }
 
 pub fn app_set_enabled(
@@ -122,14 +168,45 @@ pub fn app_set_enabled(
 pub fn fire_app_add_hooks(state: &SharedState, added_apps: &[crate::domain::AppSpec]) {
     for app in added_apps {
         let ctx = state.hook_factory().context_for_app(HookEvent::AppAdd, app);
+        let hooks = app.hooks.clone();
         let hm = state.hook_manager.clone();
-        tokio::spawn(async move { hm.fire(&ctx).await });
+        tokio::spawn(async move { hm.fire_with_hooks(&ctx, hooks.as_ref()).await });
     }
 }
 
-pub fn apps_scan(state: &SharedState) -> Result<ScanStats, ServiceError> {
+/// Stop processes belonging to scan-pruned rows and fire their `app_stop`
+/// hooks. The event is built entirely from the stopped group's spawn-time
+/// snapshot — the generation that actually ran — so an in-place row rewrite
+/// between spawn and prune cannot substitute another generation's context or
+/// hooks. Without this teardown, the reaper's reconcile would stop the
+/// process a tick later.
+pub async fn teardown_pruned_apps(state: &SharedState, pruned_apps: &[crate::domain::AppSpec]) {
+    for app in pruned_apps {
+        let killed = {
+            let mut pm = state.process_manager.lock().await;
+            pm.kill_process_quiet(app.id.0).await
+        };
+        let Some(stopped) = killed else {
+            continue;
+        };
+        let ctx = state
+            .hook_factory()
+            .context_for_app(HookEvent::AppStop, &stopped.app_snapshot);
+        let hooks = stopped.app_snapshot.hooks;
+        let hm = state.hook_manager.clone();
+        tokio::spawn(async move {
+            hm.fire_with_hooks(&ctx, hooks.as_ref()).await;
+        });
+    }
+}
+
+pub async fn apps_scan(state: &SharedState) -> Result<ScanStats, ServiceError> {
     let result =
         scanner::sync_from_apps_root(state).map_err(|e| ServiceError::Internal(e.to_string()))?;
+    // Consume the teardown snapshots first: the rows and hook registrations
+    // are already gone, so no fallible step (warnings write, route reload)
+    // may run before this or an early return would drop them.
+    teardown_pruned_apps(state, &result.pruned_apps).await;
     runtime::write_scan_warnings(&state.scan_warnings_path, &result.stats)
         .map_err(|e| ServiceError::Internal(e.to_string()))?;
     state
@@ -1049,8 +1126,9 @@ fn fire_tunnel_hook(
             ctx.app_urls.push(url.to_string());
         }
     }
+    let hooks = app.hooks.clone();
     let hm = state.hook_manager.clone();
-    tokio::spawn(async move { hm.fire(&ctx).await });
+    tokio::spawn(async move { hm.fire_with_hooks(&ctx, hooks.as_ref()).await });
 }
 
 /// Parse the first route target from a pow-format file content.

@@ -315,7 +315,7 @@ pub async fn action_toggle_lan_access(
 }
 
 pub async fn action_scan(State(state): State<DashboardState>) -> Response {
-    let stats = service::apps_scan(&state.shared);
+    let stats = service::apps_scan(&state.shared).await;
 
     let port = state.shared.listen_http.port();
     let all = state.shared.store.list_all().unwrap_or_default();
@@ -430,7 +430,7 @@ pub async fn action_delete(
         Ok(app) => app,
         Err(_) => return html_response(StatusCode::NOT_FOUND, "Not found".to_string()),
     };
-    if let Err(e) = service::app_delete(&state.shared, app.id.0) {
+    if let Err(e) = service::app_delete(&state.shared, app.id.0).await {
         tracing::error!(error = %e, app_id = app.id.0, "delete failed");
         return html_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -460,7 +460,7 @@ pub async fn action_delete_redirect(
     Path(id): Path<String>,
 ) -> Response {
     if let Ok(app) = service::app_get_by_name(&state.shared, &id) {
-        if let Err(e) = service::app_delete(&state.shared, app.id.0) {
+        if let Err(e) = service::app_delete(&state.shared, app.id.0).await {
             tracing::error!(error = %e, app_id = app.id.0, "delete failed");
             return html_response(
                 StatusCode::INTERNAL_SERVER_ERROR,

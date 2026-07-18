@@ -156,6 +156,14 @@ pub struct AppSpec {
     pub cors_enabled: bool,
     pub force_https: bool,
     pub basic_auth_user: Option<String>,
+    /// Serialized as the boolean `basic_auth_pass_set`: `AppSpec` flows out
+    /// through control RPC responses, and the password itself must never
+    /// leave the daemon. In-daemon consumers read the field directly.
+    #[serde(
+        rename = "basic_auth_pass_set",
+        serialize_with = "ser_secret_is_set",
+        skip_deserializing
+    )]
     pub basic_auth_pass: Option<String>,
     pub spa_rewrite: bool,
     pub listen_port: Option<u16>,
@@ -165,14 +173,38 @@ pub struct AppSpec {
     pub app_tunnel_id: Option<String>,
     pub app_tunnel_domain: Option<String>,
     pub app_tunnel_dns_id: Option<String>,
+    /// Serialized as the boolean `app_tunnel_creds_set` — the JSON contains
+    /// the Cloudflare tunnel secret; RPC clients only need to know whether
+    /// saved credentials exist (tunnel mode auto-inference).
+    #[serde(
+        rename = "app_tunnel_creds_set",
+        serialize_with = "ser_secret_is_set",
+        skip_deserializing
+    )]
     pub app_tunnel_creds: Option<String>,
     pub inspect_enabled: bool,
     pub lan_access: bool,
     pub cname: Option<String>,
     pub fs_entry: Option<String>,
+    /// Per-app hook configuration from `.coulson.toml`, persisted on the row
+    /// so every row snapshot carries the hooks of that app generation.
+    /// Never serialized: `AppSpec` flows out through control RPC responses
+    /// (`app.list`/`app.get`), and hook shell commands / webhook URLs can
+    /// carry credentials. In-daemon consumers read the field directly.
+    #[serde(skip)]
+    pub hooks: Option<crate::hooks::AppHooksConfig>,
     pub enabled: bool,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+}
+
+/// Serialize a secret field as a presence boolean — the value itself must
+/// never appear in any serialized form of `AppSpec`.
+fn ser_secret_is_set<S: serde::Serializer>(
+    value: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bool(value.is_some())
 }
 
 /// Runtime context needed to build URLs for an app.
