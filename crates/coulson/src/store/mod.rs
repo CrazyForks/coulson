@@ -555,6 +555,22 @@ impl StoreTxn<'_> {
         Ok(())
     }
 
+    /// Read through the transaction's connection. Process startup uses this
+    /// while holding `BEGIN IMMEDIATE` across its final desired-state check and
+    /// in-memory group insertion, so an offline scanner cannot commit a prune
+    /// in the gap between those two operations.
+    pub fn get_by_id(&self, app_id: i64) -> anyhow::Result<Option<AppSpec>> {
+        let app = self
+            .conn
+            .query_row(
+                &format!("SELECT {} FROM apps WHERE id = ?1", COLS),
+                params![app_id],
+                |row| row_to_app(row, &self.repo.domain_suffix),
+            )
+            .optional()?;
+        Ok(app)
+    }
+
     pub fn upsert_scanned_static(
         &self,
         input: &StaticAppInput,

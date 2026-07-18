@@ -122,7 +122,14 @@ pub async fn app_delete(state: &SharedState, app_id: i64) -> Result<(), ServiceE
     // user removed.
     let (stop_ctx, stop_hooks) = match stopped {
         Some(s) => (
-            Some(factory.context_for_app(HookEvent::AppStop, &s.app_snapshot)),
+            Some(factory.context_for_process(
+                HookEvent::AppStop,
+                app_id,
+                &s.name,
+                &s.root,
+                &s.kind,
+                Some(&s.app_snapshot),
+            )),
             s.app_snapshot.hooks,
         ),
         None => (None, None),
@@ -189,9 +196,14 @@ pub async fn teardown_pruned_apps(state: &SharedState, pruned_apps: &[crate::dom
         let Some(stopped) = killed else {
             continue;
         };
-        let ctx = state
-            .hook_factory()
-            .context_for_app(HookEvent::AppStop, &stopped.app_snapshot);
+        let ctx = state.hook_factory().context_for_process(
+            HookEvent::AppStop,
+            app.id.0,
+            &stopped.name,
+            &stopped.root,
+            &stopped.kind,
+            Some(&stopped.app_snapshot),
+        );
         let hooks = stopped.app_snapshot.hooks;
         let hm = state.hook_manager.clone();
         tokio::spawn(async move {
@@ -494,6 +506,7 @@ pub fn app_create_from_folder(state: &SharedState, path: &str) -> Result<AppSpec
         if let Some((_prov, detected)) = state
             .provider_registry
             .detect(folder, Some(&info.manifest_json))
+            .map_err(|e| ServiceError::Internal(e.to_string()))?
         {
             let root_str = folder.to_string_lossy().to_string();
             return insert_and_reload(state.store.insert_managed(
@@ -544,7 +557,11 @@ pub fn app_create_from_folder(state: &SharedState, path: &str) -> Result<AppSpec
     }
 
     // 3. Provider registry auto-detect
-    if let Some((_prov, detected)) = state.provider_registry.detect(folder, None) {
+    if let Some((_prov, detected)) = state
+        .provider_registry
+        .detect(folder, None)
+        .map_err(|e| ServiceError::Internal(e.to_string()))?
+    {
         let root_str = folder.to_string_lossy().to_string();
         return insert_and_reload(state.store.insert_managed(
             &name,

@@ -4,7 +4,8 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::provider::{
-    resolve_port, DetectedApp, ListenTarget, ManagedApp, ProcessProvider, ProcessSpec,
+    detection_path_exists, resolve_port, DetectedApp, ListenTarget, ManagedApp, ProcessProvider,
+    ProcessSpec,
 };
 
 /// Compose files in priority order.
@@ -22,8 +23,13 @@ const COMPOSE_FILES: &[&str] = &[
 pub struct DockerProvider;
 
 /// Find the first matching compose file in the directory.
-fn find_compose_file(dir: &Path) -> Option<&'static str> {
-    COMPOSE_FILES.iter().find(|f| dir.join(f).exists()).copied()
+fn find_compose_file(dir: &Path) -> anyhow::Result<Option<&'static str>> {
+    for file in COMPOSE_FILES {
+        if detection_path_exists(&dir.join(file))? {
+            return Ok(Some(file));
+        }
+    }
+    Ok(None)
 }
 
 /// Find the `docker` binary in PATH.
@@ -57,7 +63,7 @@ fn determine_compose_file(dir: &Path, manifest: Option<&Value>) -> anyhow::Resul
             dir.display()
         );
     }
-    find_compose_file(dir)
+    find_compose_file(dir)?
         .map(|s| s.to_string())
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -124,27 +130,25 @@ impl ProcessProvider for DockerProvider {
         "Docker Compose"
     }
 
-    fn detect(&self, dir: &Path, manifest: Option<&Value>) -> Option<DetectedApp> {
+    fn detect(&self, dir: &Path, manifest: Option<&Value>) -> anyhow::Result<Option<DetectedApp>> {
         if let Some(m) = manifest {
             if m.get("kind").and_then(|v| v.as_str()) == Some("docker") {
-                let compose_file = determine_compose_file(dir, manifest)
-                    .ok()
-                    .unwrap_or_default();
-                return Some(DetectedApp {
+                let compose_file = determine_compose_file(dir, manifest)?;
+                return Ok(Some(DetectedApp {
                     kind: "docker".into(),
                     meta: serde_json::json!({ "compose_file": compose_file }),
-                });
+                }));
             }
         }
 
-        if let Some(f) = find_compose_file(dir) {
-            return Some(DetectedApp {
+        if let Some(f) = find_compose_file(dir)? {
+            return Ok(Some(DetectedApp {
                 kind: "docker".into(),
                 meta: serde_json::json!({ "compose_file": f }),
-            });
+            }));
         }
 
-        None
+        Ok(None)
     }
 
     fn resolve(&self, app: &ManagedApp) -> anyhow::Result<ProcessSpec> {
@@ -243,7 +247,7 @@ mod tests {
         let dir = temp_dir("detect-compose-yml");
         fs::write(dir.join("docker-compose.yml"), "version: '3'").unwrap();
         let p = DockerProvider;
-        let result = p.detect(&dir, None);
+        let result = p.detect(&dir, None).expect("detection succeeds");
         assert!(result.is_some());
         let meta = result.unwrap().meta;
         assert_eq!(
@@ -258,7 +262,7 @@ mod tests {
         let dir = temp_dir("detect-compose-yaml");
         fs::write(dir.join("compose.yaml"), "services:").unwrap();
         let p = DockerProvider;
-        let result = p.detect(&dir, None);
+        let result = p.detect(&dir, None).expect("detection succeeds");
         assert!(result.is_some());
         let meta = result.unwrap().meta;
         assert_eq!(
@@ -273,7 +277,7 @@ mod tests {
         let dir = temp_dir("detect-compose-yml-short");
         fs::write(dir.join("compose.yml"), "services:").unwrap();
         let p = DockerProvider;
-        assert!(p.detect(&dir, None).is_some());
+        assert!(p.detect(&dir, None).unwrap().is_some());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -283,7 +287,7 @@ mod tests {
         fs::write(dir.join("Dockerfile"), "FROM node:20").unwrap();
         let p = DockerProvider;
         assert!(
-            p.detect(&dir, None).is_none(),
+            p.detect(&dir, None).unwrap().is_none(),
             "bare Dockerfile without compose should not be detected"
         );
         fs::remove_dir_all(&dir).ok();
@@ -294,7 +298,7 @@ mod tests {
         let dir = temp_dir("detect-nomatch");
         fs::write(dir.join("app.py"), "").unwrap();
         let p = DockerProvider;
-        assert!(p.detect(&dir, None).is_none());
+        assert!(p.detect(&dir, None).unwrap().is_none());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -304,7 +308,7 @@ mod tests {
         fs::write(dir.join("compose.yml"), "services:").unwrap();
         let manifest = serde_json::json!({ "kind": "docker" });
         let p = DockerProvider;
-        assert!(p.detect(&dir, Some(&manifest)).is_some());
+        assert!(p.detect(&dir, Some(&manifest)).unwrap().is_some());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -314,14 +318,14 @@ mod tests {
         fs::write(dir.join("compose.yml"), "").unwrap();
         fs::write(dir.join("docker-compose.yml"), "").unwrap();
         // docker-compose.yml has higher priority
-        assert_eq!(find_compose_file(&dir), Some("docker-compose.yml"));
+        assert_eq!(find_compose_file(&dir).unwrap(), Some("docker-compose.yml"));
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn find_compose_file_none() {
         let dir = temp_dir("compose-none");
-        assert_eq!(find_compose_file(&dir), None);
+        assert_eq!(find_compose_file(&dir).unwrap(), None);
         fs::remove_dir_all(&dir).ok();
     }
 

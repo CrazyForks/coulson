@@ -4,7 +4,9 @@ use anyhow::bail;
 use serde_json::Value;
 use tracing::warn;
 
-use super::provider::{DetectedApp, ListenTarget, ManagedApp, ProcessProvider, ProcessSpec};
+use super::provider::{
+    detection_path_exists, DetectedApp, ListenTarget, ManagedApp, ProcessProvider, ProcessSpec,
+};
 
 pub struct AsgiProvider;
 
@@ -17,28 +19,30 @@ impl ProcessProvider for AsgiProvider {
         "Python ASGI"
     }
 
-    fn detect(&self, dir: &Path, manifest: Option<&Value>) -> Option<DetectedApp> {
+    fn detect(&self, dir: &Path, manifest: Option<&Value>) -> anyhow::Result<Option<DetectedApp>> {
         // If manifest explicitly says kind=asgi, trust it.
         if let Some(m) = manifest {
             if m.get("kind").and_then(|v| v.as_str()) == Some("asgi") {
-                return Some(DetectedApp {
+                return Ok(Some(DetectedApp {
                     kind: "asgi".into(),
                     meta: Value::Null,
-                });
+                }));
             }
         }
 
         // Convention-based detection:
         // has (app.py || main.py) AND (pyproject.toml || requirements.txt)
-        let has_entry = dir.join("app.py").exists() || dir.join("main.py").exists();
-        let has_deps = dir.join("pyproject.toml").exists() || dir.join("requirements.txt").exists();
+        let has_entry = detection_path_exists(&dir.join("app.py"))?
+            || detection_path_exists(&dir.join("main.py"))?;
+        let has_deps = detection_path_exists(&dir.join("pyproject.toml"))?
+            || detection_path_exists(&dir.join("requirements.txt"))?;
         if has_entry && has_deps {
-            Some(DetectedApp {
+            Ok(Some(DetectedApp {
                 kind: "asgi".into(),
                 meta: Value::Null,
-            })
+            }))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -178,7 +182,7 @@ mod tests {
         fs::write(root.join("app.py"), "").unwrap();
         fs::write(root.join("requirements.txt"), "").unwrap();
         let provider = AsgiProvider;
-        let detected = provider.detect(&root, None);
+        let detected = provider.detect(&root, None).expect("detection succeeds");
         assert!(detected.is_some());
         assert_eq!(detected.unwrap().kind, "asgi");
         fs::remove_dir_all(&root).ok();
@@ -189,7 +193,9 @@ mod tests {
         let root = temp_app_dir("detect-asgi-manifest");
         let provider = AsgiProvider;
         let manifest = serde_json::json!({ "kind": "asgi" });
-        let detected = provider.detect(&root, Some(&manifest));
+        let detected = provider
+            .detect(&root, Some(&manifest))
+            .expect("detection succeeds");
         assert!(detected.is_some());
         fs::remove_dir_all(&root).ok();
     }
@@ -199,7 +205,10 @@ mod tests {
         let root = temp_app_dir("detect-asgi-nomatch");
         fs::write(root.join("index.html"), "").unwrap();
         let provider = AsgiProvider;
-        assert!(provider.detect(&root, None).is_none());
+        assert!(provider
+            .detect(&root, None)
+            .expect("detection succeeds")
+            .is_none());
         fs::remove_dir_all(&root).ok();
     }
 

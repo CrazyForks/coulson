@@ -5,7 +5,8 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::provider::{
-    resolve_port, DetectedApp, ListenTarget, ManagedApp, ProcessProvider, ProcessSpec,
+    read_optional_detection_file, resolve_port, DetectedApp, ListenTarget, ManagedApp,
+    ProcessProvider, ProcessSpec,
 };
 
 /// Spec for a companion process (no listen_target, no PORT).
@@ -33,28 +34,23 @@ const PROCFILE_DEV: &str = "Procfile.dev";
 const PROCFILE: &str = "Procfile";
 
 /// Read the Procfile content, preferring `Procfile.dev` over `Procfile`.
-fn read_procfile(dir: &Path) -> Option<String> {
+fn read_procfile(dir: &Path) -> anyhow::Result<Option<String>> {
     let dev = dir.join(PROCFILE_DEV);
-    if dev.exists() {
-        if let Ok(content) = std::fs::read_to_string(&dev) {
-            return Some(content);
-        }
+    if let Some(content) = read_optional_detection_file(&dev)? {
+        return Ok(Some(content));
     }
     let standard = dir.join(PROCFILE);
-    if standard.exists() {
-        if let Ok(content) = std::fs::read_to_string(&standard) {
-            return Some(content);
-        }
+    if let Some(content) = read_optional_detection_file(&standard)? {
+        return Ok(Some(content));
     }
-    None
+    Ok(None)
 }
 
 /// Check if parsed procfile content contains a `web` process type.
-fn has_web_process(content: &str) -> bool {
-    procfile::parse(content)
-        .ok()
-        .and_then(|procs| procs.get("web").map(|_| ()))
-        .is_some()
+fn has_web_process(content: &str) -> anyhow::Result<bool> {
+    let processes = procfile::parse(content)
+        .map_err(|err| anyhow::anyhow!("failed to parse Procfile: {err}"))?;
+    Ok(processes.contains_key("web"))
 }
 
 impl ProcfileProvider {
@@ -66,7 +62,7 @@ impl ProcfileProvider {
         process_type: &str,
     ) -> anyhow::Result<CompanionSpec> {
         let root = &app.root;
-        let content = read_procfile(root)
+        let content = read_procfile(root)?
             .ok_or_else(|| anyhow::anyhow!("no Procfile found in {}", root.display()))?;
         let procs = procfile::parse(&content)
             .map_err(|e| anyhow::anyhow!("failed to parse Procfile: {e}"))?;
@@ -101,29 +97,31 @@ impl ProcessProvider for ProcfileProvider {
         "Procfile"
     }
 
-    fn detect(&self, dir: &Path, manifest: Option<&Value>) -> Option<DetectedApp> {
+    fn detect(&self, dir: &Path, manifest: Option<&Value>) -> anyhow::Result<Option<DetectedApp>> {
         // 1. manifest kind: "procfile" → direct match
         if let Some(m) = manifest {
             if m.get("kind").and_then(|v| v.as_str()) == Some("procfile") {
-                return Some(DetectedApp {
+                return Ok(Some(DetectedApp {
                     kind: "procfile".into(),
                     meta: Value::Null,
-                });
+                }));
             }
         }
 
         // 2. Read Procfile.dev (preferred) or Procfile
-        let content = read_procfile(dir)?;
+        let Some(content) = read_procfile(dir)? else {
+            return Ok(None);
+        };
 
         // 3. Must have a "web" process type
-        if has_web_process(&content) {
+        if has_web_process(&content)? {
             debug!(dir = %dir.display(), "detected Procfile with web process");
-            Some(DetectedApp {
+            Ok(Some(DetectedApp {
                 kind: "procfile".into(),
                 meta: Value::Null,
-            })
+            }))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -150,7 +148,7 @@ impl ProcessProvider for ProcfileProvider {
         }
 
         // 2. Read Procfile.dev / Procfile
-        let content = read_procfile(root)
+        let content = read_procfile(root)?
             .ok_or_else(|| anyhow::anyhow!("no Procfile found in {}", root.display()))?;
 
         // 3. Parse and extract web process
@@ -217,7 +215,7 @@ mod tests {
         )
         .unwrap();
         let p = ProcfileProvider;
-        assert!(p.detect(&dir, None).is_some());
+        assert!(p.detect(&dir, None).unwrap().is_some());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -227,7 +225,7 @@ mod tests {
         fs::write(dir.join("Procfile"), "web: rails s").unwrap();
         fs::write(dir.join("Procfile.dev"), "web: bin/dev").unwrap();
         let p = ProcfileProvider;
-        assert!(p.detect(&dir, None).is_some());
+        assert!(p.detect(&dir, None).unwrap().is_some());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -236,7 +234,7 @@ mod tests {
         let dir = temp_dir("detect-no-web");
         fs::write(dir.join("Procfile"), "worker: bundle exec sidekiq").unwrap();
         let p = ProcfileProvider;
-        assert!(p.detect(&dir, None).is_none());
+        assert!(p.detect(&dir, None).unwrap().is_none());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -244,7 +242,7 @@ mod tests {
     fn detect_no_procfile() {
         let dir = temp_dir("detect-none");
         let p = ProcfileProvider;
-        assert!(p.detect(&dir, None).is_none());
+        assert!(p.detect(&dir, None).unwrap().is_none());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -253,7 +251,7 @@ mod tests {
         let dir = temp_dir("detect-manifest");
         let manifest = serde_json::json!({ "kind": "procfile" });
         let p = ProcfileProvider;
-        assert!(p.detect(&dir, Some(&manifest)).is_some());
+        assert!(p.detect(&dir, Some(&manifest)).unwrap().is_some());
         fs::remove_dir_all(&dir).ok();
     }
 

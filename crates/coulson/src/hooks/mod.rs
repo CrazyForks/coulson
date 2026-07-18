@@ -484,4 +484,46 @@ webhook = "https://hooks.example.com/ready"
         let ar = config.app_ready.as_ref().unwrap();
         assert_eq!(ar.run.as_deref(), Some("mise run db:migrate"));
     }
+
+    #[test]
+    fn process_context_keeps_provider_kind_with_normalized_snapshot() {
+        let base = std::env::temp_dir().join(format!(
+            "coulson-test-hook-provider-kind-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let repo =
+            crate::store::AppRepository::new(&base.join("state.sqlite"), "coulson.local").unwrap();
+        repo.init_schema().unwrap();
+        let domain = crate::domain::DomainName("dock.coulson.local".to_string());
+        let root = base.join("dock");
+        let (app, _) = repo
+            .upsert_scanned_managed(
+                "dock",
+                &domain,
+                root.to_str().unwrap(),
+                "docker",
+                true,
+                "apps_root",
+                "dock",
+                None,
+            )
+            .unwrap();
+        assert_eq!(app.kind, crate::domain::AppKind::Container);
+
+        let factory = HookContextFactory::new(80, None, true, false, "coulson.local".to_string());
+        let ctx = factory.context_for_process(
+            HookEvent::AppStop,
+            app.id.0,
+            "dock",
+            &root,
+            "docker",
+            Some(&app),
+        );
+        assert_eq!(ctx.app_kind.as_deref(), Some("docker"));
+        assert_eq!(ctx.app_domain.as_deref(), Some("dock.coulson.local"));
+        assert_eq!(ctx.app_root.as_deref(), Some(root.as_path()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

@@ -5,7 +5,8 @@ use serde_json::Value;
 use tracing::debug;
 
 use super::provider::{
-    resolve_port, DetectedApp, ListenTarget, ManagedApp, ProcessProvider, ProcessSpec,
+    read_optional_detection_file, resolve_port, DetectedApp, ListenTarget, ManagedApp,
+    ProcessProvider, ProcessSpec,
 };
 
 /// Node.js provider — manages Node applications via `package.json` scripts.
@@ -23,41 +24,40 @@ impl ProcessProvider for NodeProvider {
         "Node.js"
     }
 
-    fn detect(&self, dir: &Path, manifest: Option<&Value>) -> Option<DetectedApp> {
+    fn detect(&self, dir: &Path, manifest: Option<&Value>) -> anyhow::Result<Option<DetectedApp>> {
         if let Some(m) = manifest {
             if m.get("kind").and_then(|v| v.as_str()) == Some("node") {
-                return Some(DetectedApp {
+                return Ok(Some(DetectedApp {
                     kind: "node".into(),
                     meta: Value::Null,
-                });
+                }));
             }
         }
 
         // If a Procfile with a web process exists, defer to ProcfileProvider —
         // the developer explicitly defined a start command.
-        if has_procfile_web(dir) {
-            return None;
+        if has_procfile_web(dir)? {
+            return Ok(None);
         }
 
         // Convention: package.json with scripts.dev or scripts.start
         let pkg_path = dir.join("package.json");
-        if pkg_path.exists() {
-            if let Ok(raw) = std::fs::read_to_string(&pkg_path) {
-                if let Ok(pkg) = serde_json::from_str::<Value>(&raw) {
-                    let scripts = pkg.get("scripts");
-                    if let Some(s) = scripts {
-                        if s.get("dev").is_some() || s.get("start").is_some() {
-                            return Some(DetectedApp {
-                                kind: "node".into(),
-                                meta: Value::Null,
-                            });
-                        }
-                    }
+        if let Some(raw) = read_optional_detection_file(&pkg_path)? {
+            let pkg = serde_json::from_str::<Value>(&raw).map_err(|err| {
+                anyhow::anyhow!("invalid provider marker {}: {err}", pkg_path.display())
+            })?;
+            let scripts = pkg.get("scripts");
+            if let Some(s) = scripts {
+                if s.get("dev").is_some() || s.get("start").is_some() {
+                    return Ok(Some(DetectedApp {
+                        kind: "node".into(),
+                        meta: Value::Null,
+                    }));
                 }
             }
         }
 
-        None
+        Ok(None)
     }
 
     fn resolve(&self, app: &ManagedApp) -> anyhow::Result<ProcessSpec> {
@@ -229,18 +229,18 @@ fn detect_main_entry(root: &Path, pkg: &Value) -> anyhow::Result<String> {
 }
 
 /// Check if a Procfile.dev or Procfile with a `web:` process exists.
-fn has_procfile_web(dir: &Path) -> bool {
-    let content = if let Ok(c) = std::fs::read_to_string(dir.join("Procfile.dev")) {
-        c
-    } else if let Ok(c) = std::fs::read_to_string(dir.join("Procfile")) {
-        c
+fn has_procfile_web(dir: &Path) -> anyhow::Result<bool> {
+    let content = if let Some(content) = read_optional_detection_file(&dir.join("Procfile.dev"))? {
+        content
+    } else if let Some(content) = read_optional_detection_file(&dir.join("Procfile"))? {
+        content
     } else {
-        return false;
+        return Ok(false);
     };
-    content.lines().any(|l| {
+    Ok(content.lines().any(|l| {
         let trimmed = l.trim();
         trimmed.starts_with("web:") || trimmed.starts_with("web :")
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -266,7 +266,7 @@ mod tests {
         )
         .unwrap();
         let p = NodeProvider;
-        assert!(p.detect(&dir, None).is_some());
+        assert!(p.detect(&dir, None).unwrap().is_some());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -279,7 +279,7 @@ mod tests {
         )
         .unwrap();
         let p = NodeProvider;
-        assert!(p.detect(&dir, None).is_some());
+        assert!(p.detect(&dir, None).unwrap().is_some());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -288,7 +288,7 @@ mod tests {
         let dir = temp_dir("detect-noscripts");
         fs::write(dir.join("package.json"), r#"{"name":"foo"}"#).unwrap();
         let p = NodeProvider;
-        assert!(p.detect(&dir, None).is_none());
+        assert!(p.detect(&dir, None).unwrap().is_none());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -296,7 +296,7 @@ mod tests {
     fn detect_node_no_match() {
         let dir = temp_dir("detect-nomatch");
         let p = NodeProvider;
-        assert!(p.detect(&dir, None).is_none());
+        assert!(p.detect(&dir, None).unwrap().is_none());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -391,7 +391,10 @@ mod tests {
         .unwrap();
         fs::write(dir.join("Procfile"), "web: bin/rails s -p $PORT").unwrap();
         let p = NodeProvider;
-        assert!(p.detect(&dir, None).is_none(), "should defer to Procfile");
+        assert!(
+            p.detect(&dir, None).unwrap().is_none(),
+            "should defer to Procfile"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -406,7 +409,7 @@ mod tests {
         fs::write(dir.join("Procfile"), "worker: sidekiq").unwrap();
         let p = NodeProvider;
         assert!(
-            p.detect(&dir, None).is_some(),
+            p.detect(&dir, None).unwrap().is_some(),
             "no web: in Procfile, should still detect Node"
         );
         fs::remove_dir_all(&dir).ok();
@@ -424,7 +427,7 @@ mod tests {
         let manifest = serde_json::json!({ "kind": "node" });
         let p = NodeProvider;
         assert!(
-            p.detect(&dir, Some(&manifest)).is_some(),
+            p.detect(&dir, Some(&manifest)).unwrap().is_some(),
             "kind=node should force Node provider"
         );
         fs::remove_dir_all(&dir).ok();

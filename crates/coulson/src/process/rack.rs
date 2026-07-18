@@ -2,7 +2,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use super::provider::{DetectedApp, ManagedApp, ProcessProvider, ProcessSpec};
+use super::provider::{
+    detection_path_exists, DetectedApp, ManagedApp, ProcessProvider, ProcessSpec,
+};
 
 /// Rack/Puma provider — manages Ruby Rack applications.
 ///
@@ -20,25 +22,25 @@ impl ProcessProvider for RackProvider {
         "Ruby Rack"
     }
 
-    fn detect(&self, dir: &Path, manifest: Option<&Value>) -> Option<DetectedApp> {
+    fn detect(&self, dir: &Path, manifest: Option<&Value>) -> anyhow::Result<Option<DetectedApp>> {
         if let Some(m) = manifest {
             if m.get("kind").and_then(|v| v.as_str()) == Some("rack") {
-                return Some(DetectedApp {
+                return Ok(Some(DetectedApp {
                     kind: "rack".into(),
                     meta: Value::Null,
-                });
+                }));
             }
         }
 
         // Convention: config.ru + Gemfile
-        if dir.join("config.ru").exists() {
-            return Some(DetectedApp {
+        if detection_path_exists(&dir.join("config.ru"))? {
+            return Ok(Some(DetectedApp {
                 kind: "rack".into(),
                 meta: Value::Null,
-            });
+            }));
         }
 
-        None
+        Ok(None)
     }
 
     fn resolve(&self, _app: &ManagedApp) -> anyhow::Result<ProcessSpec> {
@@ -65,7 +67,7 @@ mod tests {
         let dir = temp_dir("detect-configru");
         fs::write(dir.join("config.ru"), "run MyApp").unwrap();
         let p = RackProvider;
-        assert!(p.detect(&dir, None).is_some());
+        assert!(p.detect(&dir, None).expect("detection succeeds").is_some());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -74,7 +76,10 @@ mod tests {
         let dir = temp_dir("detect-manifest");
         let p = RackProvider;
         let m = serde_json::json!({ "kind": "rack" });
-        assert!(p.detect(&dir, Some(&m)).is_some());
+        assert!(p
+            .detect(&dir, Some(&m))
+            .expect("detection succeeds")
+            .is_some());
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -83,7 +88,7 @@ mod tests {
         let dir = temp_dir("detect-nomatch");
         fs::write(dir.join("index.html"), "").unwrap();
         let p = RackProvider;
-        assert!(p.detect(&dir, None).is_none());
+        assert!(p.detect(&dir, None).expect("detection succeeds").is_none());
         fs::remove_dir_all(&dir).ok();
     }
 }

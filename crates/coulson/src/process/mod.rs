@@ -551,8 +551,6 @@ impl ProcessManager {
             return Err(e);
         }
 
-        self.fire_hook(HookEvent::AppReady, app_id, name, root, kind, &app_row);
-
         let companions = self.spawn_companions(
             app_id,
             name,
@@ -569,24 +567,54 @@ impl ProcessManager {
 
         let app_idle_timeout = manifest_idle_timeout(&manifest);
         let now = Instant::now();
-        self.processes.insert(
-            app_id,
-            ProcessGroup {
-                primary: ManagedProcess {
-                    handle,
-                    listen_target: spec.listen_target.clone(),
-                    started_at: now,
-                    last_active: now,
-                    kind: kind.to_string(),
-                    ready: true,
-                    resolved_env,
-                },
-                companions,
-                name: name.to_string(),
-                root: root.to_path_buf(),
-                idle_timeout: app_idle_timeout,
-                app_snapshot: app_row,
+        let group = ProcessGroup {
+            primary: ManagedProcess {
+                handle,
+                listen_target: spec.listen_target.clone(),
+                started_at: now,
+                last_active: now,
+                kind: kind.to_string(),
+                ready: true,
+                resolved_env,
             },
+            companions,
+            name: name.to_string(),
+            root: root.to_path_buf(),
+            idle_timeout: app_idle_timeout,
+            app_snapshot: app_row,
+        };
+        let ready_snapshot = group.app_snapshot.clone();
+        if let Err((err, group)) = self.commit_process_group(app_id, name, root, kind, group) {
+            let ProcessGroup {
+                primary,
+                companions,
+                name,
+                root,
+                app_snapshot,
+                ..
+            } = *group;
+            for companion in companions {
+                kill_handle(companion.handle).await;
+            }
+            cleanup_listen_target(&primary.listen_target);
+            kill_handle(primary.handle).await;
+            self.fire_hook(
+                HookEvent::AppStop,
+                app_id,
+                &name,
+                &root,
+                kind,
+                &app_snapshot,
+            );
+            return Err(err.context("app changed while process was starting"));
+        }
+        self.fire_hook(
+            HookEvent::AppReady,
+            app_id,
+            name,
+            root,
+            kind,
+            &ready_snapshot,
         );
 
         Ok(spec.listen_target)
@@ -791,25 +819,46 @@ impl ProcessManager {
 
         let app_idle_timeout = manifest_idle_timeout(&manifest);
         let now = Instant::now();
-        self.processes.insert(
-            app_id,
-            ProcessGroup {
-                primary: ManagedProcess {
-                    handle,
-                    listen_target: spec.listen_target,
-                    started_at: now,
-                    last_active: now,
-                    kind: kind.to_string(),
-                    ready: false,
-                    resolved_env,
-                },
-                companions,
-                name: name.to_string(),
-                root: root.to_path_buf(),
-                idle_timeout: app_idle_timeout,
-                app_snapshot: app_row,
+        let group = ProcessGroup {
+            primary: ManagedProcess {
+                handle,
+                listen_target: spec.listen_target,
+                started_at: now,
+                last_active: now,
+                kind: kind.to_string(),
+                ready: false,
+                resolved_env,
             },
-        );
+            companions,
+            name: name.to_string(),
+            root: root.to_path_buf(),
+            idle_timeout: app_idle_timeout,
+            app_snapshot: app_row,
+        };
+        if let Err((err, group)) = self.commit_process_group(app_id, name, root, kind, group) {
+            let ProcessGroup {
+                primary,
+                companions,
+                name,
+                root,
+                app_snapshot,
+                ..
+            } = *group;
+            for companion in companions {
+                kill_handle(companion.handle).await;
+            }
+            cleanup_listen_target(&primary.listen_target);
+            kill_handle(primary.handle).await;
+            self.fire_hook(
+                HookEvent::AppStop,
+                app_id,
+                &name,
+                &root,
+                kind,
+                &app_snapshot,
+            );
+            return Err(err.context("app changed while process was starting"));
+        }
 
         Ok(EnsureStarted::Status(StartStatus::Starting))
     }
@@ -1001,6 +1050,16 @@ impl ProcessManager {
             .store
             .get_by_id(app_id)
             .context("store lookup before spawn")?;
+        Self::validate_app_snapshot(row, app_id, name, root, kind)
+    }
+
+    fn validate_app_snapshot(
+        row: Option<crate::domain::AppSpec>,
+        app_id: i64,
+        name: &str,
+        root: &Path,
+        kind: &str,
+    ) -> anyhow::Result<crate::domain::AppSpec> {
         let current = row.filter(|app| match &app.target {
             crate::domain::BackendTarget::Managed {
                 root: r,
@@ -1016,6 +1075,45 @@ impl ProcessManager {
                 anyhow::bail!("app {name} (id={app_id}) was removed or changed; refusing to start")
             }
         }
+    }
+
+    fn acquire_spawn_commit<'a>(
+        store: &'a crate::store::AppRepository,
+        app_id: i64,
+        name: &str,
+        root: &Path,
+        kind: &str,
+    ) -> anyhow::Result<crate::store::StoreTxn<'a>> {
+        let txn = store
+            .begin_write()
+            .context("failed to acquire spawn commit guard")?;
+        let row = txn
+            .get_by_id(app_id)
+            .context("store lookup at spawn commit")?;
+        Self::validate_app_snapshot(row, app_id, name, root, kind)?;
+        Ok(txn)
+    }
+
+    /// Atomically bridge durable desired state and the in-memory process map.
+    /// The SQLite writer guard prevents both in-process and offline scanners
+    /// from committing a rewrite/prune after validation but before the group
+    /// becomes visible to teardown/reconciliation.
+    fn commit_process_group(
+        &mut self,
+        app_id: i64,
+        name: &str,
+        root: &Path,
+        kind: &str,
+        group: ProcessGroup,
+    ) -> Result<(), (anyhow::Error, Box<ProcessGroup>)> {
+        let store = self.store.clone();
+        let spawn_commit = match Self::acquire_spawn_commit(&store, app_id, name, root, kind) {
+            Ok(txn) => txn,
+            Err(err) => return Err((err, Box::new(group))),
+        };
+        self.processes.insert(app_id, group);
+        drop(spawn_commit);
+        Ok(())
     }
 
     /// Kill all managed processes (called on daemon shutdown).
@@ -3502,6 +3600,51 @@ OVERRIDE = "toml_wins"
         assert!(pm
             .validate_app_current(app.id.0, "other", &root, "procfile")
             .is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spawn_commit_guard_serializes_offline_writer() {
+        let dir =
+            std::env::temp_dir().join(format!("coulson-test-spawn-commit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("db.sqlite");
+        let store = crate::store::AppRepository::new(&db_path, "coulson.local").unwrap();
+        store.init_schema().unwrap();
+        let root = dir.join("myapp");
+        let domain = crate::domain::DomainName("myapp.coulson.local".to_string());
+        let (app, _) = store
+            .upsert_scanned_managed(
+                "myapp",
+                &domain,
+                root.to_str().unwrap(),
+                "procfile",
+                true,
+                "fs",
+                "e",
+                None,
+            )
+            .unwrap();
+
+        let guard =
+            ProcessManager::acquire_spawn_commit(&store, app.id.0, "myapp", &root, "procfile")
+                .expect("spawn commit guard");
+        let offline = crate::store::AppRepository::new(&db_path, "coulson.local").unwrap();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            attempt_tx.send(()).unwrap();
+            let acquired = offline.begin_write().is_ok();
+            acquired_tx.send(acquired).unwrap();
+        });
+        attempt_rx.recv().unwrap();
+        assert!(acquired_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        drop(guard);
+        assert!(acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        writer.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 }

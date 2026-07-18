@@ -1756,7 +1756,7 @@ fn run_add_directory_inner(
     };
 
     let registry = process::default_registry();
-    if let Some((_provider, detected)) = registry.detect(cwd, manifest.as_ref()) {
+    if let Some((_provider, detected)) = registry.detect(cwd, manifest.as_ref())? {
         std::fs::create_dir_all(&cfg.apps_root)?;
         #[cfg(unix)]
         std::os::unix::fs::symlink(cwd, &link_path).with_context(|| {

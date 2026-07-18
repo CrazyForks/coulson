@@ -598,8 +598,22 @@ fn discover(
                 continue;
             }
 
-            // Auto-detect managed app via provider registry
-            if let Some((_provider, detected)) = registry.detect(&entry.path(), None) {
+            // Auto-detect managed app via provider registry. A provider error
+            // is not a non-match: protect the existing row and do not fall
+            // through to `public/`, which could rewrite a managed app as
+            // static while its metadata is only half-written.
+            let detected = match registry.detect(&entry.path(), None) {
+                Ok(result) => result,
+                Err(err) => {
+                    indeterminate_entries.push(dir_name.clone());
+                    parse_warnings.push(format!(
+                        "{}: provider detection indeterminate ({err}); entry left untouched",
+                        entry.path().display()
+                    ));
+                    continue;
+                }
+            };
+            if let Some((_provider, detected)) = detected {
                 let domain_text = file_name_to_domain(&dir_name, suffix);
                 let domain = DomainName::parse(&domain_text, suffix).with_context(|| {
                     format!(
@@ -660,14 +674,6 @@ fn discover(
                     hooks: None,
                 };
                 insert_with_priority(&mut by_route, &mut conflicts, app);
-            } else {
-                // The entry exists but nothing classified it. Provider
-                // detection swallows read/parse errors internally (e.g. a
-                // truncated package.json mid-rewrite), so a non-match is NOT
-                // proof the app is gone — only entry removal is. Protect the
-                // entry's rows from this scan's prune; junk directories have
-                // no rows, so protection is a no-op for them.
-                indeterminate_entries.push(dir_name.clone());
             }
         }
     }
@@ -850,8 +856,20 @@ fn discover_from_symlink(
             return Ok(out);
         }
 
-        // Auto-detect managed app via provider registry
-        if let Some((_prov, detected)) = registry.detect(&resolved_target, None) {
+        // Auto-detect managed app via provider registry. Preserve the same
+        // Match / NoMatch / Indeterminate distinction as direct directories.
+        let detected = match registry.detect(&resolved_target, None) {
+            Ok(result) => result,
+            Err(err) => {
+                indeterminate_entries.push(file_name.to_string());
+                outer_parse_warnings.push(format!(
+                    "{}: provider detection indeterminate ({err}); entry left untouched",
+                    resolved_target.display()
+                ));
+                return Ok(Vec::new());
+            }
+        };
+        if let Some((_prov, detected)) = detected {
             let root_str = resolved_target.to_string_lossy().to_string();
             let app_kind = kind_str_to_app_kind(&detected.kind);
             return Ok(vec![DiscoveredStaticApp {
@@ -898,10 +916,6 @@ fn discover_from_symlink(
         }
     }
 
-    // Symlink target exists but nothing classified it (provider detection
-    // swallows its own errors) — same contract as the directory branch:
-    // a non-match must not read as absence, so protect the entry's rows.
-    indeterminate_entries.push(file_name.to_string());
     Ok(Vec::new())
 }
 
@@ -933,7 +947,9 @@ fn manifest_to_discovered_apps(
 
     // Build a serde_json::Value from manifest for provider detection
     let manifest_value = manifest_to_json_value(manifest);
-    let is_managed = registry.detect(dir_path, Some(&manifest_value));
+    let is_managed = registry
+        .detect(dir_path, Some(&manifest_value))
+        .with_context(|| format!("provider detection failed in {}", dir_path.display()))?;
 
     if let Some((_prov, detected)) = is_managed {
         let root_str = dir_path.to_string_lossy().to_string();
@@ -1414,16 +1430,23 @@ mod tests {
         std::fs::write(base.join("okapp"), "5006\n").expect("write ok");
 
         // A directory whose provider metadata is momentarily unusable (e.g.
-        // package.json truncated mid-rewrite): detection finds nothing, but
-        // that is a classification failure, not absence.
+        // package.json truncated mid-rewrite). `public/` is deliberately
+        // present: detection uncertainty must not fall through and rewrite
+        // the managed route as static.
         std::fs::create_dir_all(base.join("nodeapp")).expect("mkdir nodeapp");
         std::fs::write(base.join("nodeapp/package.json"), "{ trunca").expect("write trunc");
+        std::fs::create_dir_all(base.join("nodeapp/public")).expect("mkdir public");
+
+        // A definitive non-match must remain removable. This models a retired
+        // app whose last provider/static marker was intentionally deleted
+        // while its now-empty directory still exists.
+        std::fs::create_dir_all(base.join("retired")).expect("mkdir retired");
 
         let registry = crate::process::default_registry();
         let result = discover(&base, "coulson.local", &registry, &[]).expect("discover");
-        // Unreadable / unclassifiable entries are neither routes nor absent:
-        // they land in the indeterminate set (protecting their rows from
-        // prune), while the healthy entry is discovered normally.
+        // Only actual detection errors enter the indeterminate set. The
+        // definite non-match is omitted, allowing an old row it owned to be
+        // pruned, while the healthy entry is discovered normally.
         let mut indeterminate = result.indeterminate_entries.clone();
         indeterminate.sort();
         assert_eq!(
@@ -1433,6 +1456,50 @@ mod tests {
         assert_eq!(result.apps.len(), 1);
         assert_eq!(result.apps[0].fs_entry, "okapp");
         assert!(result.parse_warnings.iter().any(|w| w.contains("myapp")));
+        assert!(result
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("nodeapp") && w.contains("provider detection indeterminate")));
+
+        // End-to-end prune distinction: the invalid Node entry survives even
+        // with public/ present, while the definitive non-match is removed.
+        let repo = crate::store::AppRepository::new(&base.join("state.sqlite"), "coulson.local")
+            .expect("open store");
+        repo.init_schema().expect("schema");
+        let node_domain = DomainName("nodeapp.coulson.local".to_string());
+        let retired_domain = DomainName("retired.coulson.local".to_string());
+        let (node_row, _) = repo
+            .upsert_scanned_managed(
+                "nodeapp",
+                &node_domain,
+                base.join("nodeapp").to_str().unwrap(),
+                "node",
+                true,
+                "apps_root",
+                "nodeapp",
+                None,
+            )
+            .expect("seed node row");
+        let (retired_row, _) = repo
+            .upsert_scanned_managed(
+                "retired",
+                &retired_domain,
+                base.join("retired").to_str().unwrap(),
+                "node",
+                true,
+                "apps_root",
+                "retired",
+                None,
+            )
+            .expect("seed retired row");
+        let protected: HashSet<String> = result.indeterminate_entries.into_iter().collect();
+        let pruned = repo
+            .prune_scanned_not_in("apps_root", &HashSet::new(), &protected)
+            .expect("prune");
+        assert!(repo.get_by_id(node_row.id.0).unwrap().is_some());
+        assert!(repo.get_by_id(retired_row.id.0).unwrap().is_none());
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].id, retired_row.id);
         let _ = std::fs::remove_dir_all(&base);
     }
 
