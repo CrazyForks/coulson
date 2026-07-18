@@ -41,6 +41,12 @@ pub struct StaticAppInput<'a> {
 
 pub struct AppRepository {
     pub(crate) conn: Mutex<Connection>,
+    /// Dedicated read connection (WAL mode): readers see the last committed
+    /// snapshot and never queue behind a long write transaction — store
+    /// reads taken under the process-manager lock must not stall for the
+    /// duration of a scan's `StoreTxn`. `None` for in-memory test databases
+    /// (falls back to the write connection).
+    pub(crate) read_conn: Option<Mutex<Connection>>,
     pub(crate) domain_suffix: String,
     pub(crate) change_tx: Option<broadcast::Sender<String>>,
 }
@@ -75,11 +81,31 @@ impl AppRepository {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open sqlite db: {}", path.display()))?;
+        // Write transactions are taken by both the daemon and offline
+        // `coulson scan` against the same file; wait out the other side's
+        // BEGIN IMMEDIATE instead of failing with SQLITE_BUSY.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // WAL so the dedicated read connection below can read the last
+        // committed snapshot while a write transaction is open.
+        let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        let read_conn = Connection::open(path)
+            .with_context(|| format!("failed to open sqlite db (read): {}", path.display()))?;
+        read_conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            read_conn: Some(Mutex::new(read_conn)),
             domain_suffix: domain_suffix.to_string(),
             change_tx: None,
         })
+    }
+
+    /// Lock the read connection (or the write connection when no separate
+    /// reader exists, e.g. in-memory test databases).
+    fn reader(&self) -> parking_lot::MutexGuard<'_, Connection> {
+        match &self.read_conn {
+            Some(rc) => rc.lock(),
+            None => self.conn.lock(),
+        }
     }
 
     pub fn init_schema(&self) -> anyhow::Result<()> {
@@ -92,7 +118,7 @@ impl AppRepository {
             );
 
             CREATE TABLE IF NOT EXISTS apps (
-              id INTEGER PRIMARY KEY,
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
               name TEXT NOT NULL UNIQUE,
               kind TEXT NOT NULL,
               domain TEXT NOT NULL,
@@ -123,6 +149,7 @@ impl AppRepository {
               lan_access INTEGER NOT NULL DEFAULT 0,
               cname TEXT,
               fs_entry TEXT,
+              hooks TEXT,
               UNIQUE(domain, path_prefix)
             );
 
@@ -154,6 +181,12 @@ impl AppRepository {
             "#,
         )?;
 
+        // Structural v1 migration FIRST: it rebuilds `apps` from a hardcoded
+        // v1 column list, so it must run against the actual v1 shape. Running
+        // it after the additive columns below would silently drop every one
+        // of them from the rebuilt table.
+        migrate_apps_domain_unique_to_route_unique(&conn)?;
+
         // Migrations for databases created before all columns existed.
         // New databases already have every column via CREATE TABLE above,
         // so these are no-ops (add_column_if_missing silently skips).
@@ -176,11 +209,14 @@ impl AppRepository {
             "ALTER TABLE apps ADD COLUMN lan_access INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE apps ADD COLUMN cname TEXT",
             "ALTER TABLE apps ADD COLUMN fs_entry TEXT",
+            "ALTER TABLE apps ADD COLUMN hooks TEXT",
         ] {
             add_column_if_missing(&conn, sql)?;
         }
 
-        migrate_apps_domain_unique_to_route_unique(&conn)?;
+        // Runs last: rebuilds from the live sqlite_master schema text, so it
+        // preserves whatever columns exist at this point.
+        migrate_apps_id_autoincrement(&conn)?;
         Ok(())
     }
 
@@ -260,6 +296,7 @@ impl AppRepository {
             lan_access: false,
             cname: None,
             fs_entry: None,
+            hooks: None,
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -332,6 +369,7 @@ impl AppRepository {
             lan_access: false,
             cname: None,
             fs_entry: None,
+            hooks: None,
             enabled: true,
             created_at: now,
             updated_at: now,
@@ -391,9 +429,29 @@ impl AppRepository {
             lan_access: false,
             cname: None,
             fs_entry: None,
+            hooks: None,
             enabled: true,
             created_at: now,
             updated_at: now,
+        })
+    }
+
+    /// Open a write transaction (`BEGIN IMMEDIATE`) that also holds the
+    /// in-process connection lock until commit or drop (rollback).
+    ///
+    /// "An app exists" spans a DB row plus an apps_root fs entry, and every
+    /// mutation of that pair — scan upsert/prune, explicit delete — runs
+    /// inside one of these. In-process the connection lock serializes them;
+    /// across processes (the daemon vs an offline `coulson scan`) SQLite's
+    /// write lock does, so checking the filesystem from inside a write
+    /// transaction observes a state no other party can be mutating.
+    pub fn begin_write(&self) -> anyhow::Result<StoreTxn<'_>> {
+        let conn = self.conn.lock();
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        Ok(StoreTxn {
+            repo: self,
+            conn,
+            committed: false,
         })
     }
 
@@ -403,11 +461,129 @@ impl AppRepository {
         enabled: bool,
         source: &str,
         fs_entry: &str,
+        hooks: Option<&crate::hooks::AppHooksConfig>,
+    ) -> anyhow::Result<(AppSpec, ScanUpsertResult)> {
+        let txn = self.begin_write()?;
+        let result = txn.upsert_scanned_static(input, enabled, source, fs_entry, hooks)?;
+        txn.commit()?;
+        Ok(result)
+    }
+
+    /// Upsert a managed (ASGI, Rack, Node, Docker, etc.) app discovered by the scanner.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_scanned_managed(
+        &self,
+        name: &str,
+        domain: &DomainName,
+        app_root: &str,
+        kind: &str,
+        enabled: bool,
+        source: &str,
+        fs_entry: &str,
+        hooks: Option<&crate::hooks::AppHooksConfig>,
+    ) -> anyhow::Result<(AppSpec, ScanUpsertResult)> {
+        let txn = self.begin_write()?;
+        let result = txn.upsert_scanned_managed(
+            name, domain, app_root, kind, enabled, source, fs_entry, hooks,
+        )?;
+        txn.commit()?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_scanned_static_dir(
+        &self,
+        name: &str,
+        domain: &DomainName,
+        static_root: &str,
+        enabled: bool,
+        source: &str,
+        fs_entry: &str,
+        hooks: Option<&crate::hooks::AppHooksConfig>,
+    ) -> anyhow::Result<(AppSpec, ScanUpsertResult)> {
+        let txn = self.begin_write()?;
+        let result = txn.upsert_scanned_static_dir(
+            name,
+            domain,
+            static_root,
+            enabled,
+            source,
+            fs_entry,
+            hooks,
+        )?;
+        txn.commit()?;
+        Ok(result)
+    }
+
+    /// Remove scan-owned rows whose route disappeared, returning the removed
+    /// rows so the caller can tear down their processes and fire `app_stop`
+    /// hooks with full route context (after the delete, that data is gone).
+    /// Rows whose `fs_entry` is in `protected_fs_entries` are kept: their
+    /// entry exists but was unreadable this scan, which is not absence.
+    pub fn prune_scanned_not_in(
+        &self,
+        source: &str,
+        active_routes: &HashSet<String>,
+        protected_fs_entries: &HashSet<String>,
+    ) -> anyhow::Result<Vec<AppSpec>> {
+        let txn = self.begin_write()?;
+        let result = txn.prune_scanned_not_in(source, active_routes, protected_fs_entries)?;
+        txn.commit()?;
+        Ok(result)
+    }
+}
+
+/// See [`AppRepository::begin_write`].
+pub struct StoreTxn<'a> {
+    repo: &'a AppRepository,
+    conn: parking_lot::MutexGuard<'a, Connection>,
+    committed: bool,
+}
+
+impl Drop for StoreTxn<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+    }
+}
+
+impl StoreTxn<'_> {
+    pub fn commit(mut self) -> anyhow::Result<()> {
+        self.conn.execute_batch("COMMIT")?;
+        self.committed = true;
+        Ok(())
+    }
+
+    /// Read through the transaction's connection. Process startup uses this
+    /// while holding `BEGIN IMMEDIATE` across its final desired-state check and
+    /// in-memory group insertion, so an offline scanner cannot commit a prune
+    /// in the gap between those two operations.
+    pub fn get_by_id(&self, app_id: i64) -> anyhow::Result<Option<AppSpec>> {
+        let app = self
+            .conn
+            .query_row(
+                &format!("SELECT {} FROM apps WHERE id = ?1", COLS),
+                params![app_id],
+                |row| row_to_app(row, &self.repo.domain_suffix),
+            )
+            .optional()?;
+        Ok(app)
+    }
+
+    pub fn upsert_scanned_static(
+        &self,
+        input: &StaticAppInput,
+        enabled: bool,
+        source: &str,
+        fs_entry: &str,
+        hooks: Option<&crate::hooks::AppHooksConfig>,
     ) -> anyhow::Result<(AppSpec, ScanUpsertResult)> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        let conn = self.conn.lock();
+        let hooks_json: Option<String> = hooks.map(serde_json::to_string).transpose()?;
+        let conn = &*self.conn;
         let path_prefix_db = path_prefix_to_db(input.path_prefix);
-        let domain_db = domain_to_db(&input.domain.0, &self.domain_suffix);
+        let domain_db = domain_to_db(&input.domain.0, &self.repo.domain_suffix);
 
         let existing: Option<(i64, i64)> = conn
             .query_row(
@@ -421,7 +597,7 @@ impl AppRepository {
             Some((_id, 0)) => ScanUpsertResult::SkippedManual,
             Some((id, _)) => {
                 conn.execute(
-                    "UPDATE apps SET name = ?1, path_prefix = ?2, target_type = ?3, target_value = ?4, timeout_ms = ?5, updated_at = ?6, scan_managed = 1, scan_source = ?7, cors_enabled = ?8, force_https = ?9, basic_auth_user = ?10, basic_auth_pass = ?11, spa_rewrite = ?12, listen_port = ?13, fs_entry = ?14, enabled = ?15 WHERE id = ?16",
+                    "UPDATE apps SET name = ?1, path_prefix = ?2, target_type = ?3, target_value = ?4, timeout_ms = ?5, updated_at = ?6, scan_managed = 1, scan_source = ?7, cors_enabled = ?8, force_https = ?9, basic_auth_user = ?10, basic_auth_pass = ?11, spa_rewrite = ?12, listen_port = ?13, fs_entry = ?14, enabled = ?15, hooks = ?17 WHERE id = ?16",
                     params![
                         input.name,
                         path_prefix_db,
@@ -438,15 +614,16 @@ impl AppRepository {
                         input.listen_port.map(|v| v as i64),
                         fs_entry,
                         if enabled { 1 } else { 0 },
-                        id
+                        id,
+                        hooks_json
                     ],
                 )?;
                 ScanUpsertResult::Updated
             }
             None => {
                 conn.execute(
-                    "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, cors_enabled, force_https, basic_auth_user, basic_auth_pass, spa_rewrite, listen_port, fs_entry)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                    "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, cors_enabled, force_https, basic_auth_user, basic_auth_pass, spa_rewrite, listen_port, fs_entry, hooks)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                     params![
                         input.name,
                         "static",
@@ -466,18 +643,18 @@ impl AppRepository {
                         if input.spa_rewrite { 1 } else { 0 },
                         input.listen_port.map(|v| v as i64),
                         fs_entry,
+                        hooks_json,
                     ],
                 )?;
                 ScanUpsertResult::Inserted
             }
         };
 
-        let suffix = &self.domain_suffix;
-        let app = Self::read_app_by_route(&conn, &domain_db, &path_prefix_db, suffix)?;
+        let suffix = &self.repo.domain_suffix;
+        let app = AppRepository::read_app_by_route(conn, &domain_db, &path_prefix_db, suffix)?;
         Ok((app, op))
     }
 
-    /// Upsert a managed (ASGI, Rack, Node, Docker, etc.) app discovered by the scanner.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_scanned_managed(
         &self,
@@ -488,11 +665,13 @@ impl AppRepository {
         enabled: bool,
         source: &str,
         fs_entry: &str,
+        hooks: Option<&crate::hooks::AppHooksConfig>,
     ) -> anyhow::Result<(AppSpec, ScanUpsertResult)> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        let conn = self.conn.lock();
+        let hooks_json: Option<String> = hooks.map(serde_json::to_string).transpose()?;
+        let conn = &*self.conn;
         let path_prefix_db = "";
-        let domain_db = domain_to_db(&domain.0, &self.domain_suffix);
+        let domain_db = domain_to_db(&domain.0, &self.repo.domain_suffix);
 
         let existing: Option<(i64, i64)> = conn
             .query_row(
@@ -506,15 +685,15 @@ impl AppRepository {
             Some((_id, 0)) => ScanUpsertResult::SkippedManual,
             Some((id, _)) => {
                 conn.execute(
-                    "UPDATE apps SET name = ?1, kind = ?2, target_type = 'managed', target_value = ?3, updated_at = ?4, scan_managed = 1, scan_source = ?5, fs_entry = ?6, enabled = ?7 WHERE id = ?8",
-                    params![name, kind, app_root, now, source, fs_entry, if enabled { 1 } else { 0 }, id],
+                    "UPDATE apps SET name = ?1, kind = ?2, target_type = 'managed', target_value = ?3, updated_at = ?4, scan_managed = 1, scan_source = ?5, fs_entry = ?6, enabled = ?7, hooks = ?9 WHERE id = ?8",
+                    params![name, kind, app_root, now, source, fs_entry, if enabled { 1 } else { 0 }, id, hooks_json],
                 )?;
                 ScanUpsertResult::Updated
             }
             None => {
                 conn.execute(
-                    "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, fs_entry)
-                     VALUES (?1, ?2, ?3, ?4, 'managed', ?5, NULL, ?6, 1, ?7, ?8, ?9, ?10)",
+                    "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, fs_entry, hooks)
+                     VALUES (?1, ?2, ?3, ?4, 'managed', ?5, NULL, ?6, 1, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         name,
                         kind,
@@ -526,17 +705,19 @@ impl AppRepository {
                         now,
                         now,
                         fs_entry,
+                        hooks_json,
                     ],
                 )?;
                 ScanUpsertResult::Inserted
             }
         };
 
-        let suffix = &self.domain_suffix;
-        let app = Self::read_app_by_route(&conn, &domain_db, path_prefix_db, suffix)?;
+        let suffix = &self.repo.domain_suffix;
+        let app = AppRepository::read_app_by_route(conn, &domain_db, path_prefix_db, suffix)?;
         Ok((app, op))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_scanned_static_dir(
         &self,
         name: &str,
@@ -545,11 +726,13 @@ impl AppRepository {
         enabled: bool,
         source: &str,
         fs_entry: &str,
+        hooks: Option<&crate::hooks::AppHooksConfig>,
     ) -> anyhow::Result<(AppSpec, ScanUpsertResult)> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
-        let conn = self.conn.lock();
+        let hooks_json: Option<String> = hooks.map(serde_json::to_string).transpose()?;
+        let conn = &*self.conn;
         let path_prefix_db = "";
-        let domain_db = domain_to_db(&domain.0, &self.domain_suffix);
+        let domain_db = domain_to_db(&domain.0, &self.repo.domain_suffix);
 
         let existing: Option<(i64, i64)> = conn
             .query_row(
@@ -563,15 +746,15 @@ impl AppRepository {
             Some((_id, 0)) => ScanUpsertResult::SkippedManual,
             Some((id, _)) => {
                 conn.execute(
-                    "UPDATE apps SET name = ?1, kind = 'static', target_type = 'static_dir', target_value = ?2, updated_at = ?3, scan_managed = 1, scan_source = ?4, fs_entry = ?5, enabled = ?6 WHERE id = ?7",
-                    params![name, static_root, now, source, fs_entry, if enabled { 1 } else { 0 }, id],
+                    "UPDATE apps SET name = ?1, kind = 'static', target_type = 'static_dir', target_value = ?2, updated_at = ?3, scan_managed = 1, scan_source = ?4, fs_entry = ?5, enabled = ?6, hooks = ?8 WHERE id = ?7",
+                    params![name, static_root, now, source, fs_entry, if enabled { 1 } else { 0 }, id, hooks_json],
                 )?;
                 ScanUpsertResult::Updated
             }
             None => {
                 conn.execute(
-                    "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, fs_entry)
-                     VALUES (?1, 'static', ?2, ?3, 'static_dir', ?4, NULL, ?5, 1, ?6, ?7, ?8, ?9)",
+                    "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, fs_entry, hooks)
+                     VALUES (?1, 'static', ?2, ?3, 'static_dir', ?4, NULL, ?5, 1, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         name,
                         domain_db,
@@ -582,14 +765,15 @@ impl AppRepository {
                         now,
                         now,
                         fs_entry,
+                        hooks_json,
                     ],
                 )?;
                 ScanUpsertResult::Inserted
             }
         };
 
-        let suffix = &self.domain_suffix;
-        let app = Self::read_app_by_route(&conn, &domain_db, path_prefix_db, suffix)?;
+        let suffix = &self.repo.domain_suffix;
+        let app = AppRepository::read_app_by_route(conn, &domain_db, path_prefix_db, suffix)?;
         Ok((app, op))
     }
 
@@ -597,10 +781,11 @@ impl AppRepository {
         &self,
         source: &str,
         active_routes: &HashSet<String>,
-    ) -> anyhow::Result<usize> {
-        let conn = self.conn.lock();
+        protected_fs_entries: &HashSet<String>,
+    ) -> anyhow::Result<Vec<AppSpec>> {
+        let conn = &*self.conn;
         let mut stmt = conn.prepare(
-            "SELECT id, domain, path_prefix FROM apps WHERE scan_managed = 1 AND scan_source = ?1",
+            "SELECT id, domain, path_prefix, fs_entry FROM apps WHERE scan_managed = 1 AND scan_source = ?1",
         )?;
         let mut rows = stmt.query(params![source])?;
         let mut delete_ids: Vec<i64> = Vec::new();
@@ -609,23 +794,66 @@ impl AppRepository {
             let id: i64 = row.get(0)?;
             let domain_prefix: String = row.get(1)?;
             let path_prefix: String = row.get(2)?;
+            let fs_entry: Option<String> = row.get(3)?;
+            if fs_entry
+                .as_deref()
+                .is_some_and(|e| protected_fs_entries.contains(e))
+            {
+                continue;
+            }
             let key = route_key(&domain_prefix, &path_prefix);
             if !active_routes.contains(&key) {
                 delete_ids.push(id);
             }
         }
 
-        let mut deleted = 0usize;
+        let mut pruned = Vec::new();
         for id in &delete_ids {
-            deleted += conn.execute("DELETE FROM apps WHERE id = ?1", params![id])?;
+            let app = conn
+                .query_row(
+                    &format!("DELETE FROM apps WHERE id = ?1 RETURNING {}", COLS),
+                    params![id],
+                    |row| row_to_app(row, &self.repo.domain_suffix),
+                )
+                .optional()?;
+            if let Some(app) = app {
+                pruned.push(app);
+            }
         }
-        Ok(deleted)
+        Ok(pruned)
     }
 
+    /// Delete the row and return the removed snapshot in a single
+    /// `DELETE … RETURNING` statement — the scanner can rewrite a row in
+    /// place, so cleanup (hooks, fs entry) must describe the row actually
+    /// removed, not a separately fetched copy.
+    pub fn delete_returning(&self, app_id: i64) -> anyhow::Result<Option<AppSpec>> {
+        let conn = &*self.conn;
+        let app = conn
+            .query_row(
+                &format!("DELETE FROM apps WHERE id = ?1 RETURNING {}", COLS),
+                params![app_id],
+                |row| row_to_app(row, &self.repo.domain_suffix),
+            )
+            .optional()?;
+        Ok(app)
+    }
+}
+
+impl AppRepository {
     pub fn delete(&self, app_id: i64) -> anyhow::Result<bool> {
         let conn = self.conn.lock();
         let changed = conn.execute("DELETE FROM apps WHERE id = ?1", params![app_id])?;
         Ok(changed > 0)
+    }
+
+    /// Transactional variant of [`StoreTxn::delete_returning`] for callers
+    /// that have no fs entry to remove alongside the row.
+    pub fn delete_returning(&self, app_id: i64) -> anyhow::Result<Option<AppSpec>> {
+        let txn = self.begin_write()?;
+        let app = txn.delete_returning(app_id)?;
+        txn.commit()?;
+        Ok(app)
     }
 
     pub fn set_enabled(&self, app_id: i64, enabled: bool) -> anyhow::Result<bool> {
@@ -642,7 +870,7 @@ impl AppRepository {
     }
 
     pub fn list_all(&self) -> anyhow::Result<Vec<AppSpec>> {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         Self::query_apps(&conn, false, &self.domain_suffix)
     }
 
@@ -652,12 +880,12 @@ impl AppRepository {
         domain: Option<&str>,
     ) -> anyhow::Result<Vec<AppSpec>> {
         let domain_db = domain.map(|d| domain_to_db(d, &self.domain_suffix));
-        let conn = self.conn.lock();
+        let conn = self.reader();
         Self::query_apps_filtered(&conn, managed, domain_db.as_deref(), &self.domain_suffix)
     }
 
     pub fn list_enabled(&self) -> anyhow::Result<Vec<AppSpec>> {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         Self::query_apps(&conn, true, &self.domain_suffix)
     }
 
@@ -740,7 +968,7 @@ impl AppRepository {
     }
 
     pub fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         let value = conn
             .query_row(
                 "SELECT value FROM settings WHERE key = ?1",
@@ -816,7 +1044,7 @@ impl AppRepository {
     }
 
     pub fn list_app_tunnels(&self) -> anyhow::Result<Vec<AppSpec>> {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         let sql = format!(
             "SELECT {} FROM apps WHERE tunnel_mode = 'named' AND enabled = 1",
             COLS
@@ -827,7 +1055,7 @@ impl AppRepository {
     }
 
     pub fn list_quick_tunnels(&self) -> anyhow::Result<Vec<AppSpec>> {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         let sql = format!(
             "SELECT {} FROM apps WHERE tunnel_mode = 'quick' AND enabled = 1",
             COLS
@@ -838,7 +1066,7 @@ impl AppRepository {
     }
 
     pub fn is_tunnel_exposed(&self, domain_prefix: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM apps WHERE domain = ?1 AND enabled = 1 AND tunnel_mode != 'none'",
             params![domain_prefix],
@@ -848,7 +1076,7 @@ impl AppRepository {
     }
 
     pub fn is_share_auth_required(&self, domain_prefix: &str) -> anyhow::Result<bool> {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM apps WHERE domain = ?1 AND enabled = 1 AND share_auth = 1",
             params![domain_prefix],
@@ -868,7 +1096,7 @@ impl AppRepository {
     }
 
     pub fn get_by_id(&self, app_id: i64) -> anyhow::Result<Option<AppSpec>> {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         let app = conn
             .query_row(
                 &format!("SELECT {} FROM apps WHERE id = ?1", COLS),
@@ -880,7 +1108,7 @@ impl AppRepository {
     }
 
     pub fn get_by_name(&self, name: &str) -> anyhow::Result<Option<AppSpec>> {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         let app = conn
             .query_row(
                 &format!("SELECT {} FROM apps WHERE name = ?1", COLS),
@@ -1014,7 +1242,7 @@ impl AppRepository {
         app_id: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<CapturedRequest>> {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         let mut stmt = conn.prepare(
             "SELECT id, app_id, timestamp, method, path, query_string, request_headers, request_body, status_code, response_headers, response_body, response_time_ms FROM request_logs WHERE app_id = ? ORDER BY timestamp DESC LIMIT ?",
         )?;
@@ -1027,7 +1255,7 @@ impl AppRepository {
     }
 
     pub fn get_request_log(&self, req_id: &str) -> anyhow::Result<Option<CapturedRequest>> {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         let mut stmt = conn.prepare(
             "SELECT id, app_id, timestamp, method, path, query_string, request_headers, request_body, status_code, response_headers, response_body, response_time_ms FROM request_logs WHERE id = ?",
         )?;
@@ -1047,7 +1275,7 @@ impl AppRepository {
         let app = self.get_by_name(app_name)?;
         match app {
             Some(app) => {
-                let conn = self.conn.lock();
+                let conn = self.reader();
                 let mut stmt = conn.prepare(
                     "SELECT id, app_id, timestamp, method, path, query_string, request_headers, request_body, status_code, response_headers, response_body, response_time_ms FROM request_logs WHERE app_id = ? ORDER BY timestamp DESC LIMIT ? OFFSET ?",
                 )?;
@@ -1075,7 +1303,7 @@ impl AppRepository {
     }
 
     pub fn count_request_logs(&self, app_id: i64) -> anyhow::Result<usize> {
-        let conn = self.conn.lock();
+        let conn = self.reader();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM request_logs WHERE app_id = ?",
             params![app_id],
@@ -1085,7 +1313,7 @@ impl AppRepository {
     }
 }
 
-const COLS: &str = "id,name,kind,domain,path_prefix,target_type,target_value,timeout_ms,enabled,created_at,updated_at,cors_enabled,force_https,basic_auth_user,basic_auth_pass,spa_rewrite,listen_port,tunnel_url,tunnel_mode,app_tunnel_id,app_tunnel_domain,app_tunnel_dns_id,app_tunnel_creds,inspect_enabled,lan_access,cname,fs_entry";
+const COLS: &str = "id,name,kind,domain,path_prefix,target_type,target_value,timeout_ms,enabled,created_at,updated_at,cors_enabled,force_https,basic_auth_user,basic_auth_pass,spa_rewrite,listen_port,tunnel_url,tunnel_mode,app_tunnel_id,app_tunnel_domain,app_tunnel_dns_id,app_tunnel_creds,inspect_enabled,lan_access,cname,fs_entry,hooks";
 
 fn backend_target_from_db(
     id: i64,
@@ -1184,6 +1412,10 @@ fn row_to_app(row: &rusqlite::Row<'_>, suffix: &str) -> rusqlite::Result<AppSpec
         lan_access: row.get::<_, i64>(24).unwrap_or(0) == 1,
         cname: row.get::<_, Option<String>>(25).unwrap_or(None),
         fs_entry: row.get::<_, Option<String>>(26).unwrap_or(None),
+        hooks: row
+            .get::<_, Option<String>>(27)
+            .unwrap_or(None)
+            .and_then(|raw| serde_json::from_str(&raw).ok()),
     })
 }
 
@@ -1284,6 +1516,75 @@ fn migrate_apps_domain_unique_to_route_unique(conn: &Connection) -> anyhow::Resu
     Ok(())
 }
 
+/// Rebuild `apps` with `AUTOINCREMENT` so row ids are never reused after
+/// deletion. Without it SQLite hands a deleted maximum id to the next insert,
+/// and every consumer keyed by app_id (process groups, per-app hooks, routes)
+/// can confuse the replacement app with the removed one. Identity checks
+/// remain as defense in depth, but monotonic ids remove the class of races.
+///
+/// The new table is derived from the live `sqlite_master` text (not a
+/// hard-coded column list), so it works for any column set the migrations
+/// have produced so far.
+fn migrate_apps_id_autoincrement(conn: &Connection) -> anyhow::Result<()> {
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'apps'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = table_sql else {
+        return Ok(());
+    };
+    if sql.to_uppercase().contains("AUTOINCREMENT") {
+        return Ok(());
+    }
+
+    let with_autoinc = sql.replacen(
+        "id INTEGER PRIMARY KEY",
+        "id INTEGER PRIMARY KEY AUTOINCREMENT",
+        1,
+    );
+    let create_new = if with_autoinc.contains("CREATE TABLE IF NOT EXISTS apps") {
+        with_autoinc.replacen(
+            "CREATE TABLE IF NOT EXISTS apps",
+            "CREATE TABLE apps_new",
+            1,
+        )
+    } else {
+        with_autoinc.replacen("CREATE TABLE apps", "CREATE TABLE apps_new", 1)
+    };
+    if create_new == sql || !create_new.contains("AUTOINCREMENT") {
+        // Unexpected schema text: skip rather than brick startup; identity
+        // checks still guard against id reuse.
+        tracing::error!("apps table schema not recognized, skipping AUTOINCREMENT migration");
+        return Ok(());
+    }
+
+    let mut cols: Vec<String> = Vec::new();
+    let mut stmt = conn.prepare("PRAGMA table_info(apps)")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for col in rows {
+        cols.push(col?);
+    }
+    drop(stmt);
+    let col_list = cols.join(", ");
+
+    conn.execute_batch(&format!(
+        r#"
+        BEGIN;
+        {create_new};
+        INSERT INTO apps_new ({col_list}) SELECT {col_list} FROM apps;
+        DROP TABLE apps;
+        ALTER TABLE apps_new RENAME TO apps;
+        CREATE INDEX IF NOT EXISTS idx_apps_enabled_domain ON apps(enabled, domain);
+        COMMIT;
+        "#
+    ))?;
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // CapturedRequest model
 // ---------------------------------------------------------------------------
@@ -1329,6 +1630,7 @@ mod tests {
     fn insert_and_list_enabled() {
         let repo = AppRepository {
             conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            read_conn: None,
             domain_suffix: "coulson.local".to_string(),
             change_tx: None,
         };
@@ -1359,6 +1661,7 @@ mod tests {
     fn rescan_applies_enabled_change_to_managed_route() {
         let repo = AppRepository {
             conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            read_conn: None,
             domain_suffix: "coulson.local".to_string(),
             change_tx: None,
         };
@@ -1367,23 +1670,511 @@ mod tests {
 
         // First scan: enabled
         let (app, op) = repo
-            .upsert_scanned_managed("myapp", &domain, "/srv/myapp", "asgi", true, "fs", "entry")
+            .upsert_scanned_managed(
+                "myapp",
+                &domain,
+                "/srv/myapp",
+                "asgi",
+                true,
+                "fs",
+                "entry",
+                None,
+            )
             .expect("first upsert");
         assert!(matches!(op, ScanUpsertResult::Inserted));
         assert!(app.enabled);
 
         // Rescan with enabled = false must flip the stored state.
         let (app, op) = repo
-            .upsert_scanned_managed("myapp", &domain, "/srv/myapp", "asgi", false, "fs", "entry")
+            .upsert_scanned_managed(
+                "myapp",
+                &domain,
+                "/srv/myapp",
+                "asgi",
+                false,
+                "fs",
+                "entry",
+                None,
+            )
             .expect("second upsert");
         assert!(matches!(op, ScanUpsertResult::Updated));
         assert!(!app.enabled);
     }
 
     #[test]
+    fn deleted_app_ids_are_never_reused() {
+        let repo = AppRepository {
+            conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            read_conn: None,
+            domain_suffix: "coulson.local".to_string(),
+            change_tx: None,
+        };
+        repo.init_schema().expect("schema");
+
+        let domain = DomainName("appx.coulson.local".to_string());
+        let (a, _) = repo
+            .upsert_scanned_managed(
+                "appx",
+                &domain,
+                "/srv/appx",
+                "procfile",
+                true,
+                "fs",
+                "e",
+                None,
+            )
+            .expect("insert appx");
+        assert!(repo.delete(a.id.0).expect("delete appx"));
+
+        // The table is now empty; without AUTOINCREMENT the next insert would
+        // reuse appx's id and every app_id-keyed consumer could confuse the
+        // replacement with the removed app.
+        let domain2 = DomainName("appy.coulson.local".to_string());
+        let (b, _) = repo
+            .upsert_scanned_managed(
+                "appy",
+                &domain2,
+                "/srv/appy",
+                "procfile",
+                true,
+                "fs",
+                "e",
+                None,
+            )
+            .expect("insert appy");
+        assert!(b.id.0 > a.id.0, "row id reused after delete");
+    }
+
+    #[test]
+    fn hooks_persist_on_row_and_survive_delete_returning() {
+        let repo = AppRepository {
+            conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            read_conn: None,
+            domain_suffix: "coulson.local".to_string(),
+            change_tx: None,
+        };
+        repo.init_schema().expect("schema");
+        let domain = DomainName("myapp.coulson.local".to_string());
+
+        let hooks = crate::hooks::AppHooksConfig {
+            skip_global: true,
+            app_stop: Some(crate::hooks::HookActionConfig {
+                run: Some("echo stopped".to_string()),
+                webhook: None,
+            }),
+            app_add: None,
+            app_remove: None,
+            app_start: None,
+            app_ready: None,
+            app_idle: None,
+            tunnel_start: None,
+            tunnel_stop: None,
+        };
+        let (app, _) = repo
+            .upsert_scanned_managed(
+                "myapp",
+                &domain,
+                "/srv/myapp",
+                "asgi",
+                true,
+                "fs",
+                "e",
+                Some(&hooks),
+            )
+            .expect("upsert");
+        // The row is the single source of truth: reads and the deletion
+        // snapshot must both carry the hook config of this generation.
+        let read = repo.get_by_id(app.id.0).expect("get").expect("row");
+        assert!(read.hooks.as_ref().is_some_and(|h| h.skip_global));
+        let deleted = repo
+            .delete_returning(app.id.0)
+            .expect("delete")
+            .expect("row existed");
+        let dh = deleted.hooks.expect("hooks on deleted snapshot");
+        assert_eq!(
+            dh.app_stop.and_then(|a| a.run).as_deref(),
+            Some("echo stopped")
+        );
+    }
+
+    #[test]
+    fn app_spec_serialization_omits_hooks() {
+        let repo = AppRepository {
+            conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            read_conn: None,
+            domain_suffix: "coulson.local".to_string(),
+            change_tx: None,
+        };
+        repo.init_schema().expect("schema");
+        let domain = DomainName("myapp.coulson.local".to_string());
+        let hooks = crate::hooks::AppHooksConfig {
+            skip_global: false,
+            app_stop: Some(crate::hooks::HookActionConfig {
+                run: Some("curl -H 'Authorization: Bearer secret'".to_string()),
+                webhook: Some("https://example.com/?sig=secret".to_string()),
+            }),
+            app_add: None,
+            app_remove: None,
+            app_start: None,
+            app_ready: None,
+            app_idle: None,
+            tunnel_start: None,
+            tunnel_stop: None,
+        };
+        let (app, _) = repo
+            .upsert_scanned_managed(
+                "myapp",
+                &domain,
+                "/srv/myapp",
+                "asgi",
+                true,
+                "fs",
+                "e",
+                Some(&hooks),
+            )
+            .expect("upsert");
+        repo.update_settings(
+            app.id.0,
+            None,
+            None,
+            None,
+            Some(Some("s3cret-pw")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("set basic auth pass");
+        repo.set_app_tunnel_state(
+            app.id.0,
+            Some("tid"),
+            Some("t.example.com"),
+            None,
+            Some("{\"tunnel_secret\":\"s3cret-tunnel\"}"),
+            TunnelMode::Named,
+        )
+        .expect("set tunnel creds");
+        let read = repo.get_by_id(app.id.0).expect("get").expect("row");
+        assert!(read.hooks.is_some(), "hooks must round-trip via the store");
+        assert!(read.basic_auth_pass.is_some());
+        assert!(read.app_tunnel_creds.is_some());
+
+        // AppSpec flows out through control RPC (`app.list`/`app.get`); hook
+        // commands/webhook URLs, the basic-auth password, and the tunnel
+        // credential JSON can all carry secrets and must never appear in any
+        // serialized form — secrets serialize as presence booleans only.
+        let json = serde_json::to_value(&read).expect("serialize");
+        assert!(json.get("hooks").is_none(), "hooks leaked: {json}");
+        assert!(json.get("basic_auth_pass").is_none());
+        assert!(json.get("app_tunnel_creds").is_none());
+        assert_eq!(
+            json.get("basic_auth_pass_set").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            json.get("app_tunnel_creds_set").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(!json.to_string().contains("secret"));
+        assert!(!json.to_string().contains("s3cret"));
+    }
+
+    #[test]
+    fn prune_keeps_rows_of_protected_fs_entries() {
+        let repo = AppRepository {
+            conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            read_conn: None,
+            domain_suffix: "coulson.local".to_string(),
+            change_tx: None,
+        };
+        repo.init_schema().expect("schema");
+        let domain = DomainName("appx.coulson.local".to_string());
+        repo.upsert_scanned_managed(
+            "appx",
+            &domain,
+            "/srv/appx",
+            "asgi",
+            true,
+            "apps_root",
+            "appx",
+            None,
+        )
+        .expect("seed");
+
+        // Route absent from active_routes, but its fs entry is indeterminate
+        // (unreadable this scan): the row must survive the prune.
+        let mut protected = HashSet::new();
+        protected.insert("appx".to_string());
+        let pruned = repo
+            .prune_scanned_not_in("apps_root", &HashSet::new(), &protected)
+            .expect("prune protected");
+        assert!(pruned.is_empty());
+        assert!(repo.get_by_name("appx").expect("get").is_some());
+
+        // Without protection the same prune removes it.
+        let pruned = repo
+            .prune_scanned_not_in("apps_root", &HashSet::new(), &HashSet::new())
+            .expect("prune");
+        assert_eq!(pruned.len(), 1);
+        assert!(repo.get_by_name("appx").expect("get").is_none());
+    }
+
+    #[test]
+    fn store_txn_rolls_back_on_drop() {
+        let repo = AppRepository {
+            conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            read_conn: None,
+            domain_suffix: "coulson.local".to_string(),
+            change_tx: None,
+        };
+        repo.init_schema().expect("schema");
+        let domain = DomainName("appx.coulson.local".to_string());
+
+        {
+            let txn = repo.begin_write().expect("begin");
+            txn.upsert_scanned_managed("appx", &domain, "/srv/appx", "asgi", true, "fs", "e", None)
+                .expect("upsert");
+            // Dropped without commit — a scan that errors out halfway must
+            // leave no partially applied rows behind.
+        }
+        assert!(repo.get_by_name("appx").expect("get").is_none());
+    }
+
+    #[test]
+    fn store_txn_commits_multiple_ops_atomically() {
+        let repo = AppRepository {
+            conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            read_conn: None,
+            domain_suffix: "coulson.local".to_string(),
+            change_tx: None,
+        };
+        repo.init_schema().expect("schema");
+        let domain_a = DomainName("appa.coulson.local".to_string());
+        let domain_b = DomainName("appb.coulson.local".to_string());
+        repo.upsert_scanned_managed(
+            "appa",
+            &domain_a,
+            "/srv/appa",
+            "asgi",
+            true,
+            "apps_root",
+            "a",
+            None,
+        )
+        .expect("seed appa");
+
+        // One transaction: upsert appb, prune appa (route disappeared).
+        let txn = repo.begin_write().expect("begin");
+        txn.upsert_scanned_managed(
+            "appb",
+            &domain_b,
+            "/srv/appb",
+            "node",
+            true,
+            "apps_root",
+            "b",
+            None,
+        )
+        .expect("upsert appb");
+        let mut active = HashSet::new();
+        active.insert(route_key("appb", ""));
+        let pruned = txn
+            .prune_scanned_not_in("apps_root", &active, &HashSet::new())
+            .expect("prune");
+        txn.commit().expect("commit");
+
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].name, "appa");
+        assert!(repo.get_by_name("appa").expect("get").is_none());
+        assert!(repo.get_by_name("appb").expect("get").is_some());
+    }
+
+    #[test]
+    fn delete_returning_snapshots_the_row_it_removes() {
+        let repo = AppRepository {
+            conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            read_conn: None,
+            domain_suffix: "coulson.local".to_string(),
+            change_tx: None,
+        };
+        repo.init_schema().expect("schema");
+        let domain = DomainName("myapp.coulson.local".to_string());
+
+        let (a, _) = repo
+            .upsert_scanned_managed("myapp", &domain, "/srv/a", "node", true, "fs", "e", None)
+            .expect("insert");
+        // In-place scanner rewrite: same route key keeps the row id but
+        // changes identity (root + provider kind).
+        let (b, op) = repo
+            .upsert_scanned_managed(
+                "myapp", &domain, "/srv/b", "procfile", true, "fs", "e", None,
+            )
+            .expect("rewrite");
+        assert!(matches!(op, ScanUpsertResult::Updated));
+        assert_eq!(a.id.0, b.id.0);
+
+        // The returned snapshot must be the rewritten row, not a stale fetch.
+        let deleted = repo
+            .delete_returning(b.id.0)
+            .expect("delete")
+            .expect("row existed");
+        match deleted.target {
+            BackendTarget::Managed {
+                ref root, ref kind, ..
+            } => {
+                assert_eq!(root, "/srv/b");
+                assert_eq!(kind, "procfile");
+            }
+            ref other => panic!("unexpected target: {other:?}"),
+        }
+        assert!(repo.get_by_id(b.id.0).expect("get").is_none());
+        // Missing row → None, nothing deleted.
+        assert!(repo
+            .delete_returning(b.id.0)
+            .expect("second delete")
+            .is_none());
+    }
+
+    #[test]
+    fn migrate_v1_domain_unique_schema_preserves_modern_columns() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        // The actual v1 schema: `domain UNIQUE`, host/port target columns,
+        // none of the later additive columns.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE apps (
+              id INTEGER PRIMARY KEY,
+              name TEXT NOT NULL UNIQUE,
+              kind TEXT NOT NULL,
+              domain TEXT NOT NULL UNIQUE,
+              target_host TEXT,
+              target_port INTEGER,
+              enabled INTEGER NOT NULL,
+              scan_managed INTEGER NOT NULL DEFAULT 0,
+              scan_source TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL
+            );
+            INSERT INTO apps (id, name, kind, domain, target_host, target_port, enabled, created_at, updated_at)
+            VALUES (3, 'v1app', 'static', 'v1app', '127.0.0.1', 5006, 1, 0, 0);
+            "#,
+        )
+        .expect("v1 schema");
+        let repo = AppRepository {
+            conn: Mutex::new(conn),
+            read_conn: None,
+            domain_suffix: "coulson.local".to_string(),
+            change_tx: None,
+        };
+        // The v1 rebuild must run before the additive-column migrations, or
+        // it silently drops every modern column from the rebuilt table.
+        repo.init_schema().expect("migrate");
+
+        // Full COLS read works (would fail with `no such column` if the
+        // rebuild truncated the schema) and the row content survived.
+        let app = repo.get_by_id(3).expect("get").expect("row preserved");
+        assert_eq!(app.name, "v1app");
+        assert_eq!(app.domain.0, "v1app.coulson.local");
+        assert!(app.hooks.is_none());
+
+        // Modern columns are writable — hooks persistence works end to end.
+        let domain = DomainName("hooked.coulson.local".to_string());
+        let hooks = crate::hooks::AppHooksConfig {
+            skip_global: true,
+            app_add: None,
+            app_remove: None,
+            app_start: None,
+            app_ready: None,
+            app_stop: None,
+            app_idle: None,
+            tunnel_start: None,
+            tunnel_stop: None,
+        };
+        let (created, _) = repo
+            .upsert_scanned_managed(
+                "hooked",
+                &domain,
+                "/srv/hooked",
+                "asgi",
+                true,
+                "fs",
+                "e",
+                Some(&hooks),
+            )
+            .expect("upsert on migrated schema");
+        let read = repo.get_by_id(created.id.0).expect("get").expect("row");
+        assert!(read.hooks.is_some_and(|h| h.skip_global));
+    }
+
+    #[test]
+    fn migrate_apps_id_autoincrement_rebuilds_and_preserves_rows() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        // Simulate a pre-AUTOINCREMENT database with the route-unique schema.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE apps (
+              id INTEGER PRIMARY KEY,
+              name TEXT NOT NULL UNIQUE,
+              kind TEXT NOT NULL,
+              domain TEXT NOT NULL,
+              path_prefix TEXT NOT NULL DEFAULT '',
+              target_type TEXT NOT NULL DEFAULT 'tcp',
+              target_value TEXT NOT NULL DEFAULT '',
+              timeout_ms INTEGER,
+              enabled INTEGER NOT NULL,
+              scan_managed INTEGER NOT NULL DEFAULT 0,
+              scan_source TEXT,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              UNIQUE(domain, path_prefix)
+            );
+            INSERT INTO apps (id, name, kind, domain, enabled, created_at, updated_at)
+            VALUES (7, 'legacy', 'asgi', 'legacy', 1, 0, 0);
+            "#,
+        )
+        .expect("legacy schema");
+        let repo = AppRepository {
+            conn: Mutex::new(conn),
+            read_conn: None,
+            domain_suffix: "coulson.local".to_string(),
+            change_tx: None,
+        };
+        repo.init_schema().expect("migrate");
+
+        let conn = repo.conn.lock();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'apps'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("table sql");
+        assert!(sql.contains("AUTOINCREMENT"), "apps not rebuilt: {sql}");
+        let (id, name): (i64, String) = conn
+            .query_row("SELECT id, name FROM apps", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .expect("row preserved");
+        assert_eq!((id, name.as_str()), (7, "legacy"));
+        // The sequence continues above the migrated max id.
+        conn.execute(
+            "INSERT INTO apps (name, kind, domain, enabled, created_at, updated_at)
+             VALUES ('next', 'asgi', 'next', 1, 0, 0)",
+            [],
+        )
+        .expect("insert after migration");
+        let next_id: i64 = conn
+            .query_row("SELECT id FROM apps WHERE name = 'next'", [], |r| r.get(0))
+            .expect("next id");
+        assert!(next_id > 7);
+    }
+
+    #[test]
     fn settings_crud() {
         let repo = AppRepository {
             conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            read_conn: None,
             domain_suffix: "coulson.local".to_string(),
             change_tx: None,
         };
@@ -1412,6 +2203,7 @@ mod tests {
     fn db_stores_prefix_only() {
         let repo = AppRepository {
             conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            read_conn: None,
             domain_suffix: "coulson.local".to_string(),
             change_tx: None,
         };

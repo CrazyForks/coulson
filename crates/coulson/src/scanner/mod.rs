@@ -185,9 +185,16 @@ pub struct ScanResult {
     pub stats: ScanStats,
     /// Apps newly inserted during this scan (for firing `app_add` hooks after route reload).
     pub added_apps: Vec<AppSpec>,
+    /// Rows removed because their route disappeared. The daemon tears down
+    /// their processes and fires `app_stop` from these snapshots — after the
+    /// prune the row is gone, and each snapshot carries its own hook config.
+    pub pruned_apps: Vec<AppSpec>,
 }
 
 pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanResult> {
+    // One scan at a time: discovery and the write transaction below form a
+    // unit that must not interleave with a concurrent (manual vs watcher) scan.
+    let _scan_guard = state.scan_mutex.lock();
     let skip_paths: Vec<&Path> = vec![
         state.scan_warnings_path.as_path(),
         state.sqlite_path.as_path(),
@@ -203,13 +210,29 @@ pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanResult> {
     let mut updated = 0usize;
     let mut skipped_manual = 0usize;
     let mut added_apps: Vec<AppSpec> = Vec::new();
-    // Clear all per-app hooks before re-registering from scan results.
-    state.hook_manager.clear_all_app_hooks();
+    // All store mutations of this scan commit as ONE write transaction: a
+    // partially applied scan would otherwise leave rewritten rows in the
+    // store while routes and hooks still describe the pre-scan state — and
+    // the identity-aware reaper would kill the still-running old groups.
+    let txn = state.store.begin_write()?;
     for app in &discovered.apps {
+        // discover() read the filesystem before this transaction, and an app
+        // can have been explicitly deleted since (row + fs entry are removed
+        // under their own write transaction). Inside our transaction nothing
+        // else can be mutating that pair, so a definitively missing entry is
+        // authoritative: skip the stale discovery instead of resurrecting
+        // the app, and leave its route out of `active_routes` so the prune
+        // below drops any leftover row. Only NotFound means absent — any
+        // other stat error fails the scan (`?`) and rolls the whole
+        // transaction back, because pruning a live-but-unreadable app would
+        // tear down its process over a transient fs error.
+        if entry_definitively_absent(&state.apps_root, &app.fs_entry)? {
+            continue;
+        }
         let (spec, op) = match app.target_type.as_str() {
             "managed" => {
                 let kind_str = app_kind_to_str(app.kind);
-                state.store.upsert_scanned_managed(
+                txn.upsert_scanned_managed(
                     &app.name,
                     &app.domain,
                     &app.target_value,
@@ -217,17 +240,19 @@ pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanResult> {
                     app.enabled,
                     "apps_root",
                     &app.fs_entry,
+                    app.hooks.as_ref(),
                 )?
             }
-            "static_dir" => state.store.upsert_scanned_static_dir(
+            "static_dir" => txn.upsert_scanned_static_dir(
                 &app.name,
                 &app.domain,
                 &app.target_value,
                 app.enabled,
                 "apps_root",
                 &app.fs_entry,
+                app.hooks.as_ref(),
             )?,
-            _ => state.store.upsert_scanned_static(
+            _ => txn.upsert_scanned_static(
                 &StaticAppInput {
                     name: &app.name,
                     domain: &app.domain,
@@ -245,36 +270,32 @@ pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanResult> {
                 app.enabled,
                 "apps_root",
                 &app.fs_entry,
+                app.hooks.as_ref(),
             )?,
         };
         match op {
             ScanUpsertResult::Inserted => {
                 inserted += 1;
-                // Register per-app hooks only for scan-owned apps
-                if let Some(ref hooks_config) = app.hooks {
-                    state
-                        .hook_manager
-                        .register_app_hooks(spec.id.0, hooks_config.clone());
-                }
                 added_apps.push(spec);
             }
-            ScanUpsertResult::Updated => {
-                updated += 1;
-                if let Some(ref hooks_config) = app.hooks {
-                    state
-                        .hook_manager
-                        .register_app_hooks(spec.id.0, hooks_config.clone());
-                }
-            }
+            ScanUpsertResult::Updated => updated += 1,
             ScanUpsertResult::SkippedManual => skipped_manual += 1,
         }
         let domain_prefix = domain_to_db(&app.domain.0, &state.domain_suffix);
         let route_key = route_key(&domain_prefix, app.path_prefix.as_deref().unwrap_or(""));
         active_routes.insert(route_key);
     }
-    let pruned = state
-        .store
-        .prune_scanned_not_in("apps_root", &active_routes)?;
+    // Rows owned by indeterminate entries (content unreadable right now) are
+    // protected: they are not in `active_routes`, but their absence is not
+    // established either, so pruning them would destroy a live app over a
+    // transient condition.
+    let protected_fs_entries: HashSet<String> =
+        discovered.indeterminate_entries.iter().cloned().collect();
+    let pruned_apps =
+        txn.prune_scanned_not_in("apps_root", &active_routes, &protected_fs_entries)?;
+    // The commit is also the hook-config commit: hooks live on the rows, so
+    // there is no separate registry swap that could race a deletion.
+    txn.commit()?;
     let conflict_domains: Vec<String> = discovered
         .conflicts
         .into_iter()
@@ -288,7 +309,7 @@ pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanResult> {
             inserted,
             updated,
             skipped_manual,
-            pruned,
+            pruned: pruned_apps.len(),
             conflicts: conflict_domains.len(),
             conflict_domains,
             parse_warnings,
@@ -296,7 +317,49 @@ pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanResult> {
             has_issues: warning_count > 0,
         },
         added_apps,
+        pruned_apps,
     })
+}
+
+/// Whether an apps_root entry is definitively absent. Only `NotFound` means
+/// absent; any other stat error is propagated so callers treating absence as
+/// "app was deleted" (scan revalidation → prune) fail instead of destroying
+/// state over a transient permission/I/O error.
+fn entry_definitively_absent(apps_root: &Path, fs_entry: &str) -> anyhow::Result<bool> {
+    let path = apps_root.join(fs_entry);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(anyhow::Error::new(err).context(format!(
+            "failed to stat apps_root entry: {}",
+            path.display()
+        ))),
+    }
+}
+
+/// Whether a path definitively exists. `Ok(false)` only on `NotFound`; any
+/// other stat error propagates — absence inferred from an error must never
+/// drive discovery fallthrough (and thereby prune).
+fn path_definitively_exists(path: &Path) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => {
+            Err(anyhow::Error::new(err).context(format!("failed to stat: {}", path.display())))
+        }
+    }
+}
+
+/// Whether a directory definitively exists at `path` (`NotFound` → false;
+/// other stat errors propagate, same contract as [`path_definitively_exists`]).
+fn dir_definitively_exists(path: &Path) -> anyhow::Result<bool> {
+    match fs::metadata(path) {
+        Ok(m) => Ok(m.is_dir()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => {
+            Err(anyhow::Error::new(err).context(format!("failed to stat: {}", path.display())))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -324,6 +387,10 @@ struct DiscoverResult {
     apps: Vec<DiscoveredStaticApp>,
     conflicts: Vec<String>,
     parse_warnings: Vec<String>,
+    /// apps_root entries whose content could not be interpreted right now
+    /// (e.g. invalid UTF-8 mid-rewrite). Not routes, but not absence either:
+    /// rows owned by these entries are protected from this scan's prune.
+    indeterminate_entries: Vec<String>,
 }
 
 fn discover(
@@ -332,17 +399,29 @@ fn discover(
     registry: &ProviderRegistry,
     skip_paths: &[&Path],
 ) -> anyhow::Result<DiscoverResult> {
-    if !root.exists() {
-        return Ok(DiscoverResult {
-            apps: Vec::new(),
-            conflicts: Vec::new(),
-            parse_warnings: Vec::new(),
-        });
+    // `Path::exists()` swallows stat errors as `false`; an unreadable apps
+    // root would then read as an empty discovery and prune every scan-owned
+    // row. Only a definitive NotFound may mean "no apps root".
+    match fs::metadata(root) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DiscoverResult {
+                apps: Vec::new(),
+                conflicts: Vec::new(),
+                parse_warnings: Vec::new(),
+                indeterminate_entries: Vec::new(),
+            });
+        }
+        Err(err) => {
+            return Err(anyhow::Error::new(err)
+                .context(format!("failed to stat apps root: {}", root.display())))
+        }
     }
 
     let mut by_route: HashMap<String, DiscoveredStaticApp> = HashMap::new();
     let mut conflicts: Vec<String> = Vec::new();
     let mut parse_warnings: Vec<String> = Vec::new();
+    let mut indeterminate_entries: Vec<String> = Vec::new();
 
     for entry in fs::read_dir(root)
         .with_context(|| format!("failed reading apps root: {}", root.display()))?
@@ -361,7 +440,14 @@ fn discover(
             if file_name.starts_with('.') {
                 continue;
             }
-            let apps = discover_from_symlink(entry.path(), &file_name, suffix, registry)?;
+            let apps = discover_from_symlink(
+                entry.path(),
+                &file_name,
+                suffix,
+                registry,
+                &mut indeterminate_entries,
+                &mut parse_warnings,
+            )?;
             for app in apps {
                 insert_with_priority(&mut by_route, &mut conflicts, app);
             }
@@ -380,9 +466,25 @@ fn discover(
             }
             let raw = match fs::read_to_string(entry.path()) {
                 Ok(r) => r,
-                Err(_) => {
-                    // Skip files that can't be read as UTF-8 (binary files)
+                // NotFound = removed mid-scan → definitive non-route.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                // InvalidData = binary or a half-rewritten UTF-8 file. Not a
+                // route right now, but not absence either — the entry may own
+                // live routes, so it goes into the indeterminate set and this
+                // scan will not prune its rows.
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                    indeterminate_entries.push(file_name.clone());
+                    parse_warnings.push(format!(
+                        "{}: unreadable content ({err}); entry left untouched",
+                        entry.path().display()
+                    ));
                     continue;
+                }
+                // Anything else (permissions, I/O) fails the scan rather than
+                // silently dropping — and thereby pruning — a live route.
+                Err(err) => {
+                    return Err(anyhow::Error::new(err)
+                        .context(format!("failed to read {}", entry.path().display())))
                 }
             };
             let parse = parse_pow_file_routes(&raw);
@@ -432,7 +534,7 @@ fn discover(
 
             // Priority: .coulson.toml → .coulson → provider auto-detect → public/
             let toml_path = entry.path().join(".coulson.toml");
-            if toml_path.exists() {
+            if path_definitively_exists(&toml_path)? {
                 let raw = fs::read_to_string(&toml_path)
                     .with_context(|| format!("failed reading {}", toml_path.display()))?;
                 let manifest = parse_manifest(&raw)
@@ -452,7 +554,7 @@ fn discover(
             }
 
             let coulson_file = entry.path().join(".coulson");
-            if coulson_file.exists() {
+            if path_definitively_exists(&coulson_file)? {
                 let raw = fs::read_to_string(&coulson_file)
                     .with_context(|| format!("failed reading {}", coulson_file.display()))?;
                 let parse = parse_pow_file_routes(&raw);
@@ -496,8 +598,22 @@ fn discover(
                 continue;
             }
 
-            // Auto-detect managed app via provider registry
-            if let Some((_provider, detected)) = registry.detect(&entry.path(), None) {
+            // Auto-detect managed app via provider registry. A provider error
+            // is not a non-match: protect the existing row and do not fall
+            // through to `public/`, which could rewrite a managed app as
+            // static while its metadata is only half-written.
+            let detected = match registry.detect(&entry.path(), None) {
+                Ok(result) => result,
+                Err(err) => {
+                    indeterminate_entries.push(dir_name.clone());
+                    parse_warnings.push(format!(
+                        "{}: provider detection indeterminate ({err}); entry left untouched",
+                        entry.path().display()
+                    ));
+                    continue;
+                }
+            };
+            if let Some((_provider, detected)) = detected {
                 let domain_text = file_name_to_domain(&dir_name, suffix);
                 let domain = DomainName::parse(&domain_text, suffix).with_context(|| {
                     format!(
@@ -528,7 +644,7 @@ fn discover(
                     hooks: None,
                 };
                 insert_with_priority(&mut by_route, &mut conflicts, app);
-            } else if entry.path().join("public").is_dir() {
+            } else if dir_definitively_exists(&entry.path().join("public"))? {
                 let domain_text = file_name_to_domain(&dir_name, suffix);
                 let domain = DomainName::parse(&domain_text, suffix).with_context(|| {
                     format!(
@@ -576,14 +692,18 @@ fn discover(
         apps,
         conflicts,
         parse_warnings,
+        indeterminate_entries,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discover_from_symlink(
     link_path: PathBuf,
     file_name: &str,
     suffix: &str,
     registry: &ProviderRegistry,
+    indeterminate_entries: &mut Vec<String>,
+    outer_parse_warnings: &mut Vec<String>,
 ) -> anyhow::Result<Vec<DiscoveredStaticApp>> {
     let target = fs::read_link(&link_path)
         .with_context(|| format!("failed reading symlink {}", link_path.display()))?;
@@ -598,7 +718,16 @@ fn discover_from_symlink(
 
     let meta = match fs::metadata(&resolved_target) {
         Ok(m) => m,
-        Err(_) => return Ok(Vec::new()),
+        // A dangling symlink is a definitively absent app; any other stat
+        // error must fail the scan — treating it as absence would prune a
+        // live route over a transient fs error.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context(format!(
+                "failed to stat symlink target: {}",
+                resolved_target.display()
+            )))
+        }
     };
 
     let domain_text = file_name_to_domain(file_name, suffix);
@@ -613,8 +742,22 @@ fn discover_from_symlink(
     let name = sanitize_name(file_name);
 
     if meta.is_file() {
-        let raw = fs::read_to_string(&resolved_target)
-            .with_context(|| format!("failed reading {}", resolved_target.display()))?;
+        let raw = match fs::read_to_string(&resolved_target) {
+            Ok(r) => r,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                indeterminate_entries.push(file_name.to_string());
+                outer_parse_warnings.push(format!(
+                    "{}: unreadable content ({err}); entry left untouched",
+                    resolved_target.display()
+                ));
+                return Ok(Vec::new());
+            }
+            Err(err) => {
+                return Err(anyhow::Error::new(err)
+                    .context(format!("failed reading {}", resolved_target.display())))
+            }
+        };
         let is_toml = resolved_target
             .extension()
             .map(|ext| ext == "toml")
@@ -664,7 +807,7 @@ fn discover_from_symlink(
     if meta.is_dir() {
         // Priority: .coulson.toml → .coulson → provider auto-detect → public/
         let coulson_toml_file = resolved_target.join(".coulson.toml");
-        if coulson_toml_file.exists() {
+        if path_definitively_exists(&coulson_toml_file)? {
             let raw = fs::read_to_string(&coulson_toml_file)
                 .with_context(|| format!("failed reading {}", coulson_toml_file.display()))?;
             let manifest = parse_manifest(&raw)
@@ -685,7 +828,7 @@ fn discover_from_symlink(
 
         // .coulson (powfile format) in the directory
         let coulson_file = resolved_target.join(".coulson");
-        if coulson_file.exists() {
+        if path_definitively_exists(&coulson_file)? {
             let raw = fs::read_to_string(&coulson_file)
                 .with_context(|| format!("failed reading {}", coulson_file.display()))?;
             let mut out = Vec::new();
@@ -713,8 +856,20 @@ fn discover_from_symlink(
             return Ok(out);
         }
 
-        // Auto-detect managed app via provider registry
-        if let Some((_prov, detected)) = registry.detect(&resolved_target, None) {
+        // Auto-detect managed app via provider registry. Preserve the same
+        // Match / NoMatch / Indeterminate distinction as direct directories.
+        let detected = match registry.detect(&resolved_target, None) {
+            Ok(result) => result,
+            Err(err) => {
+                indeterminate_entries.push(file_name.to_string());
+                outer_parse_warnings.push(format!(
+                    "{}: provider detection indeterminate ({err}); entry left untouched",
+                    resolved_target.display()
+                ));
+                return Ok(Vec::new());
+            }
+        };
+        if let Some((_prov, detected)) = detected {
             let root_str = resolved_target.to_string_lossy().to_string();
             let app_kind = kind_str_to_app_kind(&detected.kind);
             return Ok(vec![DiscoveredStaticApp {
@@ -737,7 +892,7 @@ fn discover_from_symlink(
                 hooks: None,
             }]);
         }
-        if resolved_target.join("public").is_dir() {
+        if dir_definitively_exists(&resolved_target.join("public"))? {
             let public_root = resolved_target.join("public").to_string_lossy().to_string();
             return Ok(vec![DiscoveredStaticApp {
                 name,
@@ -792,7 +947,9 @@ fn manifest_to_discovered_apps(
 
     // Build a serde_json::Value from manifest for provider detection
     let manifest_value = manifest_to_json_value(manifest);
-    let is_managed = registry.detect(dir_path, Some(&manifest_value));
+    let is_managed = registry
+        .detect(dir_path, Some(&manifest_value))
+        .with_context(|| format!("provider detection failed in {}", dir_path.display()))?;
 
     if let Some((_prov, detected)) = is_managed {
         let root_str = dir_path.to_string_lossy().to_string();
@@ -1088,55 +1245,87 @@ fn parse_target_token(token: &str) -> Option<(String, u16)> {
     Some((host.to_string(), port))
 }
 
+/// Outcome of [`remove_app_fs_entry`]. `Refused` matters to deletion: an
+/// entry that still exists after a committed delete is rediscovered by the
+/// next scan, so callers must treat it as an error, not a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsEntryRemoval {
+    /// Entry existed and was removed.
+    Removed,
+    /// Nothing to remove — the entry is already gone.
+    Missing,
+    /// Entry exists but was not removed (directory, or removal failed).
+    Refused,
+}
+
 /// Remove the filesystem entry from apps_root.
 ///
-/// - symlink → remove symlink + clean up .coulson/.coulson.toml target file
+/// - symlink → remove symlink first, then best-effort cleanup of its
+///   .coulson/.coulson.toml target file
 /// - file → remove file
-/// - directory → skip (return false)
+/// - directory → refuse (never delete user data)
 ///
-/// Returns true if something was actually removed.
-pub fn remove_app_fs_entry(apps_root: &Path, fs_entry: &str) -> bool {
+/// A `Refused` result must leave everything untouched: callers abort the
+/// deletion on it, so the entry removal — the fallible, load-bearing step —
+/// happens before any irreversible side cleanup, never after.
+pub fn remove_app_fs_entry(apps_root: &Path, fs_entry: &str) -> FsEntryRemoval {
     let path = apps_root.join(fs_entry);
     let meta = match std::fs::symlink_metadata(&path) {
         Ok(m) => m,
-        Err(_) => return false,
+        // Only a definitive "not there" is Missing (safe to commit a delete
+        // over). Permission or transient I/O errors mean the entry may still
+        // exist and be rediscovered — refuse.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return FsEntryRemoval::Missing,
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "failed to stat fs entry");
+            return FsEntryRemoval::Refused;
+        }
     };
 
     if meta.file_type().is_dir() {
-        tracing::debug!(path = %path.display(), "skipping directory removal");
-        return false;
+        tracing::debug!(path = %path.display(), "refusing directory removal");
+        return FsEntryRemoval::Refused;
     }
 
-    // If it's a symlink pointing to a .coulson or .coulson.toml file, clean that up too
-    if meta.file_type().is_symlink() {
-        if let Ok(target) = std::fs::read_link(&path) {
-            let resolved = if target.is_absolute() {
-                target
-            } else {
-                apps_root.join(&target)
-            };
-            if resolved.is_file() {
-                if let Some(fname) = resolved.file_name().and_then(|n| n.to_str()) {
-                    if fname == ".coulson" || fname == ".coulson.toml" {
-                        if let Err(err) = std::fs::remove_file(&resolved) {
-                            tracing::warn!(path = %resolved.display(), error = %err, "failed to remove symlink target file");
-                        }
-                    }
+    // Snapshot the symlink's config-file target before removing the link —
+    // afterwards it can no longer be resolved.
+    let cleanup_target = if meta.file_type().is_symlink() {
+        std::fs::read_link(&path)
+            .ok()
+            .map(|target| {
+                if target.is_absolute() {
+                    target
+                } else {
+                    apps_root.join(&target)
                 }
-            }
-        }
-    }
+            })
+            .filter(|resolved| {
+                resolved.is_file()
+                    && resolved
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|f| f == ".coulson" || f == ".coulson.toml")
+            })
+    } else {
+        None
+    };
 
     match std::fs::remove_file(&path) {
-        Ok(()) => {
-            tracing::info!(path = %path.display(), "removed fs entry");
-            true
-        }
+        Ok(()) => tracing::info!(path = %path.display(), "removed fs entry"),
         Err(err) => {
             tracing::warn!(path = %path.display(), error = %err, "failed to remove fs entry");
-            false
+            return FsEntryRemoval::Refused;
         }
     }
+
+    // Entry is gone — target cleanup is best effort and cannot affect the
+    // outcome anymore.
+    if let Some(resolved) = cleanup_target {
+        if let Err(err) = std::fs::remove_file(&resolved) {
+            tracing::warn!(path = %resolved.display(), error = %err, "failed to remove symlink target file");
+        }
+    }
+    FsEntryRemoval::Removed
 }
 
 pub(crate) fn sanitize_name(name: &str) -> String {
@@ -1229,6 +1418,165 @@ fn humanize_route_conflict_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_utf8_entry_is_indeterminate_not_absent() {
+        let base = std::env::temp_dir().join(format!("coulson-test-indet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("mkdir");
+        // A pow-style route file that is temporarily invalid UTF-8 (e.g. a
+        // half-rewritten file observed by a watcher scan).
+        std::fs::write(base.join("myapp"), [0xff, 0xfe, 0x00, 0x80]).expect("write binary");
+        std::fs::write(base.join("okapp"), "5006\n").expect("write ok");
+
+        // A directory whose provider metadata is momentarily unusable (e.g.
+        // package.json truncated mid-rewrite). `public/` is deliberately
+        // present: detection uncertainty must not fall through and rewrite
+        // the managed route as static.
+        std::fs::create_dir_all(base.join("nodeapp")).expect("mkdir nodeapp");
+        std::fs::write(base.join("nodeapp/package.json"), "{ trunca").expect("write trunc");
+        std::fs::create_dir_all(base.join("nodeapp/public")).expect("mkdir public");
+
+        // A definitive non-match must remain removable. This models a retired
+        // app whose last provider/static marker was intentionally deleted
+        // while its now-empty directory still exists.
+        std::fs::create_dir_all(base.join("retired")).expect("mkdir retired");
+
+        let registry = crate::process::default_registry();
+        let result = discover(&base, "coulson.local", &registry, &[]).expect("discover");
+        // Only actual detection errors enter the indeterminate set. The
+        // definite non-match is omitted, allowing an old row it owned to be
+        // pruned, while the healthy entry is discovered normally.
+        let mut indeterminate = result.indeterminate_entries.clone();
+        indeterminate.sort();
+        assert_eq!(
+            indeterminate,
+            vec!["myapp".to_string(), "nodeapp".to_string()]
+        );
+        assert_eq!(result.apps.len(), 1);
+        assert_eq!(result.apps[0].fs_entry, "okapp");
+        assert!(result.parse_warnings.iter().any(|w| w.contains("myapp")));
+        assert!(result
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("nodeapp") && w.contains("provider detection indeterminate")));
+
+        // End-to-end prune distinction: the invalid Node entry survives even
+        // with public/ present, while the definitive non-match is removed.
+        let repo = crate::store::AppRepository::new(&base.join("state.sqlite"), "coulson.local")
+            .expect("open store");
+        repo.init_schema().expect("schema");
+        let node_domain = DomainName("nodeapp.coulson.local".to_string());
+        let retired_domain = DomainName("retired.coulson.local".to_string());
+        let (node_row, _) = repo
+            .upsert_scanned_managed(
+                "nodeapp",
+                &node_domain,
+                base.join("nodeapp").to_str().unwrap(),
+                "node",
+                true,
+                "apps_root",
+                "nodeapp",
+                None,
+            )
+            .expect("seed node row");
+        let (retired_row, _) = repo
+            .upsert_scanned_managed(
+                "retired",
+                &retired_domain,
+                base.join("retired").to_str().unwrap(),
+                "node",
+                true,
+                "apps_root",
+                "retired",
+                None,
+            )
+            .expect("seed retired row");
+        let protected: HashSet<String> = result.indeterminate_entries.into_iter().collect();
+        let pruned = repo
+            .prune_scanned_not_in("apps_root", &HashSet::new(), &protected)
+            .expect("prune");
+        assert!(repo.get_by_id(node_row.id.0).unwrap().is_some());
+        assert!(repo.get_by_id(retired_row.id.0).unwrap().is_none());
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].id, retired_row.id);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn entry_absence_only_definitive_for_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("coulson-test-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let apps_root = base.join("apps");
+        std::fs::create_dir_all(&apps_root).expect("mkdir");
+        std::fs::write(apps_root.join("present"), "5006\n").expect("write");
+
+        assert!(!entry_definitively_absent(&apps_root, "present").expect("stat present"));
+        assert!(entry_definitively_absent(&apps_root, "gone").expect("stat gone"));
+
+        // Untraversable parent: the entry may still exist — this must be an
+        // error (scan rollback), never "absent" (prune of a live app).
+        std::fs::set_permissions(&apps_root, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod no-exec");
+        let result = entry_definitively_absent(&apps_root, "present");
+        std::fs::set_permissions(&apps_root, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod rw");
+        assert!(result.is_err(), "stat error must not read as absence");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn refused_symlink_removal_preserves_target_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let base =
+            std::env::temp_dir().join(format!("coulson-test-fsentry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let apps_root = base.join("apps");
+        let src = base.join("src");
+        std::fs::create_dir_all(&apps_root).expect("mkdir apps");
+        std::fs::create_dir_all(&src).expect("mkdir src");
+        let target = src.join(".coulson");
+        std::fs::write(&target, "5006\n").expect("write target");
+        std::os::unix::fs::symlink(&target, apps_root.join("myapp")).expect("symlink");
+
+        // Read-only apps_root: the symlink cannot be unlinked. The refusal
+        // must leave BOTH the symlink and its config-file target untouched.
+        std::fs::set_permissions(&apps_root, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod ro");
+        let refused = remove_app_fs_entry(&apps_root, "myapp");
+        std::fs::set_permissions(&apps_root, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod rw");
+        assert_eq!(refused, FsEntryRemoval::Refused);
+        assert!(
+            target.exists(),
+            "refused removal must not delete the target"
+        );
+        assert!(apps_root.join("myapp").symlink_metadata().is_ok());
+
+        // Unstattable entry (parent not traversable) is Refused, not Missing:
+        // it may still exist and be rediscovered by a scan.
+        std::fs::set_permissions(&apps_root, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod no-exec");
+        let unstattable = remove_app_fs_entry(&apps_root, "myapp");
+        std::fs::set_permissions(&apps_root, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod rw");
+        assert_eq!(unstattable, FsEntryRemoval::Refused);
+
+        // Writable root: removal succeeds and then cleans the target too.
+        assert_eq!(
+            remove_app_fs_entry(&apps_root, "myapp"),
+            FsEntryRemoval::Removed
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            remove_app_fs_entry(&apps_root, "myapp"),
+            FsEntryRemoval::Missing
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn sanitize_dir_name() {

@@ -81,8 +81,10 @@ pub trait ProcessProvider: Send + Sync {
     /// Try to detect if `dir` contains an app this provider can manage.
     ///
     /// `manifest` is the parsed `.coulson.toml` content (as JSON Value) if present.
-    /// Returns `None` if the provider cannot handle this directory.
-    fn detect(&self, dir: &Path, manifest: Option<&Value>) -> Option<DetectedApp>;
+    /// Returns `Ok(None)` only for a definitive non-match. Filesystem and parse
+    /// uncertainty must be returned as `Err` so scanners do not turn a
+    /// half-written provider file into route removal or fallback reclassification.
+    fn detect(&self, dir: &Path, manifest: Option<&Value>) -> Result<Option<DetectedApp>>;
 
     /// Resolve a concrete [`ProcessSpec`] from the app context.
     fn resolve(&self, app: &ManagedApp) -> Result<ProcessSpec>;
@@ -127,13 +129,13 @@ impl ProviderRegistry {
         &self,
         dir: &Path,
         manifest: Option<&Value>,
-    ) -> Option<(&dyn ProcessProvider, DetectedApp)> {
+    ) -> Result<Option<(&dyn ProcessProvider, DetectedApp)>> {
         // If manifest explicitly specifies a kind, prefer that provider.
         if let Some(m) = manifest {
             if let Some(kind) = m.get("kind").and_then(|v| v.as_str()) {
                 if let Some(provider) = self.get(kind) {
-                    if let Some(detected) = provider.detect(dir, manifest) {
-                        return Some((provider, detected));
+                    if let Some(detected) = provider.detect(dir, manifest)? {
+                        return Ok(Some((provider, detected)));
                     }
                 }
             }
@@ -141,16 +143,39 @@ impl ProviderRegistry {
 
         // Otherwise, try each provider in priority order.
         for p in &self.providers {
-            if let Some(detected) = p.detect(dir, manifest) {
-                return Some((p.as_ref(), detected));
+            if let Some(detected) = p.detect(dir, manifest)? {
+                return Ok(Some((p.as_ref(), detected)));
             }
         }
-        None
+        Ok(None)
     }
 
     /// List all registered provider kind identifiers.
     pub fn kinds(&self) -> Vec<&str> {
         self.providers.iter().map(|p| p.kind()).collect()
+    }
+}
+
+/// Probe a provider marker without collapsing permission/I/O errors into
+/// absence. `Path::exists()` is unsuitable for discovery because it returns
+/// false for every metadata error.
+pub(crate) fn detection_path_exists(path: &Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(anyhow::Error::new(err)
+            .context(format!("failed to stat provider marker {}", path.display()))),
+    }
+}
+
+/// Read an optional provider marker while preserving the distinction between
+/// NotFound (a definitive non-match) and unreadable/half-written content.
+pub(crate) fn read_optional_detection_file(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(anyhow::Error::new(err)
+            .context(format!("failed to read provider marker {}", path.display()))),
     }
 }
 
@@ -297,14 +322,14 @@ mod tests {
         fn display_name(&self) -> &str {
             self.id
         }
-        fn detect(&self, _dir: &Path, _manifest: Option<&Value>) -> Option<DetectedApp> {
+        fn detect(&self, _dir: &Path, _manifest: Option<&Value>) -> Result<Option<DetectedApp>> {
             if self.should_detect {
-                Some(DetectedApp {
+                Ok(Some(DetectedApp {
                     kind: self.id.to_string(),
                     meta: Value::Null,
-                })
+                }))
             } else {
-                None
+                Ok(None)
             }
         }
         fn resolve(&self, _app: &ManagedApp) -> Result<ProcessSpec> {
@@ -345,7 +370,10 @@ mod tests {
         });
 
         let dir = Path::new("/tmp/fake");
-        let (provider, detected) = reg.detect(dir, None).expect("should detect");
+        let (provider, detected) = reg
+            .detect(dir, None)
+            .expect("detection succeeds")
+            .expect("should detect");
         assert_eq!(provider.kind(), "second"); // first matching wins
         assert_eq!(detected.kind, "second");
     }
@@ -364,7 +392,10 @@ mod tests {
 
         let dir = Path::new("/tmp/fake");
         let manifest = serde_json::json!({ "kind": "second" });
-        let (provider, _) = reg.detect(dir, Some(&manifest)).expect("should detect");
+        let (provider, _) = reg
+            .detect(dir, Some(&manifest))
+            .expect("detection succeeds")
+            .expect("should detect");
         assert_eq!(provider.kind(), "second"); // manifest kind wins
     }
 

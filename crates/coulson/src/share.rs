@@ -117,6 +117,7 @@ mod tests {
     fn test_repo() -> AppRepository {
         let repo = AppRepository {
             conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            read_conn: None,
             domain_suffix: "test".to_string(),
             change_tx: None,
         };

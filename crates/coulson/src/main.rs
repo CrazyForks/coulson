@@ -143,6 +143,9 @@ pub struct SharedState {
     pub inspector_password: Option<String>,
     /// Cached privileged-port status with TTL to avoid per-request disk I/O.
     forward_cache: Arc<Mutex<(bool, std::time::Instant)>>,
+    /// Serializes apps-root scans (manual RPC scan vs fs-watcher scan): the
+    /// scan's store upserts + prune + hook-map swap must not interleave.
+    pub scan_mutex: Arc<Mutex<()>>,
 }
 
 impl SharedState {
@@ -187,7 +190,6 @@ impl SharedState {
     /// Uses the cached PF-forwarding check so URLs reflect privileged-port status.
     pub fn hook_factory(&self) -> HookContextFactory {
         HookContextFactory::new(
-            Arc::clone(&self.store),
             self.listen_http.port(),
             self.listen_https.map(|a| a.port()),
             self.use_default_http_port(),
@@ -508,7 +510,6 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
                 .unwrap_or(false)
             || is_pf_configured_quick(&cfg.listen_http, &cfg.listen_https));
     let pm_hook_factory = HookContextFactory::new(
-        Arc::clone(&store),
         cfg.listen_http.port(),
         cfg.listen_https.map(|a| a.port()),
         pm_use_default_http,
@@ -523,6 +524,7 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
         hook_manager: Arc::clone(&hook_manager),
         hook_factory: pm_hook_factory,
         log_tx: log_tx.clone(),
+        store: Arc::clone(&store),
     });
 
     Ok(SharedState {
@@ -557,6 +559,7 @@ fn build_state(cfg: &CoulsonConfig) -> anyhow::Result<SharedState> {
             is_forward_configured_for_port(cfg.listen_http.port()) || is_pf_configured(cfg),
             std::time::Instant::now(),
         ))),
+        scan_mutex: Arc::new(Mutex::new(())),
     })
 }
 
@@ -1261,6 +1264,10 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
         while rx.recv().await.is_some() {
             match scanner::sync_from_apps_root(&watch_state) {
                 Ok(result) => {
+                    // Teardown first — the pruned rows and hook registrations
+                    // are already gone, so it must not depend on the fallible
+                    // steps below succeeding.
+                    service::teardown_pruned_apps(&watch_state, &result.pruned_apps).await;
                     if let Err(err) =
                         runtime::write_scan_warnings(&watch_state.scan_warnings_path, &result.stats)
                     {
@@ -1311,11 +1318,38 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
         }
     });
 
-    let reaper_pm = state.process_manager.clone();
+    let reaper_state = state.clone();
     let reaper_task = tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(30)).await;
-            let mut pm = reaper_pm.lock().await;
+            // Reconcile against the store: apps can be deleted behind the
+            // ProcessManager's back (scanner prune, out-of-process `coulson
+            // scan`). The store is read while holding the PM lock — any group
+            // in the map was inserted before the lock was acquired, and an app
+            // row always exists before its process starts, so a freshly
+            // created app can never be misread as an orphan. On a store error
+            // skip reconciling — an empty set would read as "kill everything".
+            let mut pm = reaper_state.process_manager.lock().await;
+            match reaper_state.store.list_filtered(None, None) {
+                Ok(apps) => {
+                    let live_apps: HashMap<i64, (String, std::path::PathBuf, String)> = apps
+                        .into_iter()
+                        .filter_map(|a| match a.target {
+                            BackendTarget::Managed {
+                                root, name, kind, ..
+                            } => Some((a.id.0, (name, std::path::PathBuf::from(root), kind))),
+                            _ => None,
+                        })
+                        .collect();
+                    let orphaned = pm.kill_orphans(&live_apps).await;
+                    if orphaned > 0 {
+                        info!(orphaned, "reaped orphaned managed processes");
+                    }
+                }
+                Err(err) => {
+                    error!(error = %err, "skipping orphan reconcile: store unavailable");
+                }
+            }
             let reaped = pm.reap_idle().await;
             if reaped > 0 {
                 info!(reaped, "reaped idle managed processes");
@@ -1722,7 +1756,7 @@ fn run_add_directory_inner(
     };
 
     let registry = process::default_registry();
-    if let Some((_provider, detected)) = registry.detect(cwd, manifest.as_ref()) {
+    if let Some((_provider, detected)) = registry.detect(cwd, manifest.as_ref())? {
         std::fs::create_dir_all(&cfg.apps_root)?;
         #[cfg(unix)]
         std::os::unix::fs::symlink(cwd, &link_path).with_context(|| {
@@ -1990,7 +2024,8 @@ fn run_rm_by_name(cfg: &CoulsonConfig, name: &str) -> anyhow::Result<()> {
     let mut removed_db = false;
 
     // Check apps_root for file/symlink
-    let removed_file = scanner::remove_app_fs_entry(&cfg.apps_root, bare_name);
+    let removed_file =
+        scanner::remove_app_fs_entry(&cfg.apps_root, bare_name) == scanner::FsEntryRemoval::Removed;
 
     // Best-effort RPC delete
     let client = RpcClient::new(&cfg.control_socket);
@@ -2303,9 +2338,12 @@ fn run_ps(cfg: CoulsonConfig) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Build app_id → (name, domain) map from app.list
-    let app_map: HashMap<String, (String, String)> =
-        if let Ok(app_result) = client.call("app.list", serde_json::json!({})) {
+    // Build app_id → (name, domain) map from app.list. `None` means the query
+    // itself failed — in that case no claims about removal can be made.
+    let app_map: Option<HashMap<String, (String, String)>> = client
+        .call("app.list", serde_json::json!({}))
+        .ok()
+        .and_then(|app_result| {
             app_result
                 .get("apps")
                 .and_then(|v| v.as_array())
@@ -2325,10 +2363,7 @@ fn run_ps(cfg: CoulsonConfig) -> anyhow::Result<()> {
                         })
                         .collect()
                 })
-                .unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
+        });
 
     #[derive(Tabled)]
     struct PsRow {
@@ -2355,10 +2390,16 @@ fn run_ps(cfg: CoulsonConfig) -> anyhow::Result<()> {
                 .get("app_id")
                 .map(|v| v.to_string().trim_matches('"').to_string())
                 .unwrap_or_default();
-            let (name, _domain) = app_map
-                .get(&app_id)
-                .cloned()
-                .unwrap_or_else(|| (app_id.to_string(), String::new()));
+            // A process whose app is gone from the store (deleted app dir,
+            // `coulson rm`) lingers until the orphan reaper's next tick — but
+            // only claim "removed" when the app query itself succeeded.
+            let (name, _domain) = match &app_map {
+                Some(map) => map
+                    .get(&app_id)
+                    .cloned()
+                    .unwrap_or_else(|| (format!("#{app_id} (removed)"), String::new())),
+                None => (app_id.to_string(), String::new()),
+            };
             let pid = p.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
             let kind_raw = p.get("kind").and_then(|v| v.as_str()).unwrap_or("unknown");
             let process_type = p
@@ -2918,10 +2959,12 @@ fn run_tunnel(cfg: CoulsonConfig, action: TunnelCommands) -> anyhow::Result<()> 
                     // 2. global named tunnel is connected → global (expose via it)
                     // 3. otherwise → quick
                     let app_info = find_app_json(&client, app_id)?;
+                    // The RPC DTO exposes only a presence boolean — the
+                    // credential JSON itself never leaves the daemon.
                     let has_creds = app_info
-                        .get("app_tunnel_creds")
-                        .and_then(|v| v.as_str())
-                        .is_some();
+                        .get("app_tunnel_creds_set")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     if has_creds {
                         TunnelMode::Named
                     } else {
