@@ -273,6 +273,8 @@ provider defaults  <  .coulson.toml [env]  <  env_url  <  .coulsonrc
 
 Rationale: committed `[env]` provides defaults/placeholders; `env_url` delivers authoritative remote secrets that override those defaults; `.coulsonrc` is the hand-edited local override that wins over everything (handy for pointing at a local DB while debugging). Below the provider defaults sit the user login-shell rc and the daemon's own environment.
 
+`coulson env` reports the winning effective value from these layers together with its source and scope. `app` settings are injected into managed app processes; `coulson` settings such as `COULSON_MANAGED_SERVICES` are consumed by Coulson itself and are not injected into those processes. Companion selection happens before `env_url` is fetched, so `COULSON_MANAGED_SERVICES` is only supported in `.coulson.toml [env]` and `.coulsonrc`; an `env_url` value is ignored. `--bare` prints both scopes as `KEY=value` lines.
+
 ### `.coulson.toml` — Per-App Configuration
 
 For full control, add a `.coulson.toml` in the app directory:
@@ -391,7 +393,7 @@ Priority: defaults < config file < environment variables.
 | `coulson start\|stop\|restart [name]` | Start / stop / restart a managed process |
 | `coulson ps` | Show running managed processes |
 | `coulson logs [name] [-f] [-n <lines>] [--path]` | Show logs (`--path` prints the log file path) |
-| `coulson env [name] [--bare\|--json] [--preview] [--no-remote]` | Show the resolved environment a process would receive |
+| `coulson env [name] [--bare\|--json] [--preview] [--no-remote]` | Show effective app and Coulson environment configuration with source and scope |
 | `coulson open [name]` | Open the app URL in the default browser |
 | `coulson attach [name]` | Attach to the process's tmux session |
 

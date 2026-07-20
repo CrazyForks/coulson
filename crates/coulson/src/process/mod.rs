@@ -209,17 +209,6 @@ impl EnvSource {
                 .unwrap_or_else(|| path.to_string_lossy().into_owned()),
         }
     }
-
-    /// Precedence rank (low → high). Used to order resolved entries so the
-    /// highest-priority overrides sort last.
-    fn rank(&self) -> u8 {
-        match self {
-            EnvSource::Provider => 0,
-            EnvSource::TomlEnv => 1,
-            EnvSource::EnvUrl => 2,
-            EnvSource::Dotenv(_) => 3,
-        }
-    }
 }
 
 impl serde::Serialize for EnvSource {
@@ -239,6 +228,33 @@ pub struct EnvEntry {
     pub key: String,
     pub value: String,
     pub source: EnvSource,
+    pub scope: EnvScope,
+}
+
+/// Where a resolved environment setting takes effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnvScope {
+    /// Injected into the managed app's processes.
+    App,
+    /// Consumed by Coulson itself and not injected into app processes.
+    Coulson,
+}
+
+impl EnvScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::Coulson => "coulson",
+        }
+    }
+
+    fn for_key(key: &str) -> Self {
+        match key {
+            "COULSON_MANAGED_SERVICES" => Self::Coulson,
+            _ => Self::App,
+        }
+    }
 }
 
 /// An ordered stack of named environment layers, lowest precedence first. Both
@@ -279,9 +295,7 @@ impl LayeredEnv {
         out
     }
 
-    /// Every key with its winning value and the layer that set it, ordered by
-    /// source precedence (low → high) then key — so the highest-priority
-    /// overrides (`.coulsonrc`) sort last.
+    /// Every key with its winning value and the layer that set it, ordered by key.
     fn resolve(&self) -> Vec<EnvEntry> {
         let mut map: std::collections::BTreeMap<String, (String, EnvSource)> =
             std::collections::BTreeMap::new();
@@ -290,14 +304,14 @@ impl LayeredEnv {
                 map.insert(k.clone(), (v.clone(), src.clone()));
             }
         }
-        // BTreeMap gives key order; stable-sort by rank preserves key order
-        // within each precedence tier.
-        let mut entries: Vec<EnvEntry> = map
-            .into_iter()
-            .map(|(key, (value, source))| EnvEntry { key, value, source })
-            .collect();
-        entries.sort_by_key(|e| e.source.rank());
-        entries
+        map.into_iter()
+            .map(|(key, (value, source))| EnvEntry {
+                scope: EnvScope::for_key(&key),
+                key,
+                value,
+                source,
+            })
+            .collect()
     }
 }
 
@@ -373,10 +387,10 @@ impl ProcessManager {
         types
     }
 
-    /// The resolved environment (with provenance) the running web process was
-    /// started with. `None` if no process is tracked for this app, or the
-    /// tracked process has already exited (so callers report "not running"
-    /// instead of stale env for a dead handle).
+    /// The resolved environment configuration (with provenance and scope)
+    /// captured when the running app was started. `None` if no process is
+    /// tracked for this app, or the tracked process has already exited (so
+    /// callers report "not running" instead of stale env for a dead handle).
     pub fn process_env(&mut self, app_id: i64) -> Option<&[EnvEntry]> {
         let group = self.processes.get_mut(&app_id)?;
         if !is_alive(&mut group.primary.handle) {
@@ -1198,8 +1212,9 @@ impl ProcessManager {
 
         // Provider seeds `spec.env` with its framework defaults only. The
         // authoritative env layering (`.coulson.toml [env]` < env_url <
-        // `.coulsonrc`) and the `COULSON_MANAGED_SERVICES` strip are applied
-        // later by `apply_and_capture_env`, once env_url has been fetched.
+        // `.coulsonrc`) is applied later by `apply_and_capture_env`, once
+        // env_url has been fetched. Coulson-only settings are captured for
+        // inspection but stripped from the child environment there.
         let spec = prov.resolve(&managed_app)?;
 
         let _ = app_id; // used in caller for logging
@@ -1213,14 +1228,17 @@ impl ProcessManager {
         ))
     }
 
-    /// Resolve the environment a managed app's **web** process would receive,
-    /// annotating each variable with the source that won it — WITHOUT spawning.
+    /// Resolve a managed app's effective environment configuration, annotating
+    /// each variable with the source that won it and where it takes effect —
+    /// WITHOUT spawning.
     ///
-    /// Reuses the real spawn path (`resolve_spec` + `finalize_managed_env`) so
-    /// the result matches what the child would actually get. Resolving the
-    /// provider spec has the same side effects as a real start (binary
-    /// detection, and a transient free-port probe for TCP providers). When
-    /// `fetch_remote` is true, `env_url` is fetched. Used by `coulson env`.
+    /// Reuses the real spawn path (`resolve_spec` + `build_layered_env`) so
+    /// App-scoped entries match what the child would actually get. Coulson-
+    /// scoped entries are effective settings consumed by Coulson itself and
+    /// deliberately omitted from the child environment. Resolving the provider
+    /// spec has the same side effects as a real start (binary detection, and a
+    /// transient free-port probe for TCP providers). When `fetch_remote` is
+    /// true, `env_url` is fetched. Used by `coulson env`.
     pub async fn inspect_env(
         &self,
         app_id: i64,
@@ -1241,9 +1259,7 @@ impl ProcessManager {
         // Provenance falls straight out of the layered fold — no reverse lookup.
         let layered =
             build_layered_env(spec.env, &manifest, env_url_env.as_ref(), &coulsonrc, root);
-        let mut entries = layered.resolve();
-        entries.retain(|e| e.key != "COULSON_MANAGED_SERVICES");
-        Ok(entries)
+        Ok(layered.resolve())
     }
 
     /// Spawn a process using the current backend (direct or tmux).
@@ -1722,6 +1738,11 @@ fn manifest_env_map(manifest: Option<&serde_json::Value>) -> HashMap<String, Str
 /// in those layers would desync the child's `$PORT` from `listen_target` and
 /// break routing. It is therefore stripped from those overlay layers; the
 /// provider-chosen value (echoed by `.coulsonrc` when set there) stands.
+///
+/// `COULSON_MANAGED_SERVICES` is another control setting: companion selection
+/// happens before `env_url` is fetched, so only `.coulson.toml [env]` and
+/// `.coulsonrc` are supported sources. An env_url value is ignored rather than
+/// reported as if it had affected the startup decision.
 fn build_layered_env(
     provider_defaults: HashMap<String, String>,
     manifest: &Option<serde_json::Value>,
@@ -1743,6 +1764,11 @@ fn build_layered_env(
         if remote.remove("PORT").is_some() {
             debug!("ignoring PORT from env_url; PORT is managed by the provider");
         }
+        if remote.remove("COULSON_MANAGED_SERVICES").is_some() {
+            debug!(
+                "ignoring COULSON_MANAGED_SERVICES from env_url; it is only supported in .coulson.toml and .coulsonrc"
+            );
+        }
         env.push(EnvSource::EnvUrl, remote);
     }
 
@@ -1753,10 +1779,10 @@ fn build_layered_env(
     env
 }
 
-/// Apply the layered environment onto `spec.env` (merged, with the
-/// `COULSON_MANAGED_SERVICES` meta-var stripped) and return the resolved entries
-/// (with provenance, meta-var stripped) for storage / inspection. The meta-var
-/// selects companion processes and must never reach the child environment.
+/// Apply the app-scoped layered environment onto `spec.env` and return all
+/// effective entries (including Coulson-scoped settings) for inspection. The
+/// `COULSON_MANAGED_SERVICES` meta-var selects companion processes, so it is
+/// reported with `scope=coulson` but must never reach the child environment.
 fn apply_and_capture_env(
     spec: &mut ProcessSpec,
     manifest: &Option<serde_json::Value>,
@@ -1775,9 +1801,7 @@ fn apply_and_capture_env(
     merged.remove("COULSON_MANAGED_SERVICES");
     spec.env = merged;
 
-    let mut entries = layered.resolve();
-    entries.retain(|e| e.key != "COULSON_MANAGED_SERVICES");
-    entries
+    layered.resolve()
 }
 
 /// Parse environment variables from a response body.
@@ -3118,7 +3142,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_managed_env_precedence_and_strips_managed_services() {
+    fn apply_and_capture_env_reports_managed_services_but_strips_it_from_child() {
         use crate::process::provider::ListenTarget;
         let dir =
             std::env::temp_dir().join(format!("coulson-test-finalize-env-{}", std::process::id()));
@@ -3176,27 +3200,39 @@ mod tests {
         // The managed-services meta-var must never leak into the child env.
         assert!(!spec.env.contains_key("COULSON_MANAGED_SERVICES"));
 
-        // --- captured provenance: winning source per key, meta-var excluded ---
+        // --- captured inspection: winning source and scope per effective key ---
         let kind = |k: &str| entries.iter().find(|e| e.key == k).map(|e| e.source.kind());
+        let scope = |k: &str| entries.iter().find(|e| e.key == k).map(|e| e.scope);
         assert_eq!(kind("RC_WINS"), Some("dotenv"));
         assert_eq!(kind("URL_WINS"), Some("env_url"));
         assert_eq!(kind("ONLY_TOML"), Some("toml"));
         assert_eq!(kind("ONLY_PROVIDER"), Some("provider"));
-        assert!(kind("COULSON_MANAGED_SERVICES").is_none());
+        assert_eq!(kind("COULSON_MANAGED_SERVICES"), Some("dotenv"));
+        assert_eq!(scope("COULSON_MANAGED_SERVICES"), Some(EnvScope::Coulson));
+        assert_eq!(scope("ONLY_RC"), Some(EnvScope::App));
+        let managed_services = entries
+            .iter()
+            .find(|e| e.key == "COULSON_MANAGED_SERVICES")
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(managed_services).unwrap()["scope"],
+            "coulson"
+        );
         // The dotenv source carries the concrete file.
         let rc = entries.iter().find(|e| e.key == "RC_WINS").unwrap();
         assert!(matches!(&rc.source, EnvSource::Dotenv(p) if p.ends_with(".coulsonrc")));
-        // Ordered by source precedence (low → high), key within tier.
+        // Ordered by key regardless of scope.
         let keys: Vec<&str> = entries.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(
             keys,
             vec![
+                "COULSON_MANAGED_SERVICES",
                 "ONLY_PROVIDER",
+                "ONLY_RC",
                 "ONLY_TOML",
                 "ONLY_URL",
-                "URL_WINS",
-                "ONLY_RC",
-                "RC_WINS"
+                "RC_WINS",
+                "URL_WINS"
             ]
         );
 
@@ -3243,10 +3279,9 @@ mod tests {
         assert_eq!(kind("B"), Some("env_url"));
         assert_eq!(kind("C"), Some("env_url"));
         assert_eq!(kind("PORT"), Some("provider"));
-        // Ordered by source precedence (low → high), key within tier:
-        // provider(PORT) < env_url(B,C) < dotenv(A,D).
+        // Entries sort by key.
         let keys: Vec<&str> = resolved.iter().map(|e| e.key.as_str()).collect();
-        assert_eq!(keys, vec!["PORT", "B", "C", "A", "D"]);
+        assert_eq!(keys, vec!["A", "B", "C", "D", "PORT"]);
     }
 
     #[test]
@@ -3269,6 +3304,48 @@ mod tests {
         assert_eq!(merged.get("PORT").map(String::as_str), Some("PROVIDER"));
         // Non-PORT overlay keys still apply.
         assert_eq!(merged.get("X").map(String::as_str), Some("x"));
+    }
+
+    #[test]
+    fn managed_services_is_ignored_from_env_url() {
+        // Companion selection happens before env_url is fetched, so inspection
+        // must report the same supported source that startup actually uses.
+        let manifest = Some(serde_json::json!({
+            "env": { "COULSON_MANAGED_SERVICES": "worker" }
+        }));
+        let url = HashMap::from([(
+            "COULSON_MANAGED_SERVICES".to_string(),
+            "scheduler".to_string(),
+        )]);
+        let layered = build_layered_env(
+            HashMap::new(),
+            &manifest,
+            Some(&url),
+            &HashMap::new(),
+            Path::new("/app"),
+        );
+
+        assert_eq!(layered.get("COULSON_MANAGED_SERVICES"), Some("worker"));
+        let entry = layered
+            .resolve()
+            .into_iter()
+            .find(|e| e.key == "COULSON_MANAGED_SERVICES")
+            .unwrap();
+        assert_eq!(entry.source.kind(), "toml");
+        assert_eq!(entry.scope, EnvScope::Coulson);
+    }
+
+    #[test]
+    fn env_scope_serde_uses_lowercase_names_and_rejects_unknown_values() {
+        assert_eq!(
+            serde_json::from_str::<EnvScope>(r#""app""#).unwrap(),
+            EnvScope::App
+        );
+        assert_eq!(
+            serde_json::from_str::<EnvScope>(r#""coulson""#).unwrap(),
+            EnvScope::Coulson
+        );
+        assert!(serde_json::from_str::<EnvScope>(r#""process""#).is_err());
     }
 
     #[test]

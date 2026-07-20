@@ -39,7 +39,7 @@ use tabled::Tabled;
 use crate::config::{CoulsonConfig, LOCALHOST_SUFFIX};
 use crate::domain::{AppSpec, BackendTarget, TunnelMode};
 use crate::hooks::{HookContextFactory, HookManager};
-use crate::process::{ProcessManagerHandle, ProviderRegistry};
+use crate::process::{EnvScope, ProcessManagerHandle, ProviderRegistry};
 use crate::rpc_client::RpcClient;
 use crate::share::ShareSigner;
 use crate::store::AppRepository;
@@ -340,14 +340,14 @@ enum Commands {
         #[arg(long)]
         path: bool,
     },
-    /// Show the resolved environment a managed app's web process would receive
+    /// Show the resolved environment configuration for a managed app
     Env {
         /// App name or domain (omit to match CWD)
         name: Option<String>,
-        /// Print as plain KEY=value lines (no source column)
+        /// Print as plain KEY=value lines (no source or scope columns)
         #[arg(long)]
         bare: bool,
-        /// Print as JSON (array of {key, value, source})
+        /// Print as JSON (array of {key, value, source, scope})
         #[arg(long)]
         json: bool,
         /// Show the would-be env (re-resolved now) instead of the running process
@@ -2180,9 +2180,16 @@ async fn run_env(
     preview: bool,
     no_remote: bool,
 ) -> anyhow::Result<()> {
-    // Each row is (key, value, source_kind, source_label).
-    let rows: Vec<(String, String, String, String)> = if preview {
-        // Re-resolve locally: what the app *would* get if started now.
+    struct EnvRow {
+        key: String,
+        value: String,
+        source_kind: String,
+        source_label: String,
+        scope: EnvScope,
+    }
+
+    let rows: Vec<EnvRow> = if preview {
+        // Re-resolve locally: the effective config if the app started now.
         let bare_name = resolve_app_name(&cfg, name.as_deref())?;
         let domain_match = format!("{bare_name}.{}", cfg.domain_suffix);
         let state = build_state(&cfg)?;
@@ -2221,14 +2228,16 @@ async fn run_env(
         );
         entries
             .into_iter()
-            .map(|e| {
-                let kind = e.source.kind().to_string();
-                let label = e.source.label();
-                (e.key, e.value, kind, label)
+            .map(|e| EnvRow {
+                key: e.key,
+                value: e.value,
+                source_kind: e.source.kind().to_string(),
+                source_label: e.source.label(),
+                scope: e.scope,
             })
             .collect()
     } else {
-        // Live: the env the running process was actually started with.
+        // Live: the effective config captured when the app was started.
         let client = RpcClient::new(&cfg.control_socket);
         let (_bare_name, app_id) = resolve_app_id(&client, &cfg, name)?;
         let result = client.call("process.env", serde_json::json!({ "app_id": app_id }))?;
@@ -2243,7 +2252,20 @@ async fn run_env(
                         let source = e.get("source")?;
                         let kind = source.get("kind")?.as_str()?.to_string();
                         let label = source.get("label")?.as_str()?.to_string();
-                        Some((key, value, kind, label))
+                        // A daemon from before scope was introduced omitted the
+                        // field; those entries were all app-scoped. Present but
+                        // unknown values are rejected by the enum parser.
+                        let scope = match e.get("scope") {
+                            Some(value) => serde_json::from_value(value.clone()).ok()?,
+                            None => EnvScope::App,
+                        };
+                        Some(EnvRow {
+                            key,
+                            value,
+                            source_kind: kind,
+                            source_label: label,
+                            scope,
+                        })
                     })
                     .collect()
             })
@@ -2253,11 +2275,12 @@ async fn run_env(
     if json {
         let arr: Vec<serde_json::Value> = rows
             .iter()
-            .map(|(k, v, kind, label)| {
+            .map(|row| {
                 serde_json::json!({
-                    "key": k,
-                    "value": v,
-                    "source": { "kind": kind, "label": label },
+                    "key": row.key,
+                    "value": row.value,
+                    "source": { "kind": row.source_kind, "label": row.source_label },
+                    "scope": row.scope,
                 })
             })
             .collect();
@@ -2265,8 +2288,8 @@ async fn run_env(
         return Ok(());
     }
     if bare {
-        for (k, v, _, _) in &rows {
-            println!("{k}={v}");
+        for row in &rows {
+            println!("{}={}", row.key, row.value);
         }
         return Ok(());
     }
@@ -2274,51 +2297,69 @@ async fn run_env(
         return Ok(());
     }
 
-    // Aligned KEY + SOURCE columns (bounded widths); VALUE last. Long values
-    // are truncated to the terminal width so rows stay one line and aligned.
-    // When output is not a TTY (piped), values are shown in full.
+    // Aligned KEY + SCOPE + SOURCE columns (bounded widths); VALUE last. Long
+    // values are truncated to the terminal width so rows stay one line and
+    // aligned. When output is not a TTY (piped), values are shown in full.
     let key_w = rows
         .iter()
-        .map(|(k, ..)| k.chars().count())
+        .map(|row| row.key.chars().count())
         .max()
         .unwrap_or(0)
         .max("KEY".len());
     let src_w = rows
         .iter()
-        .map(|(_, _, _, label)| label.chars().count())
+        .map(|row| row.source_label.chars().count())
         .max()
         .unwrap_or(0)
         .max("SOURCE".len());
+    let scope_w = rows
+        .iter()
+        .map(|row| row.scope.label().chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("SCOPE".len());
 
     const SEP: usize = 2; // spaces between columns
     let value_budget = terminal_size::terminal_size().map(|(w, _)| {
         (w.0 as usize)
-            .saturating_sub(key_w + src_w + SEP * 2)
+            .saturating_sub(key_w + src_w + scope_w + SEP * 3)
             .max(8)
     });
 
     println!(
-        "{}  {}  {}",
+        "{}  {}  {}  {}",
         format!("{:<key_w$}", "KEY").dimmed(),
+        format!("{:<scope_w$}", "SCOPE").dimmed(),
         format!("{:<src_w$}", "SOURCE").dimmed(),
         "VALUE".dimmed()
     );
-    for (k, v, kind, label) in &rows {
-        let src_cell = format!("{label:<src_w$}");
-        let src_cell = match kind.as_str() {
+    for row in &rows {
+        let src_cell = format!("{:<src_w$}", row.source_label);
+        let src_cell = match row.source_kind.as_str() {
             "dotenv" => src_cell.green(),
             "env_url" => src_cell.cyan(),
             "toml" => src_cell.yellow(),
             _ => src_cell.dimmed(),
         };
+        let scope_cell = format!("{:<scope_w$}", row.scope.label());
+        let scope_cell = match row.scope {
+            EnvScope::Coulson => scope_cell.blue(),
+            EnvScope::App => scope_cell.dimmed(),
+        };
         let value = match value_budget {
-            Some(budget) if v.chars().count() > budget => {
-                let head: String = v.chars().take(budget.saturating_sub(1)).collect();
+            Some(budget) if row.value.chars().count() > budget => {
+                let head: String = row.value.chars().take(budget.saturating_sub(1)).collect();
                 format!("{head}…")
             }
-            _ => v.clone(),
+            _ => row.value.clone(),
         };
-        println!("{}  {}  {}", format!("{k:<key_w$}").bold(), src_cell, value);
+        println!(
+            "{}  {}  {}  {}",
+            format!("{:<key_w$}", row.key).bold(),
+            scope_cell,
+            src_cell,
+            value
+        );
     }
     Ok(())
 }
