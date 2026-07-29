@@ -81,8 +81,9 @@ pub struct CoulsonConfig {
     /// Max request body (MiB) buffered per tunnel request before returning 413.
     pub max_tunnel_body_mb: usize,
     /// Host patterns (exact or `*.domain`) for which an incoming
-    /// x-forwarded-host on tunnel requests is trusted. Empty = off.
-    pub tunnel_trusted_forwarded_hosts: Vec<String>,
+    /// x-forwarded-host is trusted. Currently consulted only by the tunnel
+    /// ingress. Empty = off.
+    pub trusted_forwarded_hosts: Vec<String>,
     pub certs_dir: PathBuf,
     pub runtime_dir: PathBuf,
     pub process_backend: ProcessBackend,
@@ -124,7 +125,7 @@ impl Default for CoulsonConfig {
             link_dir: false,
             inspect_max_requests: 200,
             max_tunnel_body_mb: 100,
-            tunnel_trusted_forwarded_hosts: Vec::new(),
+            trusted_forwarded_hosts: Vec::new(),
             certs_dir: xdg_config_home().join(format!("{DIR_NAME}/certs")),
             runtime_dir,
             process_backend: ProcessBackend::Auto,
@@ -175,8 +176,8 @@ impl CoulsonConfig {
         if let Some(v) = file.max_tunnel_body_mb {
             cfg.max_tunnel_body_mb = v;
         }
-        if let Some(ref v) = file.tunnel_trusted_forwarded_hosts {
-            cfg.tunnel_trusted_forwarded_hosts = v.clone();
+        if let Some(ref v) = file.trusted_forwarded_hosts {
+            cfg.trusted_forwarded_hosts = v.clone();
         }
         if let Some(ref v) = file.certs_dir {
             cfg.certs_dir = expand_tilde(v);
@@ -250,8 +251,8 @@ impl CoulsonConfig {
                 .with_context(|| format!("invalid COULSON_MAX_TUNNEL_BODY_MB: {raw}"))?;
         }
 
-        if let Ok(raw) = env::var("COULSON_TUNNEL_TRUSTED_FORWARDED_HOSTS") {
-            cfg.tunnel_trusted_forwarded_hosts = parse_host_list(&raw);
+        if let Ok(raw) = env::var("COULSON_TRUSTED_FORWARDED_HOSTS") {
+            cfg.trusted_forwarded_hosts = parse_host_list(&raw);
         }
 
         if let Ok(path) = env::var("COULSON_CERTS_DIR") {
@@ -377,7 +378,7 @@ struct ConfigFile {
     link_dir: Option<bool>,
     inspect_max_requests: Option<usize>,
     max_tunnel_body_mb: Option<usize>,
-    tunnel_trusted_forwarded_hosts: Option<Vec<String>>,
+    trusted_forwarded_hosts: Option<Vec<String>>,
     certs_dir: Option<String>,
     runtime_dir: Option<String>,
     process_backend: Option<String>,
@@ -442,7 +443,7 @@ impl ConfigFile {
             link_dir,
             inspect_max_requests,
             max_tunnel_body_mb,
-            tunnel_trusted_forwarded_hosts,
+            trusted_forwarded_hosts,
             certs_dir,
             runtime_dir,
             process_backend,
@@ -471,18 +472,18 @@ mod tests {
     }
 
     #[test]
-    fn merge_overrides_tunnel_trusted_forwarded_hosts() {
+    fn merge_overrides_trusted_forwarded_hosts() {
         let mut base = ConfigFile {
-            tunnel_trusted_forwarded_hosts: Some(vec!["a.example.com".to_string()]),
+            trusted_forwarded_hosts: Some(vec!["a.example.com".to_string()]),
             ..Default::default()
         };
         let dev = ConfigFile {
-            tunnel_trusted_forwarded_hosts: Some(vec!["*.example.com".to_string()]),
+            trusted_forwarded_hosts: Some(vec!["*.example.com".to_string()]),
             ..Default::default()
         };
         base.merge(dev);
         assert_eq!(
-            base.tunnel_trusted_forwarded_hosts,
+            base.trusted_forwarded_hosts,
             Some(vec!["*.example.com".to_string()])
         );
     }
@@ -491,10 +492,7 @@ mod tests {
     fn parse_host_list_splits_trims_and_drops_empties() {
         assert_eq!(
             parse_host_list(" *.example.org , app.example.com ,, "),
-            vec![
-                "*.example.org".to_string(),
-                "app.example.com".to_string()
-            ]
+            vec!["*.example.org".to_string(), "app.example.com".to_string()]
         );
         assert!(parse_host_list("").is_empty());
     }
@@ -505,7 +503,7 @@ mod tests {
         if std::env::var_os(CHILD_MARKER).is_some() {
             let from_toml = CoulsonConfig::load().expect("load TOML config");
             assert_eq!(
-                from_toml.tunnel_trusted_forwarded_hosts,
+                from_toml.trusted_forwarded_hosts,
                 vec![
                     "toml.example.com".to_string(),
                     "*.toml.example.com".to_string()
@@ -513,12 +511,12 @@ mod tests {
             );
 
             std::env::set_var(
-                "COULSON_TUNNEL_TRUSTED_FORWARDED_HOSTS",
+                "COULSON_TRUSTED_FORWARDED_HOSTS",
                 " *.env.example.com, app.env.example.com ,, ",
             );
             let from_env = CoulsonConfig::load().expect("load env override");
             assert_eq!(
-                from_env.tunnel_trusted_forwarded_hosts,
+                from_env.trusted_forwarded_hosts,
                 vec![
                     "*.env.example.com".to_string(),
                     "app.env.example.com".to_string()
@@ -533,7 +531,7 @@ mod tests {
         std::fs::create_dir_all(&config_dir).expect("create config directory");
         std::fs::write(
             config_dir.join("config.toml"),
-            r#"tunnel_trusted_forwarded_hosts = ["toml.example.com", "*.toml.example.com"]"#,
+            r#"trusted_forwarded_hosts = ["toml.example.com", "*.toml.example.com"]"#,
         )
         .expect("write config");
 
@@ -547,7 +545,7 @@ mod tests {
             .env("XDG_CONFIG_HOME", &temp_root)
             .env("XDG_STATE_HOME", &temp_root)
             .env("XDG_RUNTIME_DIR", &temp_root)
-            .env_remove("COULSON_TUNNEL_TRUSTED_FORWARDED_HOSTS")
+            .env_remove("COULSON_TRUSTED_FORWARDED_HOSTS")
             .status()
             .expect("run isolated config test");
 

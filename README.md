@@ -364,13 +364,13 @@ When a named tunnel sits behind an ingress worker that supplies the visitor's
 original `X-Forwarded-Host`, allow only the external hosts you control:
 
 ```toml
-tunnel_trusted_forwarded_hosts = ["*.example.com", "app.example.net"]
+trusted_forwarded_hosts = ["*.example.com", "app.example.net"]
 ```
 
 The default empty list ignores incoming `X-Forwarded-Host` values. Exact
 patterns match one host; `*.example.com` matches exactly one leading DNS label.
 The equivalent environment variable is
-`COULSON_TUNNEL_TRUSTED_FORWARDED_HOSTS="*.example.com,app.example.net"`.
+`COULSON_TRUSTED_FORWARDED_HOSTS="*.example.com,app.example.net"`.
 
 This option is not intended for Quick Tunnels (`*.trycloudflare.com`), which
 have no fronting ingress worker.
