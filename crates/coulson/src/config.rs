@@ -80,6 +80,10 @@ pub struct CoulsonConfig {
     pub inspect_max_requests: usize,
     /// Max request body (MiB) buffered per tunnel request before returning 413.
     pub max_tunnel_body_mb: usize,
+    /// Host patterns (exact or `*.domain`) for which an incoming
+    /// x-forwarded-host is trusted. Currently consulted only by the tunnel
+    /// ingress. Empty = off.
+    pub trusted_forwarded_hosts: Vec<String>,
     pub certs_dir: PathBuf,
     pub runtime_dir: PathBuf,
     pub process_backend: ProcessBackend,
@@ -121,6 +125,7 @@ impl Default for CoulsonConfig {
             link_dir: false,
             inspect_max_requests: 200,
             max_tunnel_body_mb: 100,
+            trusted_forwarded_hosts: Vec::new(),
             certs_dir: xdg_config_home().join(format!("{DIR_NAME}/certs")),
             runtime_dir,
             process_backend: ProcessBackend::Auto,
@@ -170,6 +175,9 @@ impl CoulsonConfig {
         }
         if let Some(v) = file.max_tunnel_body_mb {
             cfg.max_tunnel_body_mb = v;
+        }
+        if let Some(ref v) = file.trusted_forwarded_hosts {
+            cfg.trusted_forwarded_hosts = v.clone();
         }
         if let Some(ref v) = file.certs_dir {
             cfg.certs_dir = expand_tilde(v);
@@ -241,6 +249,10 @@ impl CoulsonConfig {
             cfg.max_tunnel_body_mb = raw
                 .parse()
                 .with_context(|| format!("invalid COULSON_MAX_TUNNEL_BODY_MB: {raw}"))?;
+        }
+
+        if let Ok(raw) = env::var("COULSON_TRUSTED_FORWARDED_HOSTS") {
+            cfg.trusted_forwarded_hosts = parse_host_list(&raw);
         }
 
         if let Ok(path) = env::var("COULSON_CERTS_DIR") {
@@ -317,6 +329,14 @@ fn parse_bool(input: &str) -> anyhow::Result<bool> {
     }
 }
 
+fn parse_host_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Parse a listen address: bare port (`18080`) → `0.0.0.0:18080`,
 /// or a full `ip:port` string.
 fn parse_listen_addr(input: &str) -> anyhow::Result<SocketAddr> {
@@ -358,6 +378,7 @@ struct ConfigFile {
     link_dir: Option<bool>,
     inspect_max_requests: Option<usize>,
     max_tunnel_body_mb: Option<usize>,
+    trusted_forwarded_hosts: Option<Vec<String>>,
     certs_dir: Option<String>,
     runtime_dir: Option<String>,
     process_backend: Option<String>,
@@ -422,6 +443,7 @@ impl ConfigFile {
             link_dir,
             inspect_max_requests,
             max_tunnel_body_mb,
+            trusted_forwarded_hosts,
             certs_dir,
             runtime_dir,
             process_backend,
@@ -447,6 +469,88 @@ mod tests {
         };
         base.merge(dev);
         assert_eq!(base.max_tunnel_body_mb, Some(512));
+    }
+
+    #[test]
+    fn merge_overrides_trusted_forwarded_hosts() {
+        let mut base = ConfigFile {
+            trusted_forwarded_hosts: Some(vec!["a.example.com".to_string()]),
+            ..Default::default()
+        };
+        let dev = ConfigFile {
+            trusted_forwarded_hosts: Some(vec!["*.example.com".to_string()]),
+            ..Default::default()
+        };
+        base.merge(dev);
+        assert_eq!(
+            base.trusted_forwarded_hosts,
+            Some(vec!["*.example.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_host_list_splits_trims_and_drops_empties() {
+        assert_eq!(
+            parse_host_list(" *.example.org , app.example.com ,, "),
+            vec!["*.example.org".to_string(), "app.example.com".to_string()]
+        );
+        assert!(parse_host_list("").is_empty());
+    }
+
+    #[test]
+    fn load_applies_toml_hosts_and_env_override() {
+        const CHILD_MARKER: &str = "COULSON_CONFIG_LAYER_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let from_toml = CoulsonConfig::load().expect("load TOML config");
+            assert_eq!(
+                from_toml.trusted_forwarded_hosts,
+                vec![
+                    "toml.example.com".to_string(),
+                    "*.toml.example.com".to_string()
+                ]
+            );
+
+            std::env::set_var(
+                "COULSON_TRUSTED_FORWARDED_HOSTS",
+                " *.env.example.com, app.env.example.com ,, ",
+            );
+            let from_env = CoulsonConfig::load().expect("load env override");
+            assert_eq!(
+                from_env.trusted_forwarded_hosts,
+                vec![
+                    "*.env.example.com".to_string(),
+                    "app.env.example.com".to_string()
+                ]
+            );
+            return;
+        }
+
+        let temp_root =
+            std::env::temp_dir().join(format!("coulson-config-layer-{}", std::process::id()));
+        let config_dir = temp_root.join(DIR_NAME);
+        std::fs::create_dir_all(&config_dir).expect("create config directory");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            r#"trusted_forwarded_hosts = ["toml.example.com", "*.toml.example.com"]"#,
+        )
+        .expect("write config");
+
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "config::tests::load_applies_toml_hosts_and_env_override",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env("HOME", &temp_root)
+            .env("XDG_CONFIG_HOME", &temp_root)
+            .env("XDG_STATE_HOME", &temp_root)
+            .env("XDG_RUNTIME_DIR", &temp_root)
+            .env_remove("COULSON_TRUSTED_FORWARDED_HOSTS")
+            .status()
+            .expect("run isolated config test");
+
+        std::fs::remove_dir_all(&temp_root).expect("remove config directory");
+        assert!(status.success(), "isolated config test failed");
     }
 
     #[test]

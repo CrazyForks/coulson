@@ -26,6 +26,12 @@
 # Max requests to keep in the inspector buffer
 # inspect_max_requests = 200
 
+# Trust an ingress worker's X-Forwarded-Host only for these external hosts.
+# Empty (default) disables the feature. Wildcards match exactly one DNS label.
+# Intended for named tunnels behind an ingress worker, not Quick Tunnels.
+# Env: COULSON_TRUSTED_FORWARDED_HOSTS="*.example.com,app.example.net"
+# trusted_forwarded_hosts = ["*.example.com", "app.example.net"]
+
 # TLS certificate directory
 # certs_dir = "~/.config/coulson/certs"
 
