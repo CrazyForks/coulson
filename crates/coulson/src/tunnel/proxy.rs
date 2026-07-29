@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use h2::RecvStream;
@@ -35,6 +35,37 @@ static MAX_TUNNEL_REQUEST_BODY: AtomicUsize = AtomicUsize::new(100 * 1024 * 1024
 /// from the loaded `CoulsonConfig`.
 pub fn set_max_tunnel_request_body(bytes: usize) {
     MAX_TUNNEL_REQUEST_BODY.store(bytes, Ordering::Relaxed);
+}
+
+/// Host patterns for which an incoming `x-forwarded-host` value is trusted.
+/// Empty (the default) disables the feature. Set once at daemon startup via
+/// [`set_trusted_forwarded_hosts`].
+static TRUSTED_FORWARDED_HOSTS: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+pub fn set_trusted_forwarded_hosts(patterns: Vec<String>) {
+    *TRUSTED_FORWARDED_HOSTS
+        .write()
+        .expect("trusted forwarded hosts lock poisoned") = patterns;
+}
+
+/// True if `host` (port stripped, case-insensitive) matches any pattern.
+/// `*.example.com` matches exactly one leading DNS label.
+fn host_matches(host: &str, patterns: &[String]) -> bool {
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    patterns.iter().any(|pattern| {
+        let pattern = pattern.to_ascii_lowercase();
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            match host.split_once('.') {
+                Some((label, rest)) => !label.is_empty() && rest == suffix,
+                None => false,
+            }
+        } else {
+            host == pattern
+        }
+    })
 }
 
 /// Read the full h2 request body into memory, enforcing the configured
@@ -361,8 +392,24 @@ fn append_forwarding_headers(
     original_host: &str,
     incoming_headers: &http::HeaderMap,
 ) {
+    // Trust the incoming x-forwarded-host only when it matches the configured
+    // allowlist; the tunnel domain is publicly reachable, so anything else is
+    // client-forgeable.
+    let forwarded_host = incoming_headers
+        .get("x-forwarded-host")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .filter(|v| {
+            let patterns = TRUSTED_FORWARDED_HOSTS
+                .read()
+                .expect("trusted forwarded hosts lock poisoned");
+            host_matches(v, &patterns)
+        })
+        .unwrap_or(original_host)
+        .to_string();
+
     *builder = std::mem::take(builder)
-        .header("x-forwarded-host", original_host)
+        .header("x-forwarded-host", forwarded_host)
         .header("x-forwarded-proto", "https");
 
     // Propagate client IP from Cloudflare headers
@@ -482,5 +529,94 @@ mod tests {
             map_tunnel_host_to_local("unknown.other.com", "dev.example.com", "test"),
             "default.test"
         );
+    }
+
+    #[test]
+    fn test_host_matches() {
+        let patterns = vec![
+            "app.example.com".to_string(),
+            "*.example.org".to_string(),
+        ];
+
+        // exact
+        assert!(host_matches("app.example.com", &patterns));
+        assert!(!host_matches("other.example.com", &patterns));
+
+        // wildcard: exactly one label
+        assert!(host_matches("app-sandbox2.example.org", &patterns));
+        assert!(!host_matches("a.b.example.org", &patterns));
+        assert!(!host_matches("example.org", &patterns));
+        // suffix must match whole labels, not substrings
+        assert!(!host_matches("app.evil-example.org", &patterns));
+
+        // case-insensitive, port stripped
+        assert!(host_matches("APP.Example.COM", &patterns));
+        assert!(host_matches("app.example.com:8443", &patterns));
+        assert!(host_matches("x.EXAMPLE.ORG", &patterns));
+
+        // empties
+        assert!(!host_matches("", &patterns));
+        assert!(!host_matches("app.example.com", &[]));
+    }
+
+    #[test]
+    fn test_append_forwarding_headers_trust_allowlist() {
+        fn built_forwarded_host(original_host: &str, incoming: &http::HeaderMap) -> String {
+            let mut builder = http::Request::builder().uri("http://127.0.0.1/");
+            append_forwarding_headers(&mut builder, original_host, incoming);
+            builder
+                .headers_ref()
+                .unwrap()
+                .get("x-forwarded-host")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+
+        let mut incoming = http::HeaderMap::new();
+        incoming.insert("x-forwarded-host", "app.example.org".parse().unwrap());
+
+        // default (empty allowlist): incoming value ignored
+        set_trusted_forwarded_hosts(Vec::new());
+        assert_eq!(
+            built_forwarded_host("tunnel.example.net", &incoming),
+            "tunnel.example.net"
+        );
+
+        // allowlist hit: incoming value wins
+        set_trusted_forwarded_hosts(vec!["*.example.org".to_string()]);
+        assert_eq!(
+            built_forwarded_host("tunnel.example.net", &incoming),
+            "app.example.org"
+        );
+
+        // allowlist miss: fall back to original_host
+        let mut spoofed = http::HeaderMap::new();
+        spoofed.insert("x-forwarded-host", "evil.com".parse().unwrap());
+        assert_eq!(
+            built_forwarded_host("tunnel.example.net", &spoofed),
+            "tunnel.example.net"
+        );
+
+        // header absent: fall back
+        assert_eq!(
+            built_forwarded_host("tunnel.example.net", &http::HeaderMap::new()),
+            "tunnel.example.net"
+        );
+
+        // x-forwarded-proto untouched in all cases
+        let mut builder = http::Request::builder().uri("http://127.0.0.1/");
+        append_forwarding_headers(&mut builder, "tunnel.example.net", &incoming);
+        assert_eq!(
+            builder
+                .headers_ref()
+                .unwrap()
+                .get("x-forwarded-proto")
+                .unwrap(),
+            "https"
+        );
+
+        set_trusted_forwarded_hosts(Vec::new());
     }
 }
