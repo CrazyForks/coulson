@@ -358,6 +358,23 @@ Configure wildcard DNS for your own domain (e.g. `*.example.com`) pointing to a 
 
 All projects share one Tunnel connection — no per-app setup needed, new projects are instantly accessible from the public internet.
 
+### Trusted Forwarded Host
+
+When a named tunnel sits behind an ingress worker that supplies the visitor's
+original `X-Forwarded-Host`, allow only the external hosts you control:
+
+```toml
+tunnel_trusted_forwarded_hosts = ["*.example.com", "app.example.net"]
+```
+
+The default empty list ignores incoming `X-Forwarded-Host` values. Exact
+patterns match one host; `*.example.com` matches exactly one leading DNS label.
+The equivalent environment variable is
+`COULSON_TUNNEL_TRUSTED_FORWARDED_HOSTS="*.example.com,app.example.net"`.
+
+This option is not intended for Quick Tunnels (`*.trycloudflare.com`), which
+have no fronting ingress worker.
+
 ## Management
 
 - **Web Dashboard**: `http://coulson.local:18080`

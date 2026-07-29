@@ -51,7 +51,10 @@ pub fn set_trusted_forwarded_hosts(patterns: Vec<String>) {
 /// True if `host` (port stripped, case-insensitive) matches any pattern.
 /// `*.example.com` matches exactly one leading DNS label.
 fn host_matches(host: &str, patterns: &[String]) -> bool {
-    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    let Ok(authority) = host.parse::<http::uri::Authority>() else {
+        return false;
+    };
+    let host = authority.host().to_ascii_lowercase();
     if host.is_empty() {
         return false;
     }
@@ -596,6 +599,19 @@ mod tests {
         spoofed.insert("x-forwarded-host", "evil.com".parse().unwrap());
         assert_eq!(
             built_forwarded_host("tunnel.example.net", &spoofed),
+            "tunnel.example.net"
+        );
+
+        // A colon suffix must be a real numeric port, not arbitrary authority
+        // syntax that could be interpreted as a different host downstream.
+        set_trusted_forwarded_hosts(vec!["app.example.com".to_string()]);
+        let mut malformed = http::HeaderMap::new();
+        malformed.insert(
+            "x-forwarded-host",
+            "app.example.com:@evil.com".parse().unwrap(),
+        );
+        assert_eq!(
+            built_forwarded_host("tunnel.example.net", &malformed),
             "tunnel.example.net"
         );
 

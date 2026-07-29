@@ -500,6 +500,62 @@ mod tests {
     }
 
     #[test]
+    fn load_applies_toml_hosts_and_env_override() {
+        const CHILD_MARKER: &str = "COULSON_CONFIG_LAYER_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let from_toml = CoulsonConfig::load().expect("load TOML config");
+            assert_eq!(
+                from_toml.tunnel_trusted_forwarded_hosts,
+                vec![
+                    "toml.example.com".to_string(),
+                    "*.toml.example.com".to_string()
+                ]
+            );
+
+            std::env::set_var(
+                "COULSON_TUNNEL_TRUSTED_FORWARDED_HOSTS",
+                " *.env.example.com, app.env.example.com ,, ",
+            );
+            let from_env = CoulsonConfig::load().expect("load env override");
+            assert_eq!(
+                from_env.tunnel_trusted_forwarded_hosts,
+                vec![
+                    "*.env.example.com".to_string(),
+                    "app.env.example.com".to_string()
+                ]
+            );
+            return;
+        }
+
+        let temp_root =
+            std::env::temp_dir().join(format!("coulson-config-layer-{}", std::process::id()));
+        let config_dir = temp_root.join(DIR_NAME);
+        std::fs::create_dir_all(&config_dir).expect("create config directory");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            r#"tunnel_trusted_forwarded_hosts = ["toml.example.com", "*.toml.example.com"]"#,
+        )
+        .expect("write config");
+
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "config::tests::load_applies_toml_hosts_and_env_override",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env("HOME", &temp_root)
+            .env("XDG_CONFIG_HOME", &temp_root)
+            .env("XDG_STATE_HOME", &temp_root)
+            .env("XDG_RUNTIME_DIR", &temp_root)
+            .env_remove("COULSON_TUNNEL_TRUSTED_FORWARDED_HOSTS")
+            .status()
+            .expect("run isolated config test");
+
+        std::fs::remove_dir_all(&temp_root).expect("remove config directory");
+        assert!(status.success(), "isolated config test failed");
+    }
+
+    #[test]
     fn merge_keeps_base_when_dev_field_unset() {
         let mut base = ConfigFile {
             max_tunnel_body_mb: Some(100),
