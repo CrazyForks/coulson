@@ -1059,6 +1059,7 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
     // Saturate rather than wrap/panic on an absurd config value (a wrap could
     // silently shrink the cap instead of enlarging it).
     tunnel::proxy::set_max_tunnel_request_body(cfg.max_tunnel_body_mb.saturating_mul(1024 * 1024));
+    tunnel::proxy::set_trusted_forwarded_hosts(cfg.tunnel_trusted_forwarded_hosts.clone());
 
     let state = build_state(&cfg)?;
 

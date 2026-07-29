@@ -80,6 +80,9 @@ pub struct CoulsonConfig {
     pub inspect_max_requests: usize,
     /// Max request body (MiB) buffered per tunnel request before returning 413.
     pub max_tunnel_body_mb: usize,
+    /// Host patterns (exact or `*.domain`) for which an incoming
+    /// x-forwarded-host on tunnel requests is trusted. Empty = off.
+    pub tunnel_trusted_forwarded_hosts: Vec<String>,
     pub certs_dir: PathBuf,
     pub runtime_dir: PathBuf,
     pub process_backend: ProcessBackend,
@@ -121,6 +124,7 @@ impl Default for CoulsonConfig {
             link_dir: false,
             inspect_max_requests: 200,
             max_tunnel_body_mb: 100,
+            tunnel_trusted_forwarded_hosts: Vec::new(),
             certs_dir: xdg_config_home().join(format!("{DIR_NAME}/certs")),
             runtime_dir,
             process_backend: ProcessBackend::Auto,
@@ -170,6 +174,9 @@ impl CoulsonConfig {
         }
         if let Some(v) = file.max_tunnel_body_mb {
             cfg.max_tunnel_body_mb = v;
+        }
+        if let Some(ref v) = file.tunnel_trusted_forwarded_hosts {
+            cfg.tunnel_trusted_forwarded_hosts = v.clone();
         }
         if let Some(ref v) = file.certs_dir {
             cfg.certs_dir = expand_tilde(v);
@@ -241,6 +248,10 @@ impl CoulsonConfig {
             cfg.max_tunnel_body_mb = raw
                 .parse()
                 .with_context(|| format!("invalid COULSON_MAX_TUNNEL_BODY_MB: {raw}"))?;
+        }
+
+        if let Ok(raw) = env::var("COULSON_TUNNEL_TRUSTED_FORWARDED_HOSTS") {
+            cfg.tunnel_trusted_forwarded_hosts = parse_host_list(&raw);
         }
 
         if let Ok(path) = env::var("COULSON_CERTS_DIR") {
@@ -317,6 +328,14 @@ fn parse_bool(input: &str) -> anyhow::Result<bool> {
     }
 }
 
+fn parse_host_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Parse a listen address: bare port (`18080`) → `0.0.0.0:18080`,
 /// or a full `ip:port` string.
 fn parse_listen_addr(input: &str) -> anyhow::Result<SocketAddr> {
@@ -358,6 +377,7 @@ struct ConfigFile {
     link_dir: Option<bool>,
     inspect_max_requests: Option<usize>,
     max_tunnel_body_mb: Option<usize>,
+    tunnel_trusted_forwarded_hosts: Option<Vec<String>>,
     certs_dir: Option<String>,
     runtime_dir: Option<String>,
     process_backend: Option<String>,
@@ -422,6 +442,7 @@ impl ConfigFile {
             link_dir,
             inspect_max_requests,
             max_tunnel_body_mb,
+            tunnel_trusted_forwarded_hosts,
             certs_dir,
             runtime_dir,
             process_backend,
@@ -447,6 +468,35 @@ mod tests {
         };
         base.merge(dev);
         assert_eq!(base.max_tunnel_body_mb, Some(512));
+    }
+
+    #[test]
+    fn merge_overrides_tunnel_trusted_forwarded_hosts() {
+        let mut base = ConfigFile {
+            tunnel_trusted_forwarded_hosts: Some(vec!["a.example.com".to_string()]),
+            ..Default::default()
+        };
+        let dev = ConfigFile {
+            tunnel_trusted_forwarded_hosts: Some(vec!["*.example.com".to_string()]),
+            ..Default::default()
+        };
+        base.merge(dev);
+        assert_eq!(
+            base.tunnel_trusted_forwarded_hosts,
+            Some(vec!["*.example.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_host_list_splits_trims_and_drops_empties() {
+        assert_eq!(
+            parse_host_list(" *.example.org , app.example.com ,, "),
+            vec![
+                "*.example.org".to_string(),
+                "app.example.com".to_string()
+            ]
+        );
+        assert!(parse_host_list("").is_empty());
     }
 
     #[test]
