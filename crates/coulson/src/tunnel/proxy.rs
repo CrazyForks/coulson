@@ -536,10 +536,7 @@ mod tests {
 
     #[test]
     fn test_host_matches() {
-        let patterns = vec![
-            "app.example.com".to_string(),
-            "*.example.org".to_string(),
-        ];
+        let patterns = vec!["app.example.com".to_string(), "*.example.org".to_string()];
 
         // exact
         assert!(host_matches("app.example.com", &patterns));
