@@ -182,6 +182,10 @@ pub struct AppSpec {
         skip_deserializing
     )]
     pub app_tunnel_creds: Option<String>,
+    /// Host patterns (exact or `*.domain`) for which tunnel ingress trusts an
+    /// incoming `x-forwarded-host`. Empty means the header is ignored.
+    #[serde(default)]
+    pub trusted_forwarded_hosts: Vec<String>,
     pub inspect_enabled: bool,
     pub lan_access: bool,
     pub cname: Option<String>,

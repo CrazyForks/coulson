@@ -1059,7 +1059,6 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
     // Saturate rather than wrap/panic on an absurd config value (a wrap could
     // silently shrink the cap instead of enlarging it).
     tunnel::proxy::set_max_tunnel_request_body(cfg.max_tunnel_body_mb.saturating_mul(1024 * 1024));
-    tunnel::proxy::set_trusted_forwarded_hosts(cfg.trusted_forwarded_hosts.clone());
 
     let state = build_state(&cfg)?;
 
@@ -1126,8 +1125,10 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
                         (&app.app_tunnel_creds, &app.app_tunnel_domain)
                     {
                         let routing = tunnel::transport::TunnelRouting::FixedHost {
+                            app_id: app.id.0,
                             local_host: app.domain.0.clone(),
                             local_proxy_port: state.listen_http.port(),
+                            store: state.store.clone(),
                         };
                         match serde_json::from_str::<tunnel::TunnelCredentials>(creds_json) {
                             Ok(credentials) => {
@@ -1167,8 +1168,10 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
             Ok(apps) => {
                 for app in apps {
                     let routing = tunnel::transport::TunnelRouting::FixedHost {
+                        app_id: app.id.0,
                         local_host: app.domain.0.clone(),
                         local_proxy_port: state.listen_http.port(),
+                        store: state.store.clone(),
                     };
                     info!(
                         app_id = %app.id.0,

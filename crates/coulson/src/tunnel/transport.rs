@@ -23,8 +23,10 @@ pub enum TunnelRouting {
     /// Per-app tunnel: rewrite Host header to app domain,
     /// forward to the local Pingora proxy.
     FixedHost {
+        app_id: i64,
         local_host: String,
         local_proxy_port: u16,
+        store: Arc<AppRepository>,
     },
     /// Named Tunnel: extract app from Host header, rewrite Host, forward to Pingora.
     HostBased {
@@ -320,14 +322,30 @@ async fn try_connect(
                 tokio::spawn(async move {
                     let result = match &routing {
                         TunnelRouting::FixedHost {
+                            app_id,
                             local_host,
                             local_proxy_port,
+                            store,
                         } => {
+                            let trusted_forwarded_hosts = match store
+                                .trusted_forwarded_hosts_for_app(*app_id)
+                            {
+                                Ok(patterns) => patterns,
+                                Err(err) => {
+                                    warn!(
+                                        app_id,
+                                        error = %err,
+                                        "failed to load app trusted forwarded hosts; ignoring incoming header"
+                                    );
+                                    Vec::new()
+                                }
+                            };
                             proxy::proxy_to_local_with_host(
                                 request,
                                 send_response,
                                 *local_proxy_port,
                                 local_host,
+                                &trusted_forwarded_hosts,
                             )
                             .await
                         }

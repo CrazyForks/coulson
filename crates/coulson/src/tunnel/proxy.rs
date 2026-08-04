@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use h2::RecvStream;
@@ -35,17 +35,6 @@ static MAX_TUNNEL_REQUEST_BODY: AtomicUsize = AtomicUsize::new(100 * 1024 * 1024
 /// from the loaded `CoulsonConfig`.
 pub fn set_max_tunnel_request_body(bytes: usize) {
     MAX_TUNNEL_REQUEST_BODY.store(bytes, Ordering::Relaxed);
-}
-
-/// Host patterns for which an incoming `x-forwarded-host` value is trusted.
-/// Empty (the default) disables the feature. Set once at daemon startup via
-/// [`set_trusted_forwarded_hosts`].
-static TRUSTED_FORWARDED_HOSTS: RwLock<Vec<String>> = RwLock::new(Vec::new());
-
-pub fn set_trusted_forwarded_hosts(patterns: Vec<String>) {
-    *TRUSTED_FORWARDED_HOSTS
-        .write()
-        .expect("trusted forwarded hosts lock poisoned") = patterns;
 }
 
 /// True if `host` (port stripped, case-insensitive) matches any pattern.
@@ -110,6 +99,7 @@ pub async fn proxy_to_local_with_host(
     mut send_response: h2::server::SendResponse<Bytes>,
     local_proxy_port: u16,
     local_host: &str,
+    trusted_forwarded_hosts: &[String],
 ) -> anyhow::Result<()> {
     let (parts, mut body) = request.into_parts();
 
@@ -165,7 +155,12 @@ pub async fn proxy_to_local_with_host(
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| local_host.to_string());
-    append_forwarding_headers(&mut local_req, &original_host, &parts.headers);
+    append_forwarding_headers(
+        &mut local_req,
+        &original_host,
+        &parts.headers,
+        trusted_forwarded_hosts,
+    );
 
     let body_bytes = match collect_body_capped(&mut body).await? {
         Some(b) => b,
@@ -245,13 +240,13 @@ pub async fn proxy_by_host(
         .unwrap_or(tunnel_domain);
 
     let local_host = map_tunnel_host_to_local(original_host, tunnel_domain, local_suffix);
+    let domain_prefix = store::domain_to_db(&local_host, local_suffix);
 
     // Check tunnel access: extract domain prefix and verify the app allows tunnel access.
     // Apps with tunnel_mode "global", "quick", or "named" are allowed.
     // Apps with tunnel_mode "none" are not exposed through the tunnel.
     // Skip this check if the request was already authorized via share auth.
     if !share_authorized {
-        let domain_prefix = store::domain_to_db(&local_host, local_suffix);
         let exposed = match app_store.is_tunnel_exposed(&domain_prefix) {
             Ok(v) => v,
             Err(e) => {
@@ -329,8 +324,30 @@ pub async fn proxy_by_host(
     local_req = local_req.header("host", &local_host);
     local_req = local_req.header(VIA_TUNNEL_HEADER, "1");
 
-    // Let the backend know the original tunnel host and protocol
-    append_forwarding_headers(&mut local_req, original_host, &parts.headers);
+    // Resolve the longest matching route for this mapped app domain. A failed
+    // or missing lookup is fail-closed: the client-supplied header is ignored.
+    let trusted_forwarded_hosts = match app_store
+        .trusted_forwarded_hosts_for_route(&domain_prefix, parts.uri.path())
+    {
+        Ok(patterns) => patterns,
+        Err(err) => {
+            warn!(
+                original_host = %original_host,
+                domain_prefix = %domain_prefix,
+                error = %err,
+                "failed to load app trusted forwarded hosts; ignoring incoming header"
+            );
+            Vec::new()
+        }
+    };
+
+    // Let the backend know the original tunnel host and protocol.
+    append_forwarding_headers(
+        &mut local_req,
+        original_host,
+        &parts.headers,
+        &trusted_forwarded_hosts,
+    );
 
     // Collect body (capped to bound peak memory)
     let body_bytes = match collect_body_capped(&mut body).await? {
@@ -394,20 +411,16 @@ fn append_forwarding_headers(
     builder: &mut http::request::Builder,
     original_host: &str,
     incoming_headers: &http::HeaderMap,
+    trusted_forwarded_hosts: &[String],
 ) {
-    // Trust the incoming x-forwarded-host only when it matches the configured
+    // Trust the incoming x-forwarded-host only when it matches this app's
     // allowlist; the tunnel domain is publicly reachable, so anything else is
     // client-forgeable.
     let forwarded_host = incoming_headers
         .get("x-forwarded-host")
         .and_then(|v| v.to_str().ok())
         .filter(|v| !v.is_empty())
-        .filter(|v| {
-            let patterns = TRUSTED_FORWARDED_HOSTS
-                .read()
-                .expect("trusted forwarded hosts lock poisoned");
-            host_matches(v, &patterns)
-        })
+        .filter(|v| host_matches(v, trusted_forwarded_hosts))
         .unwrap_or(original_host)
         .to_string();
 
@@ -561,9 +574,18 @@ mod tests {
 
     #[test]
     fn test_append_forwarding_headers_trust_allowlist() {
-        fn built_forwarded_host(original_host: &str, incoming: &http::HeaderMap) -> String {
+        fn built_forwarded_host(
+            original_host: &str,
+            incoming: &http::HeaderMap,
+            trusted_forwarded_hosts: &[String],
+        ) -> String {
             let mut builder = http::Request::builder().uri("http://127.0.0.1/");
-            append_forwarding_headers(&mut builder, original_host, incoming);
+            append_forwarding_headers(
+                &mut builder,
+                original_host,
+                incoming,
+                trusted_forwarded_hosts,
+            );
             builder
                 .headers_ref()
                 .unwrap()
@@ -578,16 +600,15 @@ mod tests {
         incoming.insert("x-forwarded-host", "app.example.org".parse().unwrap());
 
         // default (empty allowlist): incoming value ignored
-        set_trusted_forwarded_hosts(Vec::new());
         assert_eq!(
-            built_forwarded_host("tunnel.example.net", &incoming),
+            built_forwarded_host("tunnel.example.net", &incoming, &[]),
             "tunnel.example.net"
         );
 
         // allowlist hit: incoming value wins
-        set_trusted_forwarded_hosts(vec!["*.example.org".to_string()]);
+        let example_org = vec!["*.example.org".to_string()];
         assert_eq!(
-            built_forwarded_host("tunnel.example.net", &incoming),
+            built_forwarded_host("tunnel.example.net", &incoming, &example_org),
             "app.example.org"
         );
 
@@ -595,32 +616,41 @@ mod tests {
         let mut spoofed = http::HeaderMap::new();
         spoofed.insert("x-forwarded-host", "evil.com".parse().unwrap());
         assert_eq!(
-            built_forwarded_host("tunnel.example.net", &spoofed),
+            built_forwarded_host("tunnel.example.net", &spoofed, &example_org),
             "tunnel.example.net"
         );
 
         // A colon suffix must be a real numeric port, not arbitrary authority
         // syntax that could be interpreted as a different host downstream.
-        set_trusted_forwarded_hosts(vec!["app.example.com".to_string()]);
+        let example_com = vec!["app.example.com".to_string()];
         let mut malformed = http::HeaderMap::new();
         malformed.insert(
             "x-forwarded-host",
             "app.example.com:@evil.com".parse().unwrap(),
         );
         assert_eq!(
-            built_forwarded_host("tunnel.example.net", &malformed),
+            built_forwarded_host("tunnel.example.net", &malformed, &example_com),
             "tunnel.example.net"
         );
 
         // header absent: fall back
         assert_eq!(
-            built_forwarded_host("tunnel.example.net", &http::HeaderMap::new()),
+            built_forwarded_host(
+                "tunnel.example.net",
+                &http::HeaderMap::new(),
+                &example_com,
+            ),
             "tunnel.example.net"
         );
 
         // x-forwarded-proto untouched in all cases
         let mut builder = http::Request::builder().uri("http://127.0.0.1/");
-        append_forwarding_headers(&mut builder, "tunnel.example.net", &incoming);
+        append_forwarding_headers(
+            &mut builder,
+            "tunnel.example.net",
+            &incoming,
+            &example_org,
+        );
         assert_eq!(
             builder
                 .headers_ref()
@@ -629,7 +659,5 @@ mod tests {
                 .unwrap(),
             "https"
         );
-
-        set_trusted_forwarded_hosts(Vec::new());
     }
 }

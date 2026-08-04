@@ -293,6 +293,7 @@ port = 5006
 timeout = 5000
 cors = false
 spa = false
+trusted_forwarded_hosts = ["*.example.com", "app.example.net"]
 
 # Remote env injection (fetched before each cold start)
 env_url = "https://vault.example.com/env/myapp"
@@ -360,17 +361,18 @@ All projects share one Tunnel connection — no per-app setup needed, new projec
 
 ### Trusted Forwarded Host
 
-When a named tunnel sits behind an ingress worker that supplies the visitor's
-original `X-Forwarded-Host`, allow only the external hosts you control:
+When a tunnel sits behind an ingress worker that supplies the visitor's
+original `X-Forwarded-Host`, configure the allowlist on that app in its
+`.coulson.toml`:
 
 ```toml
 trusted_forwarded_hosts = ["*.example.com", "app.example.net"]
 ```
 
-The default empty list ignores incoming `X-Forwarded-Host` values. Exact
-patterns match one host; `*.example.com` matches exactly one leading DNS label.
-The equivalent environment variable is
-`COULSON_TRUSTED_FORWARDED_HOSTS="*.example.com,app.example.net"`.
+The default empty list ignores incoming `X-Forwarded-Host` values. Each app
+has its own list, so a host trusted by one app is not trusted by another.
+Exact patterns match one host; `*.example.com` matches exactly one leading DNS
+label.
 
 This option is not intended for Quick Tunnels (`*.trycloudflare.com`), which
 have no fronting ingress worker.

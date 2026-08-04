@@ -3663,6 +3663,7 @@ OVERRIDE = "toml_wins"
                 "fs",
                 "e",
                 None,
+                &[],
             )
             .unwrap();
         // Matching identity → allowed.
@@ -3701,6 +3702,7 @@ OVERRIDE = "toml_wins"
                 "fs",
                 "e",
                 None,
+                &[],
             )
             .unwrap();
 
