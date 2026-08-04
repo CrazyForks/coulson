@@ -707,7 +707,7 @@ pub async fn app_set_tunnel_mode(
 
     let quick_restart = new_mode == TunnelMode::Quick && *old_mode == TunnelMode::Quick;
     if *old_mode != new_mode || named_domain_changed || quick_restart {
-        let routing = routing_for_app(&app, state.listen_http.port());
+        let routing = routing_for_app(&app, state.listen_http.port(), &state.apps_root);
 
         // Teardown old mode (best-effort)
         match old_mode {
@@ -1029,10 +1029,15 @@ pub async fn app_set_tunnel_mode(
 
 // -- Helpers --
 
-pub fn routing_for_app(app: &AppSpec, proxy_port: u16) -> tunnel::transport::TunnelRouting {
+pub fn routing_for_app(
+    app: &AppSpec,
+    proxy_port: u16,
+    apps_root: &std::path::Path,
+) -> tunnel::transport::TunnelRouting {
     tunnel::transport::TunnelRouting::FixedHost {
         local_host: app.domain.0.clone(),
         local_proxy_port: proxy_port,
+        config_path: tunnel::proxy::config_path_for_app(app, apps_root),
     }
 }
 

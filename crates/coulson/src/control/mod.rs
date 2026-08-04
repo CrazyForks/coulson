@@ -794,7 +794,7 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 params.domain.clone(),
                 local_suffix,
                 local_proxy_port,
-                state.store.clone(),
+                tunnel::proxy::AppConfigSource::new(state.store.clone(), state.apps_root.clone()),
                 Some(state.share_signer.clone()),
                 state.tunnel_conns.clone(),
             )
@@ -987,7 +987,7 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 tunnel_domain.clone(),
                 local_suffix,
                 local_proxy_port,
-                state.store.clone(),
+                tunnel::proxy::AppConfigSource::new(state.store.clone(), state.apps_root.clone()),
                 Some(state.share_signer.clone()),
                 state.tunnel_conns.clone(),
             )

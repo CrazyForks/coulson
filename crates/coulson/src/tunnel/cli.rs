@@ -16,6 +16,7 @@ pub async fn start_quick_tunnel_cli(
         TunnelRouting::FixedHost {
             local_host,
             local_proxy_port,
+            ..
         } => (local_host.clone(), *local_proxy_port),
         _ => bail!("CLI quick tunnel requires FixedHost routing"),
     };

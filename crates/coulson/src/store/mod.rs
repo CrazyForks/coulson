@@ -1075,6 +1075,39 @@ impl AppRepository {
         Ok(count > 0)
     }
 
+    /// Return the enabled app route that handles `path` for a domain.
+    ///
+    /// This only resolves the app identity; per-app runtime configuration is
+    /// deliberately read from `.coulson.toml` by the tunnel code instead of
+    /// being copied into SQLite.
+    pub fn get_enabled_by_route(
+        &self,
+        domain_prefix: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<AppSpec>> {
+        let conn = self.reader();
+        let app = conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM apps
+                     WHERE domain = ?1 AND enabled = 1 AND (
+                         path_prefix = '' OR path_prefix = '/' OR path_prefix = ?2 OR (
+                             LENGTH(?2) > LENGTH(path_prefix)
+                             AND SUBSTR(?2, 1, LENGTH(path_prefix)) = path_prefix
+                             AND SUBSTR(?2, LENGTH(path_prefix) + 1, 1) = '/'
+                         )
+                     )
+                     ORDER BY LENGTH(path_prefix) DESC, id ASC
+                     LIMIT 1",
+                    COLS
+                ),
+                params![domain_prefix, path],
+                |row| row_to_app(row, &self.domain_suffix),
+            )
+            .optional()?;
+        Ok(app)
+    }
+
     pub fn is_share_auth_required(&self, domain_prefix: &str) -> anyhow::Result<bool> {
         let conn = self.reader();
         let count: i64 = conn.query_row(
@@ -1655,6 +1688,70 @@ mod tests {
         let apps = repo.list_enabled().expect("list");
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].domain.0, "myapp.coulson.local");
+    }
+
+    #[test]
+    fn enabled_route_lookup_prefers_longest_boundary_match() {
+        let repo = AppRepository {
+            conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
+            read_conn: None,
+            domain_suffix: "coulson.local".to_string(),
+            change_tx: None,
+        };
+        repo.init_schema().expect("schema");
+        let domain = DomainName("myapp.coulson.local".to_string());
+
+        let root = repo
+            .insert_static(&StaticAppInput {
+                name: "myapp",
+                domain: &domain,
+                path_prefix: None,
+                target_type: "tcp",
+                target_value: "127.0.0.1:9001",
+                timeout_ms: None,
+                cors_enabled: false,
+                force_https: false,
+                basic_auth_user: None,
+                basic_auth_pass: None,
+                spa_rewrite: false,
+                listen_port: None,
+            })
+            .expect("insert root route");
+        let api = repo
+            .insert_static(&StaticAppInput {
+                name: "myapp-api",
+                domain: &domain,
+                path_prefix: Some("/api"),
+                target_type: "tcp",
+                target_value: "127.0.0.1:9002",
+                timeout_ms: None,
+                cors_enabled: false,
+                force_https: false,
+                basic_auth_user: None,
+                basic_auth_pass: None,
+                spa_rewrite: false,
+                listen_port: None,
+            })
+            .expect("insert api route");
+
+        assert_eq!(
+            repo.get_enabled_by_route("myapp", "/api/users")
+                .expect("lookup api route")
+                .expect("api route")
+                .id,
+            api.id
+        );
+        assert_eq!(
+            repo.get_enabled_by_route("myapp", "/apiary")
+                .expect("lookup root route")
+                .expect("root route")
+                .id,
+            root.id
+        );
+        assert!(repo
+            .get_enabled_by_route("other", "/")
+            .expect("lookup missing route")
+            .is_none());
     }
 
     #[test]

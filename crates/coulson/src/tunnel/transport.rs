@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -15,7 +16,6 @@ use super::rpc;
 use super::share_auth;
 use super::{TunnelConnections, TunnelCredentials};
 use crate::share::ShareSigner;
-use crate::store::AppRepository;
 
 /// Determines how incoming HTTP requests from the tunnel are routed locally.
 #[derive(Clone)]
@@ -25,13 +25,14 @@ pub enum TunnelRouting {
     FixedHost {
         local_host: String,
         local_proxy_port: u16,
+        config_path: Option<PathBuf>,
     },
     /// Named Tunnel: extract app from Host header, rewrite Host, forward to Pingora.
     HostBased {
         tunnel_domain: String,
         local_suffix: String,
         local_proxy_port: u16,
-        store: Arc<AppRepository>,
+        app_configs: proxy::AppConfigSource,
         share_signer: Option<Arc<ShareSigner>>,
     },
 }
@@ -322,12 +323,26 @@ async fn try_connect(
                         TunnelRouting::FixedHost {
                             local_host,
                             local_proxy_port,
+                            config_path,
                         } => {
+                            let trusted_forwarded_hosts = match proxy::load_trusted_forwarded_hosts(
+                                config_path.as_deref(),
+                            ) {
+                                Ok(patterns) => patterns,
+                                Err(err) => {
+                                    warn!(
+                                        error = %err,
+                                        "failed to read app trusted forwarded hosts; ignoring incoming header"
+                                    );
+                                    Vec::new()
+                                }
+                            };
                             proxy::proxy_to_local_with_host(
                                 request,
                                 send_response,
                                 *local_proxy_port,
                                 local_host,
+                                &trusted_forwarded_hosts,
                             )
                             .await
                         }
@@ -335,7 +350,7 @@ async fn try_connect(
                             tunnel_domain,
                             local_suffix,
                             local_proxy_port,
-                            store,
+                            app_configs,
                             share_signer,
                         } => {
                             let (parts, body) = request.into_parts();
@@ -356,34 +371,34 @@ async fn try_connect(
                             // Fail-close: reject on DB error to avoid bypassing auth.
                             let domain_prefix =
                                 crate::store::domain_to_db(&local_host, local_suffix);
-                            let share_required = match store.is_share_auth_required(&domain_prefix)
-                            {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    error!(
-                                        error = %e,
-                                        domain_prefix = %domain_prefix,
-                                        "share_auth query failed, denying request"
-                                    );
-                                    let resp = http::Response::builder()
-                                        .status(503)
-                                        .header("content-type", "text/plain")
-                                        .body(())
-                                        .unwrap();
-                                    match send_response.send_response(resp, false) {
-                                        Ok(mut stream) => {
-                                            let _ = stream.send_data(
-                                                bytes::Bytes::from("503 Service Unavailable"),
-                                                true,
-                                            );
+                            let share_required =
+                                match app_configs.store.is_share_auth_required(&domain_prefix) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        error!(
+                                            error = %e,
+                                            domain_prefix = %domain_prefix,
+                                            "share_auth query failed, denying request"
+                                        );
+                                        let resp = http::Response::builder()
+                                            .status(503)
+                                            .header("content-type", "text/plain")
+                                            .body(())
+                                            .unwrap();
+                                        match send_response.send_response(resp, false) {
+                                            Ok(mut stream) => {
+                                                let _ = stream.send_data(
+                                                    bytes::Bytes::from("503 Service Unavailable"),
+                                                    true,
+                                                );
+                                            }
+                                            Err(e) => {
+                                                error!(error = %e, "failed to send 503 response");
+                                            }
                                         }
-                                        Err(e) => {
-                                            error!(error = %e, "failed to send 503 response");
-                                        }
+                                        return;
                                     }
-                                    return;
-                                }
-                            };
+                                };
 
                             let share_authorized = if share_required {
                                 if let Some(signer) = share_signer {
@@ -433,7 +448,7 @@ async fn try_connect(
                                 tunnel_domain,
                                 local_suffix,
                                 *local_proxy_port,
-                                store,
+                                app_configs,
                                 share_authorized,
                             )
                             .await

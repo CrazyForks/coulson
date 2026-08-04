@@ -109,7 +109,7 @@ pub async fn start_named_tunnel(
     tunnel_domain: String,
     local_suffix: String,
     local_proxy_port: u16,
-    store: Arc<crate::store::AppRepository>,
+    app_configs: proxy::AppConfigSource,
     share_signer: Option<Arc<crate::share::ShareSigner>>,
     conns: TunnelConnections,
 ) -> anyhow::Result<NamedTunnelHandle> {
@@ -124,7 +124,7 @@ pub async fn start_named_tunnel(
                 tunnel_domain: td.clone(),
                 local_suffix: local_suffix.clone(),
                 local_proxy_port,
-                store: store.clone(),
+                app_configs: app_configs.clone(),
                 share_signer: share_signer.clone(),
             };
             let h = tokio::spawn(async move {
