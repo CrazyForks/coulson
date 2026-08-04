@@ -371,36 +371,34 @@ async fn try_connect(
                             // Fail-close: reject on DB error to avoid bypassing auth.
                             let domain_prefix =
                                 crate::store::domain_to_db(&local_host, local_suffix);
-                            let share_required = match app_configs
-                                .store
-                                .is_share_auth_required(&domain_prefix)
-                            {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    error!(
-                                        error = %e,
-                                        domain_prefix = %domain_prefix,
-                                        "share_auth query failed, denying request"
-                                    );
-                                    let resp = http::Response::builder()
-                                        .status(503)
-                                        .header("content-type", "text/plain")
-                                        .body(())
-                                        .unwrap();
-                                    match send_response.send_response(resp, false) {
-                                        Ok(mut stream) => {
-                                            let _ = stream.send_data(
-                                                bytes::Bytes::from("503 Service Unavailable"),
-                                                true,
-                                            );
+                            let share_required =
+                                match app_configs.store.is_share_auth_required(&domain_prefix) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        error!(
+                                            error = %e,
+                                            domain_prefix = %domain_prefix,
+                                            "share_auth query failed, denying request"
+                                        );
+                                        let resp = http::Response::builder()
+                                            .status(503)
+                                            .header("content-type", "text/plain")
+                                            .body(())
+                                            .unwrap();
+                                        match send_response.send_response(resp, false) {
+                                            Ok(mut stream) => {
+                                                let _ = stream.send_data(
+                                                    bytes::Bytes::from("503 Service Unavailable"),
+                                                    true,
+                                                );
+                                            }
+                                            Err(e) => {
+                                                error!(error = %e, "failed to send 503 response");
+                                            }
                                         }
-                                        Err(e) => {
-                                            error!(error = %e, "failed to send 503 response");
-                                        }
+                                        return;
                                     }
-                                    return;
-                                }
-                            };
+                                };
 
                             let share_authorized = if share_required {
                                 if let Some(signer) = share_signer {

@@ -1130,10 +1130,7 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
                         let routing = tunnel::transport::TunnelRouting::FixedHost {
                             local_host: app.domain.0.clone(),
                             local_proxy_port: state.listen_http.port(),
-                            config_path: tunnel::proxy::config_path_for_app(
-                                &app,
-                                &state.apps_root,
-                            ),
+                            config_path: tunnel::proxy::config_path_for_app(&app, &state.apps_root),
                         };
                         match serde_json::from_str::<tunnel::TunnelCredentials>(creds_json) {
                             Ok(credentials) => {
@@ -1175,10 +1172,7 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
                     let routing = tunnel::transport::TunnelRouting::FixedHost {
                         local_host: app.domain.0.clone(),
                         local_proxy_port: state.listen_http.port(),
-                        config_path: tunnel::proxy::config_path_for_app(
-                            &app,
-                            &state.apps_root,
-                        ),
+                        config_path: tunnel::proxy::config_path_for_app(&app, &state.apps_root),
                     };
                     info!(
                         app_id = %app.id.0,

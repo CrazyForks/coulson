@@ -115,8 +115,9 @@ pub fn load_trusted_forwarded_hosts(config_path: Option<&Path>) -> anyhow::Resul
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => {
-            return Err(anyhow::Error::new(err)
-                .context(format!("failed to read {}", path.display())))
+            return Err(
+                anyhow::Error::new(err).context(format!("failed to read {}", path.display()))
+            )
         }
     };
     let config: ForwardedHostConfig =
@@ -414,10 +415,10 @@ pub async fn proxy_by_host(
     // Resolve the longest matching route, then read that app's source config.
     // A failed lookup/read/parse is fail-closed: the client-supplied header is
     // ignored. The value is never persisted in SQLite or AppSpec.
-    let trusted_forwarded_hosts = match app_configs.store.get_enabled_by_route(
-        &domain_prefix,
-        parts.uri.path(),
-    ) {
+    let trusted_forwarded_hosts = match app_configs
+        .store
+        .get_enabled_by_route(&domain_prefix, parts.uri.path())
+    {
         Ok(Some(app)) => {
             let config_path = config_path_for_app(&app, &app_configs.apps_root);
             match load_trusted_forwarded_hosts(config_path.as_deref()) {
@@ -807,22 +808,13 @@ mod tests {
 
         // header absent: fall back
         assert_eq!(
-            built_forwarded_host(
-                "tunnel.example.net",
-                &http::HeaderMap::new(),
-                &example_com,
-            ),
+            built_forwarded_host("tunnel.example.net", &http::HeaderMap::new(), &example_com,),
             "tunnel.example.net"
         );
 
         // x-forwarded-proto untouched in all cases
         let mut builder = http::Request::builder().uri("http://127.0.0.1/");
-        append_forwarding_headers(
-            &mut builder,
-            "tunnel.example.net",
-            &incoming,
-            &example_org,
-        );
+        append_forwarding_headers(&mut builder, "tunnel.example.net", &incoming, &example_org);
         assert_eq!(
             builder
                 .headers_ref()
