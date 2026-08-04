@@ -37,7 +37,6 @@ pub struct StaticAppInput<'a> {
     pub basic_auth_pass: Option<&'a str>,
     pub spa_rewrite: bool,
     pub listen_port: Option<u16>,
-    pub trusted_forwarded_hosts: &'a [String],
 }
 
 pub struct AppRepository {
@@ -151,7 +150,6 @@ impl AppRepository {
               cname TEXT,
               fs_entry TEXT,
               hooks TEXT,
-              trusted_forwarded_hosts TEXT NOT NULL DEFAULT '[]',
               UNIQUE(domain, path_prefix)
             );
 
@@ -212,7 +210,6 @@ impl AppRepository {
             "ALTER TABLE apps ADD COLUMN cname TEXT",
             "ALTER TABLE apps ADD COLUMN fs_entry TEXT",
             "ALTER TABLE apps ADD COLUMN hooks TEXT",
-            "ALTER TABLE apps ADD COLUMN trusted_forwarded_hosts TEXT NOT NULL DEFAULT '[]'",
         ] {
             add_column_if_missing(&conn, sql)?;
         }
@@ -240,12 +237,11 @@ impl AppRepository {
         let now = OffsetDateTime::now_utc();
         let path_prefix_db = path_prefix_to_db(input.path_prefix);
         let domain_db = domain_to_db(&input.domain.0, &self.domain_suffix);
-        let trusted_forwarded_hosts = serde_json::to_string(input.trusted_forwarded_hosts)?;
 
         let conn = self.conn.lock();
         let result = conn.execute(
-            "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, cors_enabled, force_https, basic_auth_user, basic_auth_pass, spa_rewrite, listen_port, trusted_forwarded_hosts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, cors_enabled, force_https, basic_auth_user, basic_auth_pass, spa_rewrite, listen_port)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, NULL, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 input.name,
                 "static",
@@ -263,7 +259,6 @@ impl AppRepository {
                 input.basic_auth_pass,
                 if input.spa_rewrite { 1 } else { 0 },
                 input.listen_port.map(|v| v as i64),
-                trusted_forwarded_hosts,
             ],
         );
         check_insert(result)?;
@@ -297,7 +292,6 @@ impl AppRepository {
             app_tunnel_domain: None,
             app_tunnel_dns_id: None,
             app_tunnel_creds: None,
-            trusted_forwarded_hosts: input.trusted_forwarded_hosts.to_vec(),
             inspect_enabled: false,
             lan_access: false,
             cname: None,
@@ -316,11 +310,9 @@ impl AppRepository {
         app_root: &str,
         kind: &str,
         listen_port: Option<u16>,
-        trusted_forwarded_hosts: &[String],
     ) -> anyhow::Result<AppSpec> {
         let now = OffsetDateTime::now_utc();
         let domain_db = domain_to_db(&domain.0, &self.domain_suffix);
-        let trusted_forwarded_hosts_json = serde_json::to_string(trusted_forwarded_hosts)?;
         let kind_enum = match kind {
             "asgi" => AppKind::Asgi,
             "rack" => AppKind::Rack,
@@ -332,8 +324,8 @@ impl AppRepository {
 
         let conn = self.conn.lock();
         let result = conn.execute(
-            "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, listen_port, trusted_forwarded_hosts)
-             VALUES (?1, ?2, ?3, '', 'managed', ?4, NULL, 1, 0, NULL, ?5, ?6, ?7, ?8)",
+            "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, listen_port)
+             VALUES (?1, ?2, ?3, '', 'managed', ?4, NULL, 1, 0, NULL, ?5, ?6, ?7)",
             params![
                 name,
                 kind,
@@ -342,7 +334,6 @@ impl AppRepository {
                 now.unix_timestamp(),
                 now.unix_timestamp(),
                 listen_port.map(|v| v as i64),
-                trusted_forwarded_hosts_json,
             ],
         );
         check_insert(result)?;
@@ -374,7 +365,6 @@ impl AppRepository {
             app_tunnel_domain: None,
             app_tunnel_dns_id: None,
             app_tunnel_creds: None,
-            trusted_forwarded_hosts: trusted_forwarded_hosts.to_vec(),
             inspect_enabled: false,
             lan_access: false,
             cname: None,
@@ -392,16 +382,14 @@ impl AppRepository {
         domain: &DomainName,
         root: &str,
         listen_port: Option<u16>,
-        trusted_forwarded_hosts: &[String],
     ) -> anyhow::Result<AppSpec> {
         let now = OffsetDateTime::now_utc();
         let domain_db = domain_to_db(&domain.0, &self.domain_suffix);
-        let trusted_forwarded_hosts_json = serde_json::to_string(trusted_forwarded_hosts)?;
 
         let conn = self.conn.lock();
         let result = conn.execute(
-            "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, listen_port, trusted_forwarded_hosts)
-             VALUES (?1, 'static', ?2, '', 'static_dir', ?3, NULL, 1, 0, NULL, ?4, ?5, ?6, ?7)",
+            "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, listen_port)
+             VALUES (?1, 'static', ?2, '', 'static_dir', ?3, NULL, 1, 0, NULL, ?4, ?5, ?6)",
             params![
                 name,
                 domain_db,
@@ -409,7 +397,6 @@ impl AppRepository {
                 now.unix_timestamp(),
                 now.unix_timestamp(),
                 listen_port.map(|v| v as i64),
-                trusted_forwarded_hosts_json,
             ],
         );
         check_insert(result)?;
@@ -438,7 +425,6 @@ impl AppRepository {
             app_tunnel_domain: None,
             app_tunnel_dns_id: None,
             app_tunnel_creds: None,
-            trusted_forwarded_hosts: trusted_forwarded_hosts.to_vec(),
             inspect_enabled: false,
             lan_access: false,
             cname: None,
@@ -495,19 +481,10 @@ impl AppRepository {
         source: &str,
         fs_entry: &str,
         hooks: Option<&crate::hooks::AppHooksConfig>,
-        trusted_forwarded_hosts: &[String],
     ) -> anyhow::Result<(AppSpec, ScanUpsertResult)> {
         let txn = self.begin_write()?;
         let result = txn.upsert_scanned_managed(
-            name,
-            domain,
-            app_root,
-            kind,
-            enabled,
-            source,
-            fs_entry,
-            hooks,
-            trusted_forwarded_hosts,
+            name, domain, app_root, kind, enabled, source, fs_entry, hooks,
         )?;
         txn.commit()?;
         Ok(result)
@@ -523,7 +500,6 @@ impl AppRepository {
         source: &str,
         fs_entry: &str,
         hooks: Option<&crate::hooks::AppHooksConfig>,
-        trusted_forwarded_hosts: &[String],
     ) -> anyhow::Result<(AppSpec, ScanUpsertResult)> {
         let txn = self.begin_write()?;
         let result = txn.upsert_scanned_static_dir(
@@ -534,7 +510,6 @@ impl AppRepository {
             source,
             fs_entry,
             hooks,
-            trusted_forwarded_hosts,
         )?;
         txn.commit()?;
         Ok(result)
@@ -606,8 +581,6 @@ impl StoreTxn<'_> {
     ) -> anyhow::Result<(AppSpec, ScanUpsertResult)> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let hooks_json: Option<String> = hooks.map(serde_json::to_string).transpose()?;
-        let trusted_forwarded_hosts_json =
-            serde_json::to_string(input.trusted_forwarded_hosts)?;
         let conn = &*self.conn;
         let path_prefix_db = path_prefix_to_db(input.path_prefix);
         let domain_db = domain_to_db(&input.domain.0, &self.repo.domain_suffix);
@@ -624,7 +597,7 @@ impl StoreTxn<'_> {
             Some((_id, 0)) => ScanUpsertResult::SkippedManual,
             Some((id, _)) => {
                 conn.execute(
-                    "UPDATE apps SET name = ?1, path_prefix = ?2, target_type = ?3, target_value = ?4, timeout_ms = ?5, updated_at = ?6, scan_managed = 1, scan_source = ?7, cors_enabled = ?8, force_https = ?9, basic_auth_user = ?10, basic_auth_pass = ?11, spa_rewrite = ?12, listen_port = ?13, fs_entry = ?14, enabled = ?15, hooks = ?17, trusted_forwarded_hosts = ?18 WHERE id = ?16",
+                    "UPDATE apps SET name = ?1, path_prefix = ?2, target_type = ?3, target_value = ?4, timeout_ms = ?5, updated_at = ?6, scan_managed = 1, scan_source = ?7, cors_enabled = ?8, force_https = ?9, basic_auth_user = ?10, basic_auth_pass = ?11, spa_rewrite = ?12, listen_port = ?13, fs_entry = ?14, enabled = ?15, hooks = ?17 WHERE id = ?16",
                     params![
                         input.name,
                         path_prefix_db,
@@ -642,16 +615,15 @@ impl StoreTxn<'_> {
                         fs_entry,
                         if enabled { 1 } else { 0 },
                         id,
-                        hooks_json,
-                        trusted_forwarded_hosts_json,
+                        hooks_json
                     ],
                 )?;
                 ScanUpsertResult::Updated
             }
             None => {
                 conn.execute(
-                    "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, cors_enabled, force_https, basic_auth_user, basic_auth_pass, spa_rewrite, listen_port, fs_entry, hooks, trusted_forwarded_hosts)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                    "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, cors_enabled, force_https, basic_auth_user, basic_auth_pass, spa_rewrite, listen_port, fs_entry, hooks)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                     params![
                         input.name,
                         "static",
@@ -672,7 +644,6 @@ impl StoreTxn<'_> {
                         input.listen_port.map(|v| v as i64),
                         fs_entry,
                         hooks_json,
-                        trusted_forwarded_hosts_json,
                     ],
                 )?;
                 ScanUpsertResult::Inserted
@@ -695,11 +666,9 @@ impl StoreTxn<'_> {
         source: &str,
         fs_entry: &str,
         hooks: Option<&crate::hooks::AppHooksConfig>,
-        trusted_forwarded_hosts: &[String],
     ) -> anyhow::Result<(AppSpec, ScanUpsertResult)> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let hooks_json: Option<String> = hooks.map(serde_json::to_string).transpose()?;
-        let trusted_forwarded_hosts_json = serde_json::to_string(trusted_forwarded_hosts)?;
         let conn = &*self.conn;
         let path_prefix_db = "";
         let domain_db = domain_to_db(&domain.0, &self.repo.domain_suffix);
@@ -716,15 +685,15 @@ impl StoreTxn<'_> {
             Some((_id, 0)) => ScanUpsertResult::SkippedManual,
             Some((id, _)) => {
                 conn.execute(
-                    "UPDATE apps SET name = ?1, kind = ?2, target_type = 'managed', target_value = ?3, updated_at = ?4, scan_managed = 1, scan_source = ?5, fs_entry = ?6, enabled = ?7, hooks = ?9, trusted_forwarded_hosts = ?10 WHERE id = ?8",
-                    params![name, kind, app_root, now, source, fs_entry, if enabled { 1 } else { 0 }, id, hooks_json, trusted_forwarded_hosts_json],
+                    "UPDATE apps SET name = ?1, kind = ?2, target_type = 'managed', target_value = ?3, updated_at = ?4, scan_managed = 1, scan_source = ?5, fs_entry = ?6, enabled = ?7, hooks = ?9 WHERE id = ?8",
+                    params![name, kind, app_root, now, source, fs_entry, if enabled { 1 } else { 0 }, id, hooks_json],
                 )?;
                 ScanUpsertResult::Updated
             }
             None => {
                 conn.execute(
-                    "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, fs_entry, hooks, trusted_forwarded_hosts)
-                     VALUES (?1, ?2, ?3, ?4, 'managed', ?5, NULL, ?6, 1, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, fs_entry, hooks)
+                     VALUES (?1, ?2, ?3, ?4, 'managed', ?5, NULL, ?6, 1, ?7, ?8, ?9, ?10, ?11)",
                     params![
                         name,
                         kind,
@@ -737,7 +706,6 @@ impl StoreTxn<'_> {
                         now,
                         fs_entry,
                         hooks_json,
-                        trusted_forwarded_hosts_json,
                     ],
                 )?;
                 ScanUpsertResult::Inserted
@@ -759,11 +727,9 @@ impl StoreTxn<'_> {
         source: &str,
         fs_entry: &str,
         hooks: Option<&crate::hooks::AppHooksConfig>,
-        trusted_forwarded_hosts: &[String],
     ) -> anyhow::Result<(AppSpec, ScanUpsertResult)> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let hooks_json: Option<String> = hooks.map(serde_json::to_string).transpose()?;
-        let trusted_forwarded_hosts_json = serde_json::to_string(trusted_forwarded_hosts)?;
         let conn = &*self.conn;
         let path_prefix_db = "";
         let domain_db = domain_to_db(&domain.0, &self.repo.domain_suffix);
@@ -780,15 +746,15 @@ impl StoreTxn<'_> {
             Some((_id, 0)) => ScanUpsertResult::SkippedManual,
             Some((id, _)) => {
                 conn.execute(
-                    "UPDATE apps SET name = ?1, kind = 'static', target_type = 'static_dir', target_value = ?2, updated_at = ?3, scan_managed = 1, scan_source = ?4, fs_entry = ?5, enabled = ?6, hooks = ?8, trusted_forwarded_hosts = ?9 WHERE id = ?7",
-                    params![name, static_root, now, source, fs_entry, if enabled { 1 } else { 0 }, id, hooks_json, trusted_forwarded_hosts_json],
+                    "UPDATE apps SET name = ?1, kind = 'static', target_type = 'static_dir', target_value = ?2, updated_at = ?3, scan_managed = 1, scan_source = ?4, fs_entry = ?5, enabled = ?6, hooks = ?8 WHERE id = ?7",
+                    params![name, static_root, now, source, fs_entry, if enabled { 1 } else { 0 }, id, hooks_json],
                 )?;
                 ScanUpsertResult::Updated
             }
             None => {
                 conn.execute(
-                    "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, fs_entry, hooks, trusted_forwarded_hosts)
-                     VALUES (?1, 'static', ?2, ?3, 'static_dir', ?4, NULL, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    "INSERT INTO apps (name, kind, domain, path_prefix, target_type, target_value, timeout_ms, enabled, scan_managed, scan_source, created_at, updated_at, fs_entry, hooks)
+                     VALUES (?1, 'static', ?2, ?3, 'static_dir', ?4, NULL, ?5, 1, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         name,
                         domain_db,
@@ -800,7 +766,6 @@ impl StoreTxn<'_> {
                         now,
                         fs_entry,
                         hooks_json,
-                        trusted_forwarded_hosts_json,
                     ],
                 )?;
                 ScanUpsertResult::Inserted
@@ -937,7 +902,6 @@ impl AppRepository {
         timeout_ms: Option<Option<u64>>,
         lan_access: Option<bool>,
         cname: Option<Option<&str>>,
-        trusted_forwarded_hosts: Option<&[String]>,
     ) -> anyhow::Result<bool> {
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let conn = self.conn.lock();
@@ -989,11 +953,6 @@ impl AppRepository {
         if let Some(v) = cname {
             sets.push(format!("cname = ?{idx}"));
             values.push(Box::new(v.map(|s| s.to_string())));
-            idx += 1;
-        }
-        if let Some(v) = trusted_forwarded_hosts {
-            sets.push(format!("trusted_forwarded_hosts = ?{idx}"));
-            values.push(Box::new(serde_json::to_string(v)?));
             idx += 1;
         }
 
@@ -1116,46 +1075,37 @@ impl AppRepository {
         Ok(count > 0)
     }
 
-    /// Return the trusted forwarded-host patterns for a specific app row.
-    /// Used by fixed-host quick and per-app named tunnels.
-    pub fn trusted_forwarded_hosts_for_app(&self, app_id: i64) -> anyhow::Result<Vec<String>> {
-        let conn = self.reader();
-        let raw: Option<String> = conn
-            .query_row(
-                "SELECT trusted_forwarded_hosts FROM apps WHERE id = ?1 AND enabled = 1",
-                params![app_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        parse_trusted_forwarded_hosts(raw.as_deref())
-    }
-
-    /// Resolve the longest matching route for this mapped app domain and
-    /// return that row's forwarded-host allowlist. Route rows are ordered
-    /// longest-prefix-first, matching the proxy route table.
-    pub fn trusted_forwarded_hosts_for_route(
+    /// Return the enabled app route that handles `path` for a domain.
+    ///
+    /// This only resolves the app identity; per-app runtime configuration is
+    /// deliberately read from `.coulson.toml` by the tunnel code instead of
+    /// being copied into SQLite.
+    pub fn get_enabled_by_route(
         &self,
         domain_prefix: &str,
         path: &str,
-    ) -> anyhow::Result<Vec<String>> {
+    ) -> anyhow::Result<Option<AppSpec>> {
         let conn = self.reader();
-        let raw: Option<String> = conn
+        let app = conn
             .query_row(
-                "SELECT trusted_forwarded_hosts FROM apps
-                 WHERE domain = ?1 AND enabled = 1
-                   AND (
-                     path_prefix = '' OR path_prefix = '/' OR path_prefix = ?2 OR
-                     (LENGTH(?2) > LENGTH(path_prefix)
-                      AND SUBSTR(?2, 1, LENGTH(path_prefix)) = path_prefix
-                      AND SUBSTR(?2, LENGTH(path_prefix) + 1, 1) = '/')
-                   )
-                 ORDER BY LENGTH(path_prefix) DESC, id ASC
-                 LIMIT 1",
+                &format!(
+                    "SELECT {} FROM apps
+                     WHERE domain = ?1 AND enabled = 1 AND (
+                         path_prefix = '' OR path_prefix = '/' OR path_prefix = ?2 OR (
+                             LENGTH(?2) > LENGTH(path_prefix)
+                             AND SUBSTR(?2, 1, LENGTH(path_prefix)) = path_prefix
+                             AND SUBSTR(?2, LENGTH(path_prefix) + 1, 1) = '/'
+                         )
+                     )
+                     ORDER BY LENGTH(path_prefix) DESC, id ASC
+                     LIMIT 1",
+                    COLS
+                ),
                 params![domain_prefix, path],
-                |row| row.get(0),
+                |row| row_to_app(row, &self.domain_suffix),
             )
             .optional()?;
-        parse_trusted_forwarded_hosts(raw.as_deref())
+        Ok(app)
     }
 
     pub fn is_share_auth_required(&self, domain_prefix: &str) -> anyhow::Result<bool> {
@@ -1396,14 +1346,7 @@ impl AppRepository {
     }
 }
 
-const COLS: &str = "id,name,kind,domain,path_prefix,target_type,target_value,timeout_ms,enabled,created_at,updated_at,cors_enabled,force_https,basic_auth_user,basic_auth_pass,spa_rewrite,listen_port,tunnel_url,tunnel_mode,app_tunnel_id,app_tunnel_domain,app_tunnel_dns_id,app_tunnel_creds,inspect_enabled,lan_access,cname,fs_entry,hooks,trusted_forwarded_hosts";
-
-fn parse_trusted_forwarded_hosts(raw: Option<&str>) -> anyhow::Result<Vec<String>> {
-    match raw {
-        Some(raw) => serde_json::from_str(raw).context("invalid trusted_forwarded_hosts JSON"),
-        None => Ok(Vec::new()),
-    }
-}
+const COLS: &str = "id,name,kind,domain,path_prefix,target_type,target_value,timeout_ms,enabled,created_at,updated_at,cors_enabled,force_https,basic_auth_user,basic_auth_pass,spa_rewrite,listen_port,tunnel_url,tunnel_mode,app_tunnel_id,app_tunnel_domain,app_tunnel_dns_id,app_tunnel_creds,inspect_enabled,lan_access,cname,fs_entry,hooks";
 
 fn backend_target_from_db(
     id: i64,
@@ -1498,11 +1441,6 @@ fn row_to_app(row: &rusqlite::Row<'_>, suffix: &str) -> rusqlite::Result<AppSpec
         app_tunnel_domain: row.get::<_, Option<String>>(20).unwrap_or(None),
         app_tunnel_dns_id: row.get::<_, Option<String>>(21).unwrap_or(None),
         app_tunnel_creds: row.get::<_, Option<String>>(22).unwrap_or(None),
-        trusted_forwarded_hosts: row
-            .get::<_, Option<String>>(28)
-            .unwrap_or(None)
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default(),
         inspect_enabled: row.get::<_, i64>(23).unwrap_or(0) == 1,
         lan_access: row.get::<_, i64>(24).unwrap_or(0) == 1,
         cname: row.get::<_, Option<String>>(25).unwrap_or(None),
@@ -1745,7 +1683,6 @@ mod tests {
             basic_auth_pass: None,
             spa_rewrite: false,
             listen_port: None,
-            trusted_forwarded_hosts: &[],
         })
         .expect("insert");
         let apps = repo.list_enabled().expect("list");
@@ -1754,7 +1691,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_forwarded_hosts_follow_the_selected_app_route() {
+    fn enabled_route_lookup_prefers_longest_boundary_match() {
         let repo = AppRepository {
             conn: Mutex::new(Connection::open_in_memory().expect("open sqlite")),
             read_conn: None,
@@ -1763,8 +1700,6 @@ mod tests {
         };
         repo.init_schema().expect("schema");
         let domain = DomainName("myapp.coulson.local".to_string());
-        let root_hosts = vec!["app.example.com".to_string()];
-        let api_hosts = vec!["api.example.com".to_string()];
 
         let root = repo
             .insert_static(&StaticAppInput {
@@ -1780,41 +1715,43 @@ mod tests {
                 basic_auth_pass: None,
                 spa_rewrite: false,
                 listen_port: None,
-                trusted_forwarded_hosts: &root_hosts,
             })
-            .expect("insert root app");
-        repo.insert_static(&StaticAppInput {
-            name: "myapp-api",
-            domain: &domain,
-            path_prefix: Some("/api"),
-            target_type: "tcp",
-            target_value: "127.0.0.1:9002",
-            timeout_ms: None,
-            cors_enabled: false,
-            force_https: false,
-            basic_auth_user: None,
-            basic_auth_pass: None,
-            spa_rewrite: false,
-            listen_port: None,
-            trusted_forwarded_hosts: &api_hosts,
-        })
-        .expect("insert api app");
+            .expect("insert root route");
+        let api = repo
+            .insert_static(&StaticAppInput {
+                name: "myapp-api",
+                domain: &domain,
+                path_prefix: Some("/api"),
+                target_type: "tcp",
+                target_value: "127.0.0.1:9002",
+                timeout_ms: None,
+                cors_enabled: false,
+                force_https: false,
+                basic_auth_user: None,
+                basic_auth_pass: None,
+                spa_rewrite: false,
+                listen_port: None,
+            })
+            .expect("insert api route");
 
         assert_eq!(
-            repo.trusted_forwarded_hosts_for_app(root.id.0)
-                .expect("fixed app config"),
-            root_hosts
+            repo.get_enabled_by_route("myapp", "/api/users")
+                .expect("lookup api route")
+                .expect("api route")
+                .id,
+            api.id
         );
         assert_eq!(
-            repo.trusted_forwarded_hosts_for_route("myapp", "/api/users")
-                .expect("api route config"),
-            api_hosts
+            repo.get_enabled_by_route("myapp", "/apiary")
+                .expect("lookup root route")
+                .expect("root route")
+                .id,
+            root.id
         );
-        assert_eq!(
-            repo.trusted_forwarded_hosts_for_route("myapp", "/apiary")
-                .expect("root route config"),
-            root_hosts
-        );
+        assert!(repo
+            .get_enabled_by_route("other", "/")
+            .expect("lookup missing route")
+            .is_none());
     }
 
     #[test]
@@ -1839,7 +1776,6 @@ mod tests {
                 "fs",
                 "entry",
                 None,
-                &[],
             )
             .expect("first upsert");
         assert!(matches!(op, ScanUpsertResult::Inserted));
@@ -1856,7 +1792,6 @@ mod tests {
                 "fs",
                 "entry",
                 None,
-                &[],
             )
             .expect("second upsert");
         assert!(matches!(op, ScanUpsertResult::Updated));
@@ -1884,7 +1819,6 @@ mod tests {
                 "fs",
                 "e",
                 None,
-                &[],
             )
             .expect("insert appx");
         assert!(repo.delete(a.id.0).expect("delete appx"));
@@ -1903,7 +1837,6 @@ mod tests {
                 "fs",
                 "e",
                 None,
-                &[],
             )
             .expect("insert appy");
         assert!(b.id.0 > a.id.0, "row id reused after delete");
@@ -1944,7 +1877,6 @@ mod tests {
                 "fs",
                 "e",
                 Some(&hooks),
-                &[],
             )
             .expect("upsert");
         // The row is the single source of truth: reads and the deletion
@@ -1996,7 +1928,6 @@ mod tests {
                 "fs",
                 "e",
                 Some(&hooks),
-                &[],
             )
             .expect("upsert");
         repo.update_settings(
@@ -2005,7 +1936,6 @@ mod tests {
             None,
             None,
             Some(Some("s3cret-pw")),
-            None,
             None,
             None,
             None,
@@ -2066,7 +1996,6 @@ mod tests {
             "apps_root",
             "appx",
             None,
-            &[],
         )
         .expect("seed");
 
@@ -2101,18 +2030,8 @@ mod tests {
 
         {
             let txn = repo.begin_write().expect("begin");
-            txn.upsert_scanned_managed(
-                "appx",
-                &domain,
-                "/srv/appx",
-                "asgi",
-                true,
-                "fs",
-                "e",
-                None,
-                &[],
-            )
-            .expect("upsert");
+            txn.upsert_scanned_managed("appx", &domain, "/srv/appx", "asgi", true, "fs", "e", None)
+                .expect("upsert");
             // Dropped without commit — a scan that errors out halfway must
             // leave no partially applied rows behind.
         }
@@ -2139,7 +2058,6 @@ mod tests {
             "apps_root",
             "a",
             None,
-            &[],
         )
         .expect("seed appa");
 
@@ -2154,7 +2072,6 @@ mod tests {
             "apps_root",
             "b",
             None,
-            &[],
         )
         .expect("upsert appb");
         let mut active = HashSet::new();
@@ -2182,31 +2099,13 @@ mod tests {
         let domain = DomainName("myapp.coulson.local".to_string());
 
         let (a, _) = repo
-            .upsert_scanned_managed(
-                "myapp",
-                &domain,
-                "/srv/a",
-                "node",
-                true,
-                "fs",
-                "e",
-                None,
-                &[],
-            )
+            .upsert_scanned_managed("myapp", &domain, "/srv/a", "node", true, "fs", "e", None)
             .expect("insert");
         // In-place scanner rewrite: same route key keeps the row id but
         // changes identity (root + provider kind).
         let (b, op) = repo
             .upsert_scanned_managed(
-                "myapp",
-                &domain,
-                "/srv/b",
-                "procfile",
-                true,
-                "fs",
-                "e",
-                None,
-                &[],
+                "myapp", &domain, "/srv/b", "procfile", true, "fs", "e", None,
             )
             .expect("rewrite");
         assert!(matches!(op, ScanUpsertResult::Updated));
@@ -2299,7 +2198,6 @@ mod tests {
                 "fs",
                 "e",
                 Some(&hooks),
-                &[],
             )
             .expect("upsert on migrated schema");
         let read = repo.get_by_id(created.id.0).expect("get").expect("row");
@@ -2422,7 +2320,6 @@ mod tests {
             basic_auth_pass: None,
             spa_rewrite: false,
             listen_port: None,
-            trusted_forwarded_hosts: &[],
         })
         .expect("insert");
 

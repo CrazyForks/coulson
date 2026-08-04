@@ -260,7 +260,6 @@ pub struct UpdateSettingsParams {
     pub timeout_ms: Option<Option<u64>>,
     pub lan_access: Option<bool>,
     pub cname: Option<Option<String>>,
-    pub trusted_forwarded_hosts: Option<Vec<String>>,
 }
 
 pub fn app_update_settings(
@@ -293,7 +292,6 @@ pub fn app_update_settings(
         params.timeout_ms,
         params.lan_access,
         cname_normalized.as_ref().map(|v| v.as_deref()),
-        params.trusted_forwarded_hosts.as_deref(),
     ) {
         Ok(true) => {
             state
@@ -332,8 +330,6 @@ pub struct CreateAppParams {
     pub spa_rewrite: bool,
     #[serde(default)]
     pub listen_port: Option<u16>,
-    #[serde(default)]
-    pub trusted_forwarded_hosts: Vec<String>,
 }
 
 fn default_target_type() -> String {
@@ -436,7 +432,6 @@ pub fn app_create(state: &SharedState, params: &CreateAppParams) -> Result<AppSp
             basic_auth_pass: params.basic_auth_pass.as_deref(),
             spa_rewrite: params.spa_rewrite,
             listen_port: params.listen_port,
-            trusted_forwarded_hosts: &params.trusted_forwarded_hosts,
         })
         .map_err(ServiceError::from)?;
 
@@ -489,7 +484,6 @@ pub fn app_create_from_folder(state: &SharedState, path: &str) -> Result<AppSpec
             basic_auth_pass: None,
             spa_rewrite: false,
             listen_port: None,
-            trusted_forwarded_hosts: &[],
         };
         insert_and_reload(state.store.insert_static(&input))
     };
@@ -521,7 +515,6 @@ pub fn app_create_from_folder(state: &SharedState, path: &str) -> Result<AppSpec
                 &root_str,
                 &detected.kind,
                 None,
-                &info.trusted_forwarded_hosts,
             ));
         }
 
@@ -548,7 +541,6 @@ pub fn app_create_from_folder(state: &SharedState, path: &str) -> Result<AppSpec
                 basic_auth_pass: info.basic_auth_pass.as_deref(),
                 spa_rewrite: info.spa_rewrite,
                 listen_port: info.listen_port,
-                trusted_forwarded_hosts: &info.trusted_forwarded_hosts,
             };
             return insert_and_reload(state.store.insert_static(&input));
         }
@@ -577,7 +569,6 @@ pub fn app_create_from_folder(state: &SharedState, path: &str) -> Result<AppSpec
             &root_str,
             &detected.kind,
             None,
-            &[],
         ));
     }
 
@@ -588,7 +579,7 @@ pub fn app_create_from_folder(state: &SharedState, path: &str) -> Result<AppSpec
         return insert_and_reload(
             state
                 .store
-                .insert_static_dir(&name, &domain, &root_str, None, &[]),
+                .insert_static_dir(&name, &domain, &root_str, None),
         );
     }
 
@@ -598,7 +589,7 @@ pub fn app_create_from_folder(state: &SharedState, path: &str) -> Result<AppSpec
         return insert_and_reload(
             state
                 .store
-                .insert_static_dir(&name, &domain, &root_str, None, &[]),
+                .insert_static_dir(&name, &domain, &root_str, None),
         );
     }
 
@@ -716,7 +707,7 @@ pub async fn app_set_tunnel_mode(
 
     let quick_restart = new_mode == TunnelMode::Quick && *old_mode == TunnelMode::Quick;
     if *old_mode != new_mode || named_domain_changed || quick_restart {
-        let routing = routing_for_app(&app, state.listen_http.port(), state.store.clone());
+        let routing = routing_for_app(&app, state.listen_http.port(), &state.apps_root);
 
         // Teardown old mode (best-effort)
         match old_mode {
@@ -1041,13 +1032,12 @@ pub async fn app_set_tunnel_mode(
 pub fn routing_for_app(
     app: &AppSpec,
     proxy_port: u16,
-    store: std::sync::Arc<crate::store::AppRepository>,
+    apps_root: &std::path::Path,
 ) -> tunnel::transport::TunnelRouting {
     tunnel::transport::TunnelRouting::FixedHost {
-        app_id: app.id.0,
         local_host: app.domain.0.clone(),
         local_proxy_port: proxy_port,
-        store,
+        config_path: tunnel::proxy::config_path_for_app(app, apps_root),
     }
 }
 

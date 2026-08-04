@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -15,7 +16,6 @@ use super::rpc;
 use super::share_auth;
 use super::{TunnelConnections, TunnelCredentials};
 use crate::share::ShareSigner;
-use crate::store::AppRepository;
 
 /// Determines how incoming HTTP requests from the tunnel are routed locally.
 #[derive(Clone)]
@@ -23,17 +23,16 @@ pub enum TunnelRouting {
     /// Per-app tunnel: rewrite Host header to app domain,
     /// forward to the local Pingora proxy.
     FixedHost {
-        app_id: i64,
         local_host: String,
         local_proxy_port: u16,
-        store: Arc<AppRepository>,
+        config_path: Option<PathBuf>,
     },
     /// Named Tunnel: extract app from Host header, rewrite Host, forward to Pingora.
     HostBased {
         tunnel_domain: String,
         local_suffix: String,
         local_proxy_port: u16,
-        store: Arc<AppRepository>,
+        app_configs: proxy::AppConfigSource,
         share_signer: Option<Arc<ShareSigner>>,
     },
 }
@@ -322,20 +321,18 @@ async fn try_connect(
                 tokio::spawn(async move {
                     let result = match &routing {
                         TunnelRouting::FixedHost {
-                            app_id,
                             local_host,
                             local_proxy_port,
-                            store,
+                            config_path,
                         } => {
-                            let trusted_forwarded_hosts = match store
-                                .trusted_forwarded_hosts_for_app(*app_id)
-                            {
+                            let trusted_forwarded_hosts = match proxy::load_trusted_forwarded_hosts(
+                                config_path.as_deref(),
+                            ) {
                                 Ok(patterns) => patterns,
                                 Err(err) => {
                                     warn!(
-                                        app_id,
                                         error = %err,
-                                        "failed to load app trusted forwarded hosts; ignoring incoming header"
+                                        "failed to read app trusted forwarded hosts; ignoring incoming header"
                                     );
                                     Vec::new()
                                 }
@@ -353,7 +350,7 @@ async fn try_connect(
                             tunnel_domain,
                             local_suffix,
                             local_proxy_port,
-                            store,
+                            app_configs,
                             share_signer,
                         } => {
                             let (parts, body) = request.into_parts();
@@ -374,7 +371,9 @@ async fn try_connect(
                             // Fail-close: reject on DB error to avoid bypassing auth.
                             let domain_prefix =
                                 crate::store::domain_to_db(&local_host, local_suffix);
-                            let share_required = match store.is_share_auth_required(&domain_prefix)
+                            let share_required = match app_configs
+                                .store
+                                .is_share_auth_required(&domain_prefix)
                             {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -451,7 +450,7 @@ async fn try_connect(
                                 tunnel_domain,
                                 local_suffix,
                                 *local_proxy_port,
-                                store,
+                                app_configs,
                                 share_authorized,
                             )
                             .await

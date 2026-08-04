@@ -1,18 +1,37 @@
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use anyhow::Context;
 use bytes::Bytes;
 use h2::RecvStream;
 use http::Request;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use crate::domain::{AppSpec, BackendTarget};
 use crate::store::{self, AppRepository};
 
 const RESPONSE_USER_HEADERS: &str = "cf-cloudflared-response-headers";
 const RESPONSE_META_HEADER: &str = "cf-cloudflared-response-meta";
 const RESPONSE_META_ORIGIN: &str = r#"{"src":"origin"}"#;
+
+/// Sources needed to locate an app route and read that app's config file.
+/// The store identifies the app only; config values are never copied into it.
+#[derive(Clone)]
+pub struct AppConfigSource {
+    pub(crate) store: Arc<AppRepository>,
+    apps_root: PathBuf,
+}
+
+impl AppConfigSource {
+    pub fn new(store: Arc<AppRepository>, apps_root: PathBuf) -> Self {
+        Self { store, apps_root }
+    }
+}
 
 /// Internal marker header injected by the tunnel proxy so the Pingora proxy
 /// can distinguish tunnel requests from local/LAN requests. Basic auth is
@@ -35,6 +54,74 @@ static MAX_TUNNEL_REQUEST_BODY: AtomicUsize = AtomicUsize::new(100 * 1024 * 1024
 /// from the loaded `CoulsonConfig`.
 pub fn set_max_tunnel_request_body(bytes: usize) {
     MAX_TUNNEL_REQUEST_BODY.store(bytes, Ordering::Relaxed);
+}
+
+#[derive(Default, Deserialize)]
+struct ForwardedHostConfig {
+    #[serde(default)]
+    trusted_forwarded_hosts: Vec<String>,
+}
+
+/// Locate the source `.coulson.toml` for an app without copying any of its
+/// values into `AppSpec` or SQLite.
+pub fn config_path_for_app(app: &AppSpec, apps_root: &Path) -> Option<PathBuf> {
+    config_path_for_source(&app.target, app.fs_entry.as_deref(), apps_root)
+}
+
+fn config_path_for_source(
+    target: &BackendTarget,
+    fs_entry: Option<&str>,
+    apps_root: &Path,
+) -> Option<PathBuf> {
+    if let BackendTarget::Managed { root, .. } = target {
+        return Some(Path::new(root).join(".coulson.toml"));
+    }
+
+    if let Some(fs_entry) = fs_entry {
+        let entry = apps_root.join(fs_entry);
+        match fs::metadata(&entry) {
+            Ok(metadata) if metadata.is_dir() => return Some(entry.join(".coulson.toml")),
+            Ok(metadata) if metadata.is_file() => {
+                let target_is_toml = fs::canonicalize(&entry)
+                    .ok()
+                    .and_then(|path| path.extension().map(|ext| ext == "toml"))
+                    .unwrap_or(false);
+                return target_is_toml.then_some(entry);
+            }
+            Ok(_) => return None,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // A directory entry can disappear while an app is restarting.
+                // Keep its conventional path so a recreated config is picked up.
+                return Some(entry.join(".coulson.toml"));
+            }
+            Err(_) => return None,
+        }
+    }
+
+    match target {
+        BackendTarget::StaticDir { root } => Some(Path::new(root).join(".coulson.toml")),
+        _ => None,
+    }
+}
+
+/// Read the forwarded-host allowlist directly from the app config. Callers
+/// invoke this for each tunnel request, so a restarted app observes the latest
+/// `.coulson.toml` without a database update or daemon restart.
+pub fn load_trusted_forwarded_hosts(config_path: Option<&Path>) -> anyhow::Result<Vec<String>> {
+    let Some(path) = config_path else {
+        return Ok(Vec::new());
+    };
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(anyhow::Error::new(err)
+                .context(format!("failed to read {}", path.display())))
+        }
+    };
+    let config: ForwardedHostConfig =
+        toml::from_str(&raw).with_context(|| format!("invalid TOML in {}", path.display()))?;
+    Ok(config.trusted_forwarded_hosts)
 }
 
 /// True if `host` (port stripped, case-insensitive) matches any pattern.
@@ -225,7 +312,7 @@ pub async fn proxy_by_host(
     tunnel_domain: &str,
     local_suffix: &str,
     local_proxy_port: u16,
-    app_store: &Arc<AppRepository>,
+    app_configs: &AppConfigSource,
     share_authorized: bool,
 ) -> anyhow::Result<()> {
     let (parts, mut body) = request.into_parts();
@@ -247,7 +334,7 @@ pub async fn proxy_by_host(
     // Apps with tunnel_mode "none" are not exposed through the tunnel.
     // Skip this check if the request was already authorized via share auth.
     if !share_authorized {
-        let exposed = match app_store.is_tunnel_exposed(&domain_prefix) {
+        let exposed = match app_configs.store.is_tunnel_exposed(&domain_prefix) {
             Ok(v) => v,
             Err(e) => {
                 warn!(
@@ -324,18 +411,35 @@ pub async fn proxy_by_host(
     local_req = local_req.header("host", &local_host);
     local_req = local_req.header(VIA_TUNNEL_HEADER, "1");
 
-    // Resolve the longest matching route for this mapped app domain. A failed
-    // or missing lookup is fail-closed: the client-supplied header is ignored.
-    let trusted_forwarded_hosts = match app_store
-        .trusted_forwarded_hosts_for_route(&domain_prefix, parts.uri.path())
-    {
-        Ok(patterns) => patterns,
+    // Resolve the longest matching route, then read that app's source config.
+    // A failed lookup/read/parse is fail-closed: the client-supplied header is
+    // ignored. The value is never persisted in SQLite or AppSpec.
+    let trusted_forwarded_hosts = match app_configs.store.get_enabled_by_route(
+        &domain_prefix,
+        parts.uri.path(),
+    ) {
+        Ok(Some(app)) => {
+            let config_path = config_path_for_app(&app, &app_configs.apps_root);
+            match load_trusted_forwarded_hosts(config_path.as_deref()) {
+                Ok(patterns) => patterns,
+                Err(err) => {
+                    warn!(
+                        app_id = app.id.0,
+                        original_host = %original_host,
+                        error = %err,
+                        "failed to read app trusted forwarded hosts; ignoring incoming header"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        Ok(None) => Vec::new(),
         Err(err) => {
             warn!(
                 original_host = %original_host,
                 domain_prefix = %domain_prefix,
                 error = %err,
-                "failed to load app trusted forwarded hosts; ignoring incoming header"
+                "failed to resolve app config; ignoring incoming header"
             );
             Vec::new()
         }
@@ -513,6 +617,74 @@ fn serialize_headers(headers: &http::HeaderMap) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "coulson-tunnel-{name}-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn trusted_forwarded_hosts_are_reloaded_from_app_config() {
+        let dir = temp_test_dir("forwarded-host-reload");
+        let config_path = dir.join(".coulson.toml");
+        std::fs::write(
+            &config_path,
+            "trusted_forwarded_hosts = [\"old.example.com\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_trusted_forwarded_hosts(Some(&config_path)).unwrap(),
+            vec!["old.example.com"]
+        );
+
+        std::fs::write(
+            &config_path,
+            "trusted_forwarded_hosts = [\"new.example.com\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_trusted_forwarded_hosts(Some(&config_path)).unwrap(),
+            vec!["new.example.com"]
+        );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn locates_managed_and_scanned_app_configs() {
+        let apps_root = temp_test_dir("config-paths");
+        let managed_root = apps_root.join("managed-source");
+        let scanned_root = apps_root.join("scanned-app");
+        std::fs::create_dir_all(&managed_root).unwrap();
+        std::fs::create_dir_all(&scanned_root).unwrap();
+
+        let managed = BackendTarget::Managed {
+            app_id: 1,
+            root: managed_root.to_string_lossy().to_string(),
+            kind: "node".to_string(),
+            name: "managed".to_string(),
+        };
+        assert_eq!(
+            config_path_for_source(&managed, None, &apps_root),
+            Some(managed_root.join(".coulson.toml"))
+        );
+
+        let scanned = BackendTarget::Tcp {
+            host: "127.0.0.1".to_string(),
+            port: 3000,
+        };
+        assert_eq!(
+            config_path_for_source(&scanned, Some("scanned-app"), &apps_root),
+            Some(scanned_root.join(".coulson.toml"))
+        );
+
+        std::fs::remove_dir_all(apps_root).unwrap();
+    }
 
     #[test]
     fn test_map_tunnel_host_to_local() {

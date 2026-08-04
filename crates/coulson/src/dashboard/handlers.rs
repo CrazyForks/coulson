@@ -308,7 +308,6 @@ pub async fn action_toggle_lan_access(
                 timeout_ms: None,
                 lan_access: Some(!app.lan_access),
                 cname: None,
-                trusted_forwarded_hosts: None,
             },
         );
     }
@@ -490,7 +489,6 @@ pub async fn action_toggle_cors(
                 timeout_ms: None,
                 lan_access: None,
                 cname: None,
-                trusted_forwarded_hosts: None,
             },
         );
     }
@@ -515,7 +513,6 @@ pub async fn action_toggle_https(
                 timeout_ms: None,
                 lan_access: None,
                 cname: None,
-                trusted_forwarded_hosts: None,
             },
         );
     }
@@ -540,7 +537,6 @@ pub async fn action_toggle_spa(
                 timeout_ms: None,
                 lan_access: None,
                 cname: None,
-                trusted_forwarded_hosts: None,
             },
         );
     }
@@ -782,7 +778,6 @@ pub async fn action_update_settings(
             timeout_ms,
             lan_access: None,
             cname: None,
-            trusted_forwarded_hosts: None,
         },
     ) {
         Ok(_) => Redirect::to(&format!("/apps/{id}")).into_response(),
@@ -836,7 +831,6 @@ pub async fn action_create_app(
         basic_auth_pass: None,
         spa_rewrite: false,
         listen_port: None,
-        trusted_forwarded_hosts: Vec::new(),
     };
 
     match service::app_create(&state.shared, &create_params) {
@@ -995,7 +989,6 @@ pub async fn action_set_basic_auth(
                 timeout_ms: None,
                 lan_access: None,
                 cname: None,
-                trusted_forwarded_hosts: None,
             },
         );
     }

@@ -27,7 +27,6 @@ pub struct ManifestInfo {
     pub basic_auth_pass: Option<String>,
     pub spa_rewrite: bool,
     pub listen_port: Option<u16>,
-    pub trusted_forwarded_hosts: Vec<String>,
     /// Number of routes defined in the manifest (0 if using top-level port/socket).
     pub route_count: usize,
     /// The raw manifest as JSON Value for provider detection.
@@ -110,7 +109,6 @@ fn parse_toml_manifest_inner(toml_path: &Path) -> anyhow::Result<ManifestInfo> {
         basic_auth_pass: manifest.basic_auth_pass,
         spa_rewrite: manifest.spa.unwrap_or(false),
         listen_port: manifest.listen_port,
-        trusted_forwarded_hosts: manifest.trusted_forwarded_hosts,
         manifest_json,
     })
 }
@@ -142,8 +140,6 @@ struct CoulsonManifest {
     basic_auth_pass: Option<String>,
     #[serde(default)]
     listen_port: Option<u16>,
-    #[serde(default)]
-    trusted_forwarded_hosts: Vec<String>,
     #[serde(default)]
     service: Option<String>,
     #[serde(default)]
@@ -245,7 +241,6 @@ pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanResult> {
                     "apps_root",
                     &app.fs_entry,
                     app.hooks.as_ref(),
-                    &app.trusted_forwarded_hosts,
                 )?
             }
             "static_dir" => txn.upsert_scanned_static_dir(
@@ -256,7 +251,6 @@ pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanResult> {
                 "apps_root",
                 &app.fs_entry,
                 app.hooks.as_ref(),
-                &app.trusted_forwarded_hosts,
             )?,
             _ => txn.upsert_scanned_static(
                 &StaticAppInput {
@@ -272,7 +266,6 @@ pub fn sync_from_apps_root(state: &SharedState) -> anyhow::Result<ScanResult> {
                     basic_auth_pass: app.basic_auth_pass.as_deref(),
                     spa_rewrite: app.spa_rewrite,
                     listen_port: app.listen_port,
-                    trusted_forwarded_hosts: &app.trusted_forwarded_hosts,
                 },
                 app.enabled,
                 "apps_root",
@@ -384,7 +377,6 @@ struct DiscoveredStaticApp {
     basic_auth_pass: Option<String>,
     spa_rewrite: bool,
     listen_port: Option<u16>,
-    trusted_forwarded_hosts: Vec<String>,
     enabled: bool,
     explicit_domain: bool,
     fs_entry: String,
@@ -527,7 +519,6 @@ fn discover(
                     basic_auth_pass: None,
                     spa_rewrite: false,
                     listen_port: None,
-                    trusted_forwarded_hosts: Vec::new(),
                     enabled: true,
                     explicit_domain: file_name.ends_with(&format!(".{suffix}")),
                     fs_entry: file_name.clone(),
@@ -597,7 +588,6 @@ fn discover(
                         basic_auth_pass: None,
                         spa_rewrite: false,
                         listen_port: None,
-                        trusted_forwarded_hosts: Vec::new(),
                         enabled: true,
                         explicit_domain,
                         fs_entry: dir_name.clone(),
@@ -648,7 +638,6 @@ fn discover(
                     basic_auth_pass: None,
                     spa_rewrite: false,
                     listen_port: None,
-                    trusted_forwarded_hosts: Vec::new(),
                     enabled: true,
                     explicit_domain: dir_name.ends_with(&format!(".{suffix}")),
                     fs_entry: dir_name.clone(),
@@ -679,7 +668,6 @@ fn discover(
                     basic_auth_pass: None,
                     spa_rewrite: false,
                     listen_port: None,
-                    trusted_forwarded_hosts: Vec::new(),
                     enabled: true,
                     explicit_domain: dir_name.ends_with(&format!(".{suffix}")),
                     fs_entry: dir_name.clone(),
@@ -807,7 +795,6 @@ fn discover_from_symlink(
                 basic_auth_pass: None,
                 spa_rewrite: false,
                 listen_port: None,
-                trusted_forwarded_hosts: Vec::new(),
                 enabled: true,
                 explicit_domain,
                 fs_entry: file_name.to_string(),
@@ -860,7 +847,6 @@ fn discover_from_symlink(
                     basic_auth_pass: None,
                     spa_rewrite: false,
                     listen_port: None,
-                    trusted_forwarded_hosts: Vec::new(),
                     enabled: true,
                     explicit_domain,
                     fs_entry: file_name.to_string(),
@@ -900,7 +886,6 @@ fn discover_from_symlink(
                 basic_auth_pass: None,
                 spa_rewrite: false,
                 listen_port: None,
-                trusted_forwarded_hosts: Vec::new(),
                 enabled: true,
                 explicit_domain,
                 fs_entry: file_name.to_string(),
@@ -923,7 +908,6 @@ fn discover_from_symlink(
                 basic_auth_pass: None,
                 spa_rewrite: false,
                 listen_port: None,
-                trusted_forwarded_hosts: Vec::new(),
                 enabled: true,
                 explicit_domain,
                 fs_entry: file_name.to_string(),
@@ -984,7 +968,6 @@ fn manifest_to_discovered_apps(
             basic_auth_pass: manifest.basic_auth_pass.clone(),
             spa_rewrite: manifest.spa.unwrap_or(false),
             listen_port: manifest.listen_port,
-            trusted_forwarded_hosts: manifest.trusted_forwarded_hosts.clone(),
             enabled,
             explicit_domain,
             fs_entry,
@@ -1021,7 +1004,6 @@ fn manifest_to_discovered_apps(
                 basic_auth_pass: manifest.basic_auth_pass.clone(),
                 spa_rewrite: manifest.spa.unwrap_or(false),
                 listen_port: manifest.listen_port,
-                trusted_forwarded_hosts: manifest.trusted_forwarded_hosts.clone(),
                 enabled,
                 explicit_domain,
                 fs_entry: fs_entry.clone(),
@@ -1048,7 +1030,6 @@ fn manifest_to_discovered_apps(
             basic_auth_pass: manifest.basic_auth_pass.clone(),
             spa_rewrite: manifest.spa.unwrap_or(false),
             listen_port: manifest.listen_port,
-            trusted_forwarded_hosts: manifest.trusted_forwarded_hosts.clone(),
             enabled,
             explicit_domain,
             fs_entry,
@@ -1075,7 +1056,6 @@ fn manifest_to_discovered_apps(
             basic_auth_pass: manifest.basic_auth_pass.clone(),
             spa_rewrite: manifest.spa.unwrap_or(false),
             listen_port: manifest.listen_port,
-            trusted_forwarded_hosts: manifest.trusted_forwarded_hosts.clone(),
             enabled,
             explicit_domain,
             fs_entry,
@@ -1498,7 +1478,6 @@ mod tests {
                 "apps_root",
                 "nodeapp",
                 None,
-                &[],
             )
             .expect("seed node row");
         let (retired_row, _) = repo
@@ -1511,7 +1490,6 @@ mod tests {
                 "apps_root",
                 "retired",
                 None,
-                &[],
             )
             .expect("seed retired row");
         let protected: HashSet<String> = result.indeterminate_entries.into_iter().collect();
@@ -1639,7 +1617,6 @@ mod tests {
                 basic_auth_pass: None,
                 spa_rewrite: false,
                 listen_port: None,
-                trusted_forwarded_hosts: Vec::new(),
                 enabled: true,
                 explicit_domain: false,
                 fs_entry: "myapp".to_string(),
@@ -1663,7 +1640,6 @@ mod tests {
                 basic_auth_pass: None,
                 spa_rewrite: false,
                 listen_port: None,
-                trusted_forwarded_hosts: Vec::new(),
                 enabled: true,
                 explicit_domain: true,
                 fs_entry: "myapp.coulson.local".to_string(),
@@ -1744,21 +1720,6 @@ mod tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].target_host, "192.168.1.1");
         assert_eq!(routes[0].target_port, 3000);
-    }
-
-    #[test]
-    fn parse_coulson_toml_trusted_forwarded_hosts() {
-        let manifest = parse_manifest(
-            r#"
-            port = 3000
-            trusted_forwarded_hosts = ["*.example.com", "app.example.net"]
-            "#,
-        )
-        .expect("parse");
-        assert_eq!(
-            manifest.trusted_forwarded_hosts,
-            vec!["*.example.com".to_string(), "app.example.net".to_string()]
-        );
     }
 
     #[test]

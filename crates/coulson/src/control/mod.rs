@@ -159,7 +159,6 @@ struct UpdateSettingsParams {
     listen_port: Option<Option<u16>>,
     lan_access: Option<bool>,
     cname: Option<Option<String>>,
-    trusted_forwarded_hosts: Option<Vec<String>>,
     tunnel_mode: Option<TunnelMode>,
     app_tunnel_domain: Option<String>,
     app_tunnel_token: Option<String>,
@@ -436,7 +435,6 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                     timeout_ms: None,
                     lan_access: params.lan_access,
                     cname: params.cname.clone(),
-                    trusted_forwarded_hosts: params.trusted_forwarded_hosts.clone(),
                 },
             ) {
                 return render_err(req.request_id, ControlError::from(e));
@@ -796,7 +794,10 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 params.domain.clone(),
                 local_suffix,
                 local_proxy_port,
-                state.store.clone(),
+                tunnel::proxy::AppConfigSource::new(
+                    state.store.clone(),
+                    state.apps_root.clone(),
+                ),
                 Some(state.share_signer.clone()),
                 state.tunnel_conns.clone(),
             )
@@ -989,7 +990,10 @@ async fn dispatch_request(req: RequestEnvelope, state: &SharedState) -> Response
                 tunnel_domain.clone(),
                 local_suffix,
                 local_proxy_port,
-                state.store.clone(),
+                tunnel::proxy::AppConfigSource::new(
+                    state.store.clone(),
+                    state.apps_root.clone(),
+                ),
                 Some(state.share_signer.clone()),
                 state.tunnel_conns.clone(),
             )

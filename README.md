@@ -372,7 +372,9 @@ trusted_forwarded_hosts = ["*.example.com", "app.example.net"]
 The default empty list ignores incoming `X-Forwarded-Host` values. Each app
 has its own list, so a host trusted by one app is not trusted by another.
 Exact patterns match one host; `*.example.com` matches exactly one leading DNS
-label.
+label. Coulson reads this value directly from the app's `.coulson.toml` rather
+than storing a copy in SQLite; edits are picked up on subsequent tunnel
+requests, including after every app restart.
 
 This option is not intended for Quick Tunnels (`*.trycloudflare.com`), which
 have no fronting ingress worker.

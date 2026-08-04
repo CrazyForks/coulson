@@ -1094,7 +1094,10 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
                         tunnel_domain,
                         local_suffix,
                         local_proxy_port,
-                        state.store.clone(),
+                        tunnel::proxy::AppConfigSource::new(
+                            state.store.clone(),
+                            state.apps_root.clone(),
+                        ),
                         Some(state.share_signer.clone()),
                         state.tunnel_conns.clone(),
                     )
@@ -1125,10 +1128,12 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
                         (&app.app_tunnel_creds, &app.app_tunnel_domain)
                     {
                         let routing = tunnel::transport::TunnelRouting::FixedHost {
-                            app_id: app.id.0,
                             local_host: app.domain.0.clone(),
                             local_proxy_port: state.listen_http.port(),
-                            store: state.store.clone(),
+                            config_path: tunnel::proxy::config_path_for_app(
+                                &app,
+                                &state.apps_root,
+                            ),
                         };
                         match serde_json::from_str::<tunnel::TunnelCredentials>(creds_json) {
                             Ok(credentials) => {
@@ -1168,10 +1173,12 @@ async fn run_serve(cfg: CoulsonConfig) -> anyhow::Result<()> {
             Ok(apps) => {
                 for app in apps {
                     let routing = tunnel::transport::TunnelRouting::FixedHost {
-                        app_id: app.id.0,
                         local_host: app.domain.0.clone(),
                         local_proxy_port: state.listen_http.port(),
-                        store: state.store.clone(),
+                        config_path: tunnel::proxy::config_path_for_app(
+                            &app,
+                            &state.apps_root,
+                        ),
                     };
                     info!(
                         app_id = %app.id.0,

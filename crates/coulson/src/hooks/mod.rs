@@ -508,7 +508,6 @@ webhook = "https://hooks.example.com/ready"
                 "apps_root",
                 "dock",
                 None,
-                &[],
             )
             .unwrap();
         assert_eq!(app.kind, crate::domain::AppKind::Container);
