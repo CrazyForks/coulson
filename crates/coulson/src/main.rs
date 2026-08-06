@@ -3582,6 +3582,8 @@ fn setup_forward_daemon(cfg: &CoulsonConfig, force: bool) -> anyhow::Result<()> 
 <dict>
     <key>Label</key>
     <string>com.coulson.forward</string>
+    <key>AssociatedBundleIdentifiers</key>
+    <string>ac.hola.coulson</string>
     <key>ProgramArguments</key>
     <array>
 {args}
