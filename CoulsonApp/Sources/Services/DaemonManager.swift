@@ -179,6 +179,8 @@ final class DaemonManager: ObservableObject {
         <dict>
             <key>Label</key>
             <string>\(serviceLabel)</string>
+            <key>AssociatedBundleIdentifiers</key>
+            <string>ac.hola.coulson</string>
             <key>Program</key>
             <string>\(daemonPath)</string>
             <key>ProgramArguments</key>
