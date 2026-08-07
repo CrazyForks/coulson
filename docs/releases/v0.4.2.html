@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Coulson v0.4.2 Release Notes</title>
+<style>
+  :root {
+    --fg: #1e293b;
+    --fg-secondary: #64748b;
+    --bg: #ffffff;
+    --border: #e2e8f0;
+    --accent: #0284c7;
+    --tag-bg: #f0f9ff;
+    --tag-fg: #0369a1;
+    --code-bg: #f8fafc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e2e8f0;
+      --fg-secondary: #94a3b8;
+      --bg: #0f172a;
+      --border: #1e293b;
+      --accent: #38bdf8;
+      --tag-bg: #0c4a6e;
+      --tag-fg: #7dd3fc;
+      --code-bg: #1e293b;
+    }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--fg);
+    background: var(--bg);
+    padding: 16px;
+    -webkit-font-smoothing: antialiased;
+  }
+  h2 {
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .meta {
+    font-size: 12px;
+    color: var(--fg-secondary);
+    margin-bottom: 12px;
+  }
+  .section { margin-bottom: 14px; }
+  .section-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-secondary);
+    margin-bottom: 6px;
+  }
+  ul {
+    list-style: none;
+    padding: 0;
+  }
+  li {
+    position: relative;
+    padding-left: 16px;
+    margin-bottom: 4px;
+    font-size: 13px;
+  }
+  li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 7px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+  .tag {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 500;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--tag-bg);
+    color: var(--tag-fg);
+    margin-left: 4px;
+    vertical-align: middle;
+  }
+  code {
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 12px;
+    background: var(--code-bg);
+    padding: 1px 4px;
+    border-radius: 3px;
+  }
+  hr {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 14px 0;
+  }
+  a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h2>Coulson 0.4.2</h2>
+<div class="meta">August 7, 2026</div>
+
+<div class="section">
+  <div class="section-title">New</div>
+  <ul>
+    <li>Per-app <code>trusted_forwarded_hosts</code> in <code>.coulson.toml</code> — honor <code>x-forwarded-host</code> from an allowlisted upstream proxy on tunnel ingress, re-read per request <span class="tag">tunnel</span></li>
+    <li><code>coulson env</code> now reports whether each resolved variable is <code>app</code> scope (injected into the process) or <code>coulson</code> scope (consumed by Coulson itself) <span class="tag">cli</span></li>
+    <li><code>coulson ps</code> gained a process type column <span class="tag">cli</span></li>
+  </ul>
+</div>
+
+<div class="section">
+  <div class="section-title">Fixed</div>
+  <ul>
+    <li>Launch agents now carry <code>AssociatedBundleIdentifiers</code>, so macOS attributes background items to Coulson instead of listing them as anonymous login items <span class="tag">macos</span></li>
+    <li>Orphaned processes are reaped when their app is removed <span class="tag">process</span></li>
+    <li>Lifecycle invariants for delete, scan and process cleanup — app ids are never reused, deletion and spawn are serialized under the process-manager lock, and a spawn revalidates its app row before committing <span class="tag">process</span></li>
+    <li>Row existence and filesystem entries are now settled in a single transaction, so a concurrent scan can no longer resurrect a deleted app or prune a live one <span class="tag">core</span></li>
+    <li>Lifecycle hooks fire from the app row snapshot the process was started with, so <code>app_stop</code> stays complete even after the row is gone <span class="tag">hooks</span></li>
+    <li>Forwarded-host authority is validated before use <span class="tag">tunnel</span></li>
+    <li><code>.coulsonrc</code> now overrides <code>.coulson.toml</code> for <code>COULSON_MANAGED_SERVICES</code>, matching the general env precedence <span class="tag">process</span></li>
+  </ul>
+</div>
+
+<div class="section">
+  <div class="section-title">Changed</div>
+  <ul>
+    <li>Store runs in WAL mode with a dedicated read connection — read-only queries no longer queue behind scan write transactions <span class="tag">core</span></li>
+    <li>Hooks are stored on the app row instead of a separate in-memory registry, removing a source of drift between the two <span class="tag">hooks</span></li>
+  </ul>
+</div>
+
+<hr>
+<div class="meta">
+  <a href="https://github.com/ratazzi/coulson">View on GitHub</a>
+</div>
+
+</body>
+</html>

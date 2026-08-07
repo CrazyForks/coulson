@@ -58,7 +58,7 @@ let project = Project(
             settings: .settings(
                 base: [
                     "MACOSX_DEPLOYMENT_TARGET": "13.0",
-                    "MARKETING_VERSION": "0.4.1",
+                    "MARKETING_VERSION": "0.4.2",
                     "CURRENT_PROJECT_VERSION": "1",
                 ]
             )
